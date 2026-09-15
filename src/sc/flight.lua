@@ -34,8 +34,11 @@
 -- RPM is signed, -256 to 256, positive being whichever direction calibration
 -- found pushes the hull forward.
 --
--- A differential is a single signed RPM meaning "this much harder on the right
--- than on the left". Positive raises yaw.
+-- A differential is a single signed RPM meaning "this much harder on the left
+-- than on the right". Positive raises yaw, which is the ship turning to its own
+-- right, because a forward push on the left side is what swings the nose that
+-- way. Getting this backwards flies a confident mirror image, so it is worth
+-- saying twice: left harder, nose right, yaw rising.
 --
 -- == The shape of `cal` ==
 --
@@ -146,8 +149,8 @@ function flight.tankDemand(err, pid, cal, cfg, dt)
         cal.yawAuth and cal.yawAuth.left, cal.yawAuth and cal.yawAuth.right)
 
     return {
-        left  = util.clamp(-diff * scaleL, -cfg.tankRpmMax, cfg.tankRpmMax),
-        right = util.clamp(diff * scaleR, -cfg.tankRpmMax, cfg.tankRpmMax),
+        left  = util.clamp(diff * scaleL, -cfg.tankRpmMax, cfg.tankRpmMax),
+        right = util.clamp(-diff * scaleR, -cfg.tankRpmMax, cfg.tankRpmMax),
         main  = 0,
         rate  = wantRate,
         diff  = diff,
@@ -275,6 +278,14 @@ end
 -- calibration, so a propeller mounted backwards is a flag in a file rather than
 -- a special case in here.
 function flight.mix(common, differential, lines, cal, cfg)
+    return flight.mixParts(common, common, differential, lines, cal, cfg)
+end
+
+-- The same, with the main propeller and the turbines given their own thrust.
+-- Graduated braking is the reason this exists: a plan that reverses the main
+-- alone has to reach the propellers as the main alone, and a single common
+-- number cannot say that.
+function flight.mixParts(mainCommon, turbineCommon, differential, lines, cal, cfg)
     local scaleL, scaleR = flight.sideScales(
         cal.yawAuth and cal.yawAuth.left, cal.yawAuth and cal.yawAuth.right)
 
@@ -285,11 +296,11 @@ function flight.mix(common, differential, lines, cal, cfg)
         local rpm = 0
 
         if side == "main" then
-            rpm = common * cfg.mainShare
+            rpm = mainCommon * cfg.mainShare
         elseif side == "left" then
-            rpm = common * cfg.turbineShare - differential * scaleL
+            rpm = turbineCommon * cfg.turbineShare + differential * scaleL
         elseif side == "right" then
-            rpm = common * cfg.turbineShare + differential * scaleR
+            rpm = turbineCommon * cfg.turbineShare - differential * scaleR
         end
 
         if entry and entry.reverse then rpm = -rpm end

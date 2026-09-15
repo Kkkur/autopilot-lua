@@ -157,19 +157,6 @@ end
 
 -- == READING THE SHIP ========================================
 
--- Yaw rate out of CC: Sable, in the units and the sign the rest of the program
--- thinks in. getAngularVelocity is radians about the world axes, and its y runs
--- opposite to this yaw convention, which is the single easiest sign in the
--- program to get backwards and the hardest to notice.
-local function yawRateOf()
-    if type(sublevel) ~= "table" or not sublevel.getAngularVelocity then return nil end
-    local ok, raw = pcall(sublevel.getAngularVelocity)
-    if not ok then return nil end
-    local vec = util.toVec(raw)
-    if not vec then return nil end
-    return -math.deg(vec.y)
-end
-
 -- Speed along the hull rather than speed through the air. A ship that has just
 -- turned is still carrying the velocity of where it used to be pointing, and
 -- braking against that number would brake against a crosswind.
@@ -205,15 +192,17 @@ local function setStatus(text, kind)
 end
 
 -- One tick of a leg: where the phase machine is, and what the propellers are
--- told because of it. Returns the common thrust and the differential, both
--- signed RPM, for the mixer.
+-- told because of it. Returns the main's thrust, the turbines' thrust and the
+-- differential, all signed RPM, for the mixer. The main and the turbines are
+-- separate because braking is graduated: a stop on the main alone has to reach
+-- the propellers as the main alone.
 local function flyLeg(state, goal, dt)
     local cfg = config.values
     local p = state.position
 
     local bearing = flight.bearingTo(p.x, p.z, goal.x, goal.z)
     local err = flight.headingError(bearing, state.yaw, cal.noseOffset)
-    local yawRate = yawRateOf() or 0
+    local yawRate = ship.yawRate() or 0
     local pitch = util.pitchOf(state.orientation)
     local dx, dz = goal.x - p.x, goal.z - p.z
     local d = math.sqrt(dx * dx + dz * dz)
@@ -255,7 +244,7 @@ local function flyLeg(state, goal, dt)
     end
 
     if control.phase == "arrived" then
-        return 0, 0, d
+        return 0, 0, 0, d
     end
 
     -- Two different ways to fail to arrive, and they get two different strings.
@@ -268,7 +257,7 @@ local function flyLeg(state, goal, dt)
         else
             setStatus(string.format("GAVE UP, STOPPED %.1f blk OUT", d), "bad")
         end
-        return 0, 0, d
+        return 0, 0, 0, d
     end
 
     -- Tank: rotate, do not translate.
@@ -278,7 +267,7 @@ local function flyLeg(state, goal, dt)
         control.info.common = 0
         control.info.differential = demand.diff
         setStatus(string.format("TURN %+.0f deg  %.0f blk", err, d), "warn")
-        return 0, demand.diff, d
+        return 0, 0, demand.diff, d
     end
 
     -- Cruise: run at it, trimming the heading rather than turning.
@@ -303,7 +292,7 @@ local function flyLeg(state, goal, dt)
         control.info.common = common
         control.info.differential = control.trim or 0
         setStatus(string.format("RUN %.0f blk  %.1f m/s", d, v), "good")
-        return common, control.trim or 0, d
+        return common, common, control.trim or 0, d
     end
 
     -- Brake: reverse, graduated, heading still trimmed.
@@ -317,10 +306,11 @@ local function flyLeg(state, goal, dt)
         setStatus(string.format("STOP %.0f blk  %.1f m/s", d, v), "warn")
         -- The turbines hold back whatever the heading trim is asking for, so the
         -- ship never loses its nose in the middle of a stop.
-        return plan.main, plan.turbines ~= 0 and (control.trim or 0) or 0, d
+        return plan.main, plan.turbines,
+            plan.turbines ~= 0 and (control.trim or 0) or 0, d
     end
 
-    return 0, 0, d
+    return 0, 0, 0, d
 end
 
 function control.tick()
@@ -366,18 +356,19 @@ function control.tick()
         return
     end
 
-    local common, differential = 0, 0
+    local mainCommon, turbineCommon, differential = 0, 0, 0
 
     if control.manual then
-        common = control.manual.throttle * cfg.cruiseMaxRpm
+        mainCommon = control.manual.throttle * cfg.cruiseMaxRpm
+        turbineCommon = mainCommon
         differential = control.manual.yaw * cfg.tankRpmMax
-        control.info.common = common
+        control.info.common = mainCommon
         control.info.differential = differential
         setStatus(string.format("MANUAL thr %+.0f%%  yaw %+.0f%%",
             control.manual.throttle * 100, control.manual.yaw * 100), "warn")
     elseif goal then
         local d
-        common, differential, d = flyLeg(state, goal, dt)
+        mainCommon, turbineCommon, differential, d = flyLeg(state, goal, dt)
 
         if control.phase == "arrived" and not control.hold then
             local name = control.targetName
@@ -407,7 +398,8 @@ function control.tick()
     -- the hull, and it is not the same number as the one that softens a launch.
     local slew = control.phase == "brake" and cfg.brakeSlew or cfg.rpmSlew
 
-    local wanted = flight.mix(common, differential, ship.order, cal, cfg)
+    local wanted = flight.mixParts(mainCommon, turbineCommon, differential,
+        ship.order, cal, cfg)
     control.demands = flight.applySlew(control.demands, wanted, slew)
     ship.flush(control.demands)
 end

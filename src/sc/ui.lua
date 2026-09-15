@@ -323,7 +323,7 @@ local function drawFlight(snap, reads)
     end
 
     -- Speed bar against whatever the ship has actually been measured doing.
-    local top = cal.topSpeed("z") or cal.topSpeed("x") or config.get("cruiseSpeed")
+    local top = cal.topForward() or config.get("cruiseSpeed")
     local frac = state and top and top > 0 and (state.speed / top) or 0
     at(1, y, " SPD ", C("dim"), C("bg"))
     bar(6, y, math.max(4, W - 18), frac, frac > 0.98 and C("warn") or C("bar"))
@@ -437,11 +437,11 @@ local function drawFlight(snap, reads)
         local column = 0
         for _, name in ipairs(ship.order) do
             if y > H - 2 then break end
-            local axis = cal.axisOf(name)
+            local entry = cal.sideOf(name)
             local rpm = snap.demands and snap.demands[name] or 0
             local text = string.format("%s%-3s %-5s %4d", ship.lines[name].main and "*" or " ",
-                util.shortName(name), util.labelFor(axis):sub(1, 5), rpm)
-            at(1 + column * 17, y, text, axis and (rpm ~= 0 and C("good") or C("hi")) or C("warn"), C("bg"))
+                util.shortName(name), entry and entry.side or "?", rpm)
+            at(1 + column * 17, y, text, entry and (rpm ~= 0 and C("good") or C("hi")) or C("warn"), C("bg"))
             column = column + 1
             if column >= perRow then column = 0; y = y + 1 end
         end
@@ -489,19 +489,19 @@ local function drawProps(snap, reads)
     for index, name in ipairs(ship.order) do
         if y > H - 4 then break end
         local line_ = ship.lines[name]
-        local axis = cal.axisOf(name)
-        local label = util.labelFor(axis)
+        local entry = cal.sideOf(name)
+        local label = entry and entry.side or "unfiled"
         local rpm = snap.demands and snap.demands[name] or 0
         local tag = line_.main and "*" or " "
-        local colour = axis and C("hi") or C("warn")
+        local colour = entry and C("hi") or C("warn")
         at(1, y, string.rep(" ", W), C("hi"), C("bg"))
         -- A line driven over the radio is marked, because when it stops doing
         -- what it is told the place to look is a different computer.
         at(1, y, string.format("%s%-4s %-6s %-3s %5d", line_.remote and "~" or tag,
             util.shortName(name), label,
-            axis and axis.reverse and "rev" or "", rpm), colour)
+            entry and entry.reverse and "rev" or "", rpm), colour)
         biBar(24, y, math.max(6, W - 38), rpm, maxRpm,
-            axis and C("bar") or C("warn"))
+            entry and C("bar") or C("warn"))
         local tele = ship.readLineTelemetry(name)
         if tele then
             local note = ""
@@ -575,8 +575,8 @@ end
 
 -- == TAB: CAL ================================================
 
--- A curve drawn as a column chart, which is the only honest way to look at six
--- numbers and decide whether the ship is behaving linearly.
+-- A ladder drawn as a column chart, which is the only honest way to look at
+-- four numbers and decide whether the ship is behaving linearly.
 local function drawCurve(x, y, width, height, curve, colour)
     local top = util.curveTopSpeed(curve)
     if not curve or #curve == 0 or not top or top <= 0 then
@@ -594,49 +594,62 @@ local function drawCurve(x, y, width, height, curve, colour)
     end
 end
 
+-- One row per stage of the wizard, in the order the wizard runs them, because
+-- the thing a pilot wants off this tab is which stage still has to be done.
 local function drawCal(snap)
     local y = 2
-    local missing = cal.missingLines()
-    rule(y, "DIRECTION"); y = y + 1
-    line(y, string.format(" %d of %d lines calibrated%s",
-        #ship.order - #missing, #ship.order,
-        cal.meta.directionAt and ("   last run " .. cal.meta.directionAt) or ""),
-        #missing > 0 and C("warn") or C("good")); y = y + 1
-    if #missing > 0 then
-        local names = {}
-        for _, name in ipairs(missing) do names[#names + 1] = util.shortName(name) end
-        line(y, " uncalibrated: " .. table.concat(names, " ") .. "   run `cal`", C("warn")); y = y + 1
-    else
-        line(y, " `cal` again after a propeller moves or is rewired", C("dim")); y = y + 1
+    rule(y, "CALIBRATION"); y = y + 1
+
+    for _, row in ipairs(cal.summary()) do
+        if y > H - 4 then break end
+        at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+        -- The detail is cut to whatever the timestamp leaves, because a line
+        -- that runs under the date reads as a different sentence than it is.
+        local room = W - 13 - (row.at and (#row.at + 3) or 0)
+        at(1, y, string.format(" %d %-8s %s", row.index, row.title,
+            (row.detail or ""):sub(1, math.max(0, room))),
+            row.done and C("good") or C("warn"), C("bg"))
+        if row.at then
+            at(W - #row.at - 1, y, row.at, C("dim"), C("bg"))
+        end
+        y = y + 1
     end
 
-    rule(y, "VELOCITY"); y = y + 1
-    line(y, cal.meta.velocityAt and (" last run " .. cal.meta.velocityAt)
-        or " never run. `vcal` measures what this ship can actually do.",
-        cal.meta.velocityAt and C("dim") or C("warn")); y = y + 1
-
-    -- Two rows per axis: the headline with its sparkline, and the endpoints.
-    for _, entry in ipairs(cal.summary()) do
-        if y + 2 > H - 3 then break end
-        local curve = entry.pos or entry.neg
-        at(1, y, string.format(" %s  %d line%s  top %s", entry.axis:upper(), entry.lines,
-            entry.lines == 1 and "" or "s",
-            entry.top and string.format("%.2f m/s", entry.top) or "unmeasured"),
-            entry.top and C("hi") or C("dim"), C("bg"))
+    -- The two ladders worth a picture. Yaw and forward are what the controller
+    -- spends every tick reading, and a kink in either is visible here and
+    -- nowhere else.
+    for _, entry in ipairs({
+        { label = "YAW", curve = cal.yawCurve and cal.yawCurve.pos, unit = "deg/s" },
+        { label = "FWD", curve = cal.fwdCurve and cal.fwdCurve.pos, unit = "m/s" },
+    }) do
+        if y + 1 > H - 3 then break end
+        local curve = entry.curve
+        local top = util.curveTopSpeed(curve)
+        at(1, y, string.format(" %-4s top %s", entry.label,
+            top and string.format("%.2f %s", top, entry.unit) or "unmeasured"),
+            top and C("hi") or C("dim"), C("bg"))
         at(W - 24, y, string.rep(" ", 24), C("hi"), C("bg"))
         drawCurve(W - 24, y, 24, 1, curve, C("bar"))
+        y = y + 1
         if curve and #curve > 0 then
             local lo, hi = curve[1], curve[#curve]
-            at(1, y + 1, string.format("    %d rpm %.2f  ->  %d rpm %.2f",
+            at(1, y, string.format("    %d rpm %.2f  ->  %d rpm %.2f",
                 lo.rpm, lo.speed, hi.rpm, hi.speed), C("dim"), C("bg"))
         else
-            at(1, y + 1, "    no samples", C("dim"), C("bg"))
+            at(1, y, "    no samples", C("dim"), C("bg"))
         end
-        y = y + 2
+        y = y + 1
+    end
+
+    if y <= H - 3 and cal.inventory then
+        local ok, items = cal.inventoryCheck()
+        if not ok and #items > 0 then
+            line(y, " " .. items[1].text, kindColour(items[1].kind)); y = y + 1
+        end
     end
 
     while y <= H - 3 do line(y, "", C("bg")); y = y + 1 end
-    line(H - 2, " `cal` dirs   `vcal` speeds   `vcal y` one axis", C("dim"))
+    line(H - 2, " `cal` all five stages   `cal yaw` one of them   `forget <stage>`", C("dim"))
     local _ = snap
 end
 
@@ -1091,41 +1104,40 @@ function ui.makeWizard(title)
         wizardFrame(title, "q or Q stops")
         local y = 2
 
+        -- The card that offers a stage: what it does, how much room it wants,
+        -- and what the last run of it found.
+        if fields.stageTitle then
+            line(y, string.format(" stage %d of %d   %s", fields.stageIndex or 1,
+                fields.stageTotal or 1, fields.stageTitle), C("accent")); y = y + 1
+            if fields.what then line(y, " " .. fields.what, C("hi")); y = y + 1 end
+            if fields.room then line(y, " " .. fields.room, C("warn")); y = y + 1 end
+            if fields.current then
+                line(y, string.format(" now: %s%s", fields.current,
+                    fields.at and ("   last run " .. fields.at) or ""), C("dim")); y = y + 1
+            end
+        end
+
         if fields.step then
             line(y, string.format(" line %d of %d   %s", fields.step, fields.total,
                 util.shortName(fields.line or "")), C("hi")); y = y + 1
-            line(y, string.format(" currently: %s%s", fields.current or "?",
+            line(y, string.format(" currently: %s%s", fields.current or "unfiled",
                 fields.reversed and " (reversed)" or ""), C("dim")); y = y + 1
         end
 
-        if fields.stepNo then
-            line(y, string.format(" measurement %d of %d   axis %s%s   %d rpm",
-                fields.stepNo, fields.totalSteps, (fields.axis or "?"):upper(),
-                fields.way == "neg" and "-" or "+", fields.rpm or 0), C("hi")); y = y + 1
+        if fields.rungLabel then
+            local counter = fields.rungIndex
+                and string.format("measurement %d of %d   ", fields.rungIndex, fields.rungTotal or 0)
+                or ""
+            line(y, " " .. counter .. fields.rungLabel, C("hi")); y = y + 1
         end
 
-        if fields.spinning and not fields.done then
-            line(y, string.format(" spinning for %.1fs. Press Enter to stop it.",
-                fields.elapsed or 0), C("warn")); y = y + 1
-        end
-
-        if fields.drift then
-            local d = fields.drift
-            line(y, string.format(" drift  %+6.2f %+6.2f %+6.2f   looks like %s",
-                d[1], d[2], d[3], fields.guess or "?"), C("hi")); y = y + 1
-        end
-        if fields.best then
-            local b = fields.best
-            line(y, string.format(" strongest %+6.2f %+6.2f %+6.2f", b[1], b[2], b[3]),
-                C("accent")); y = y + 1
-        end
-        if fields.noPose then
-            line(y, " no pose read, so no measurement. Use your eyes.", C("bad")); y = y + 1
-        end
-
-        if fields.speed then
-            line(y, string.format(" speed %6.2f m/s   trend %+6.3f m/s2   %s",
-                fields.speed, fields.slope or 0, (fields.phase or ""):upper()),
+        -- One live row, whatever the stage happens to be measuring. The label
+        -- and the unit come with the reading, so a yaw rate is never drawn as
+        -- metres per second.
+        if fields.value then
+            line(y, string.format(" %-6s %+7.2f %-5s  trend %+6.3f  %s",
+                fields.valueLabel or "value", fields.value, fields.unit or "",
+                fields.slope or 0, (fields.phase or ""):upper()),
                 fields.phase == "cooldown" and C("warn") or C("hi")); y = y + 1
             at(1, y, " hold ", C("dim"), C("bg"))
             bar(7, y, math.max(6, W - 22), (fields.held or 0) / math.max(0.1, fields.holdNeeded or 1),
@@ -1137,6 +1149,24 @@ function ui.makeWizard(title)
                 C("panel"))
             at(W - 14, y, string.format("%4.1f/%-4.1fs", fields.elapsed or 0, fields.settle or 0),
                 C("dim"), C("bg")); y = y + 1
+        end
+
+        -- The sides stage reads two numbers at once and the second one is the
+        -- one that decides the answer, so it gets its own row rather than
+        -- sharing the live line.
+        if fields.yawRate then
+            line(y, string.format(" yaw    %+7.2f deg/s%s", fields.yawRate,
+                fields.guess and ("   looks like the " .. fields.guess) or ""),
+                C("accent")); y = y + 1
+        end
+        if fields.drift then
+            local d = fields.drift
+            line(y, string.format(" drift  %+6.2f %+6.2f %+6.2f", d[1], d[2], d[3]),
+                C("dim")); y = y + 1
+        end
+        if fields.pitch then
+            line(y, string.format(" nose   %+7.1f deg   from %.1f m/s", fields.pitch,
+                fields.from or 0), C("warn")); y = y + 1
         end
 
         if fields.samples and #fields.samples > 0 then

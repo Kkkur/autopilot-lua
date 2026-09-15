@@ -36,7 +36,7 @@ config.SCHEMA = {
     { key = "rpmSlew",       group = "loop",   kind = "int",    def = 64,   min = 4,   max = 256, step = 8,
       help = "Most RPM one line may change per tick. Softens the shove." },
 
-    -- Gains. The speed loop is what the velocity calibration feeds.
+    -- Gains. The speed loop is what the forward ladder feeds.
     { key = "posKp",         group = "gains",  kind = "number", def = 0.35, min = 0,   max = 5,   step = 0.05,
       help = "Position error to demanded speed, (m/s) per block." },
     { key = "posKi",         group = "gains",  kind = "number", def = 0.0,  min = 0,   max = 1,   step = 0.01,
@@ -54,31 +54,41 @@ config.SCHEMA = {
     { key = "useCurves",     group = "gains",  kind = "bool",   def = true,
       help = "Use the measured RPM-to-speed curves as feed-forward." },
 
-    -- Direction calibration
+    -- Calibration. The five stage wizard measures the ship with these, and
+    -- they are the only numbers in the program that describe a measurement
+    -- rather than a flight.
     { key = "calRpm",        group = "cal",    kind = "int",    def = 128,  min = 16,  max = 256, step = 16,
-      help = "RPM one line spins at while its direction is being read." },
+      help = "RPM one line spins at while the wizard reads which side it is on." },
     { key = "calSample",     group = "cal",    kind = "number", def = 0.3,  min = 0.05, max = 2, step = 0.05,
-      help = "Seconds between live drift readings during calibration." },
+      help = "Seconds between live readings while the wizard watches the ship." },
     { key = "calMinDrift",   group = "cal",    kind = "number", def = 0.15, min = 0.01, max = 5, step = 0.05,
-      help = "Drift below this reads as noise, not as a direction." },
-
-    -- Velocity calibration
-    { key = "velSteps",      group = "vcal",   kind = "int",    def = 6,    min = 2,   max = 16,  step = 1,
-      help = "How many RPM steps each axis is measured at." },
-    { key = "velStartRpm",   group = "vcal",   kind = "int",    def = 48,   min = 8,   max = 256, step = 8,
-      help = "Lowest RPM step of a velocity run." },
-    { key = "velEndRpm",     group = "vcal",   kind = "int",    def = 256,  min = 16,  max = 256, step = 8,
-      help = "Highest RPM step of a velocity run." },
-    { key = "velSettle",     group = "vcal",   kind = "number", def = 12.0, min = 1,   max = 120, step = 1,
-      help = "Seconds a step may take to reach a steady speed before giving up." },
-    { key = "velHold",       group = "vcal",   kind = "number", def = 3.0,  min = 0.5, max = 60,  step = 0.5,
-      help = "Seconds the speed has to stay steady before the step is kept." },
-    { key = "velStable",     group = "vcal",   kind = "number", def = 0.25, min = 0.01, max = 5,  step = 0.05,
-      help = "How much the speed may still be changing, m/s per second." },
-    { key = "velCooldown",   group = "vcal",   kind = "number", def = 4.0,  min = 0,   max = 60,  step = 0.5,
-      help = "Seconds of all-stop between steps, to shed the speed built up." },
-    { key = "velBothWays",   group = "vcal",   kind = "bool",   def = true,
-      help = "Measure each axis in both directions. Twice as slow, twice as right." },
+      help = "Speed below this reads as noise rather than as thrust." },
+    { key = "calMinYaw",     group = "cal",    kind = "number", def = 1.0,  min = 0.05, max = 30, step = 0.25,
+      help = "Yaw below this reads as a line on neither side, which is the main." },
+    { key = "calSteps",      group = "cal",    kind = "int",    def = 4,    min = 2,   max = 16,  step = 1,
+      help = "Rungs in the yaw and forward ladders." },
+    { key = "calStartRpm",   group = "cal",    kind = "int",    def = 64,   min = 8,   max = 256, step = 8,
+      help = "Lowest rung of the yaw and forward ladders." },
+    { key = "calEndRpm",     group = "cal",    kind = "int",    def = 256,  min = 16,  max = 256, step = 8,
+      help = "Highest rung of the yaw and forward ladders." },
+    { key = "calSettle",     group = "cal",    kind = "number", def = 12.0, min = 1,   max = 120, step = 1,
+      help = "Seconds a rung may take to steady before the reading is taken anyway." },
+    { key = "calHold",       group = "cal",    kind = "number", def = 3.0,  min = 0.5, max = 60,  step = 0.5,
+      help = "Seconds the reading has to stay steady before the rung is kept." },
+    { key = "calStable",     group = "cal",    kind = "number", def = 0.25, min = 0.01, max = 5,  step = 0.05,
+      help = "How much a speed may still be changing and count as steady, m/s per second." },
+    { key = "calYawStable",  group = "cal",    kind = "number", def = 1.5,  min = 0.05, max = 30, step = 0.25,
+      help = "The same, for a yaw rate, in deg/s per second. A hull swings slower than it accelerates." },
+    { key = "calCooldown",   group = "cal",    kind = "number", def = 4.0,  min = 0,   max = 60,  step = 0.5,
+      help = "Seconds of all stop between rungs, to shed what the last one built up." },
+    { key = "calBothWays",   group = "cal",    kind = "bool",   def = true,
+      help = "Measure the yaw and forward ladders both ways. Twice as slow, twice as right." },
+    { key = "calBalloonStep", group = "cal",   kind = "int",    def = 3,    min = 1,   max = 5,   step = 1,
+      help = "Strengths skipped in the balloon sweep before it refines around hover." },
+    { key = "calBalloonDwell", group = "cal",  kind = "number", def = 8.0,  min = 1,   max = 120, step = 1,
+      help = "Seconds a balloon strength is held before its climb rate is taken." },
+    { key = "calRunup",      group = "cal",    kind = "number", def = 8.0,  min = 1,   max = 120, step = 1,
+      help = "Seconds of full thrust before a brake rung, to have something to stop." },
 
     -- Fuel. The numbers live here rather than on the relay because these are
     -- the captain's judgement calls, not facts about the tanks.
@@ -222,8 +232,7 @@ config.GROUPS = {
     { id = "flight",   title = "FLIGHT ENVELOPE" },
     { id = "loop",     title = "CONTROL LOOP" },
     { id = "gains",    title = "GAINS" },
-    { id = "cal",      title = "DIRECTION CAL" },
-    { id = "vcal",     title = "VELOCITY CAL" },
+    { id = "cal",      title = "CALIBRATION" },
     { id = "fuel",     title = "FUEL" },
     { id = "turbine",  title = "TURBINE RELAY" },
     { id = "ui",       title = "INTERFACE" },

@@ -6,31 +6,6 @@
 
 local util = {}
 
--- == DIRECTIONS ==============================================
--- The vocabulary calibration answers in. Body frame, the ship's own, so these
--- line up with world directions only while the ship sits at identity
--- orientation.
-util.DIRECTIONS = {
-    up    = {  0,  1,  0 },
-    down  = {  0, -1,  0 },
-    north = {  0,  0, -1 },
-    south = {  0,  0,  1 },
-    east  = {  1,  0,  0 },
-    west  = { -1,  0,  0 },
-    none  = {  0,  0,  0 },
-}
-
-util.DIR_ORDER = { "up", "down", "north", "south", "east", "west", "none" }
-
--- Which body axis each direction lives on, so the controller can group the
--- lines that fight over the same degree of freedom.
-util.DIR_AXIS = {
-    up = "y", down = "y", north = "z", south = "z", east = "x", west = "x",
-}
-
-util.AXIS_ORDER = { "x", "y", "z" }
-util.AXIS_INDEX = { x = 1, y = 2, z = 3 }
-
 -- == QUATERNIONS =============================================
 
 -- Rotate v by the quaternion (ux, uy, uz, w): v + 2u x (u x v + w v).
@@ -165,36 +140,6 @@ function util.shortName(name)
         return "#" .. relay .. "." .. (rest:match("_(%d+)$") or rest)
     end
     return "#" .. (name:match("_(%d+)$") or name)
-end
-
--- Which named direction a measured drift is closest to, for calibration to
--- offer as its suggested answer.
-function util.dominantDirection(bx, by, bz, minMag)
-    if util.len3(bx, by, bz) < (minMag or 0.15) then return "none" end
-    local best, bestDot = "none", 0
-    for _, name in ipairs(util.DIR_ORDER) do
-        local d = util.DIRECTIONS[name]
-        local dot = bx * d[1] + by * d[2] + bz * d[3]
-        if dot > bestDot then best, bestDot = name, dot end
-    end
-    return best
-end
-
-function util.labelFor(axis)
-    if not axis then return "?" end
-    for _, name in ipairs(util.DIR_ORDER) do
-        local d = util.DIRECTIONS[name]
-        if axis[1] == d[1] and axis[2] == d[2] and axis[3] == d[3] then return name end
-    end
-    return "custom"
-end
-
--- A calibrated line is one of the named directions plus which way it has to
--- spin to get there. DIRECTIONS is shared, so never hand it out to be tagged.
-function util.makeAxis(direction, reverse)
-    local d = util.DIRECTIONS[direction]
-    if not d then return nil end
-    return { d[1], d[2], d[3], reverse = reverse or false }
 end
 
 -- == FORMATTERS ==============================================

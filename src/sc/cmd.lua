@@ -187,71 +187,85 @@ define("manual", {
 
 define("cal", {
     aliases = { "calibrate" },
-    usage = "cal",
-    help = "Learn which way each propeller pushes. Run this first, on a new ship.",
-    run = function()
-        control.stop("CALIBRATING")
-        ui.runWizard("DIRECTION CALIBRATION", function(ctx)
-            cal.runDirection(ctx)
-            ctx.clearFields()
-            ctx.note("done. Press Enter to go back.", "good")
-            ctx.waitEnter()
-        end)
-        return "direction calibration finished", "good"
-    end,
-})
-
-define("vcal", {
-    aliases = { "velcal", "speedtest" },
-    usage = "vcal [x|y|z]",
-    help = "Measure how fast the ship flies at each RPM step, and save the curve.",
+    usage = "cal [sides|balloon|yaw|forward|brake]",
+    help = "Measure the ship. Five stages, each confirmed and each skippable.",
     run = function(args)
-        local axis = args[1] and args[1]:lower() or nil
-        if axis and not util.AXIS_INDEX[axis] then return "axis is x, y or z", "warn" end
-        if #cal.missingLines() == #ship.order then
-            return "nothing is calibrated yet, run `cal` first", "bad"
+        local only = args[1] and args[1]:lower() or nil
+        if only and not cal.stageById(only) then
+            return "the stages are sides, balloon, yaw, forward and brake", "warn"
         end
+        -- Calibration is the one thing the gate never blocks. It is how a ship
+        -- gets into a state the checker would pass in the first place.
         control.stop("CALIBRATING")
-        ui.runWizard("VELOCITY CALIBRATION", function(ctx)
-            cal.runVelocity(ctx, axis)
-            ctx.clearFields()
-            ctx.note("done. Press Enter to go back.", "good")
-            ctx.waitEnter()
-        end)
+        ui.runWizard(only and ("CALIBRATION: " .. only:upper()) or "CALIBRATION",
+            function(ctx)
+                cal.runWizard(ctx, only)
+                ctx.clearFields()
+                ctx.note("done. Press Enter to go back.", "good")
+                ctx.waitEnter()
+            end)
         ui.tab = 4
-        return "velocity calibration finished", "good"
+        return "calibration finished", "good"
     end,
 })
 
 define("curves", {
     usage = "curves",
-    help = "Show the measured speed curves.",
+    help = "Show what calibration measured, stage by stage.",
     run = function()
         ui.tab = 4
         local parts = {}
-        for _, entry in ipairs(cal.summary()) do
-            parts[#parts + 1] = string.format("%s %s", entry.axis:upper(),
-                entry.top and string.format("%.1f m/s", entry.top) or "-")
+        for _, row in ipairs(cal.summary()) do
+            parts[#parts + 1] = string.format("%s %s", row.title,
+                row.done and "ok" or "-")
         end
         return table.concat(parts, "  "), "hi"
     end,
 })
 
+define("inventory", {
+    aliases = { "inv" },
+    usage = "inventory",
+    help = "Compare the ship on the network against the one that was measured.",
+    run = function()
+        local ok, items = cal.inventoryCheck()
+        if #items == 0 then
+            local now = cal.inventoryNow()
+            return string.format("%d lines, unchanged since calibration", now.total), "good"
+        end
+        -- The first difference, in its own words. The rest are on the CAL tab,
+        -- because a status line that lists four faults is read as one.
+        return items[1].text, ok and "warn" or "bad"
+    end,
+})
+
 define("forget", {
-    usage = "forget curves|dirs|all",
-    help = "Throw away calibration data so it can be measured again.",
+    usage = "forget sides|balloon|yaw|forward|brake|all",
+    help = "Throw away one stage of calibration so it can be measured again.",
     run = function(args)
         local what = (args[1] or ""):lower()
-        if what == "curves" then
-            cal.curves = {}
-            cal.meta.velocityAt = nil
-        elseif what == "dirs" or what == "directions" then
-            cal.axes = {}
-            cal.meta.directionAt = nil
+        if what == "sides" then
+            cal.sides, cal.yawAuth, cal.noseOffset = {}, {}, nil
+            cal.meta.sidesAt = nil
+        elseif what == "balloon" then
+            cal.balloonCurve, cal.altHover = nil, nil
+            cal.meta.balloonAt = nil
+        elseif what == "yaw" then
+            cal.yawCurve, cal.stressAtTurn = nil, nil
+            cal.meta.yawAt = nil
+        elseif what == "forward" then
+            cal.fwdCurve, cal.stressAtCruise = nil, nil
+            cal.meta.forwardAt = nil
+        elseif what == "brake" then
+            cal.brakeCurve = nil
+            cal.meta.brakeAt = nil
         elseif what == "all" then
-            cal.curves, cal.axes, cal.meta = {}, {}, {}
+            cal.sides, cal.yawAuth, cal.meta = {}, {}, {}
+            cal.noseOffset, cal.yawCurve, cal.fwdCurve = nil, nil, nil
+            cal.brakeCurve, cal.balloonCurve, cal.altHover = nil, nil, nil
+            cal.stressAtTurn, cal.stressAtCruise, cal.inventory = nil, nil, nil
         else
-            return "forget curves, dirs or all", "warn"
+            return "forget sides, balloon, yaw, forward, brake or all", "warn"
         end
         cal.save()
         return "forgotten: " .. what, "warn"

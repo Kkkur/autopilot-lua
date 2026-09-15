@@ -1,10 +1,10 @@
 -- starcatcher.lua -- entry point.
 --
--- A Create: Avionics autopilot for a ship with four propellers and a big one.
--- Or three propellers. Or eleven. Nothing about the vessel is written into the
--- program: it finds every rotation speed controller on its network, learns what
--- each one does from `cal`, learns how fast the ship flies from `vcal`, and
--- flies to whatever you point it at.
+-- A Create: Avionics autopilot for a tank turn hull: propellers all pointing
+-- one way, steering on the difference between its two sides, floating on a
+-- balloon. Nothing about the vessel is written into the program. It finds every
+-- rotation speed controller on its network and on its relays, and `cal`
+-- measures what each one is worth.
 --
 --   starcatcher            fly
 --   starcatcher --test     check the maths, needs no ship and no peripherals
@@ -43,13 +43,19 @@ local config = loadModule("config")
 -- == --test ==================================================
 
 if ARGS[1] == "--test" or ARGS[1] == "-t" then
-    -- cal is loaded with a stub ship: the parsing it is being tested on never
-    -- touches the network, and nothing here is allowed to write to disk.
-    local stubShip = { order = {}, readState = function() return nil end }
-    local stubCal = { topSpeed = function() return nil end }
+    local stubShip = { order = {}, remoteLines = {}, readState = function() return nil end }
+    local stubCal = { topForward = function() return nil end }
     local stubControl = {}
     local stubLog = setmetatable({}, { __index = function() return function() end end })
-    local calModule = loadModule("cal", util, stubShip, config, stubLog)
+    -- flight is pure the way util is, so it needs nothing stubbed at all. That
+    -- is the whole point of it being its own module. cal reads it, for the
+    -- mixer the ladders are measured through, so it is built first.
+    local flightModule = loadModule("flight", util)
+    -- cal is loaded with a stub ship and no relay: the parsing it is being
+    -- tested on never touches the network, and nothing here writes to disk.
+    local stubTurbine = { hasBalloon = function() return false end }
+    local calModule = loadModule("cal", util, stubShip, config, stubLog,
+        flightModule, stubTurbine)
     -- The fuel module never touches a peripheral until init is called, so it
     -- can be loaded and have its arithmetic checked on a computer with no modem.
     local fuelModule = loadModule("fuel", util, stubShip, stubCal, stubControl, config, stubLog)
@@ -58,9 +64,6 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     -- ship.lua touches a peripheral until discover is called, and it is not.
     local shipModule = loadModule("ship", util)
     local turbineModule = loadModule("turbine", util, shipModule, config, stubLog)
-    -- flight is pure the way util is, so it needs nothing stubbed at all. That
-    -- is the whole point of it being its own module.
-    local flightModule = loadModule("flight", util)
     local tests = loadModule("tests", util, config, calModule, fuelModule,
         turbineModule, shipModule, flightModule)
     return tests.run() and 0 or 1
@@ -69,8 +72,8 @@ end
 if ARGS[1] == "--help" or ARGS[1] == "-h" then
     print("starcatcher -- Create: Avionics autopilot")
     print("")
-    print("  cal          learn which way each propeller pushes")
-    print("  vcal         measure how fast the ship flies per RPM")
+    print("  cal          measure the ship: sides, balloon, yaw, forward, brake")
+    print("  cal yaw      run one stage of it again")
     print("  save <name>  pin a waypoint where you are")
     print("  goto <name>  fly there")
     print("  fly x y z    fly to coordinates")
@@ -93,11 +96,12 @@ local log = loadModule("log")
 log.init(DATA, function() return config.get("logLevel") end)
 
 local ship = loadModule("ship", util)
-local cal = loadModule("cal", util, ship, config, log)
 local flight = loadModule("flight", util)
--- turbine before control: the control loop commands the balloon, and the
--- balloon is a relay, so the link has to exist before the loop that drives it.
+-- turbine before cal and before control: the balloon is a relay, and both the
+-- wizard that measures it and the loop that drives it need the link to exist
+-- before they are built.
 local turbine = loadModule("turbine", util, ship, config, log)
+local cal = loadModule("cal", util, ship, config, log, flight, turbine)
 local control = loadModule("control", util, ship, cal, config, log, flight, turbine)
 local nav = loadModule("nav", util, control, log)
 local fuel = loadModule("fuel", util, ship, cal, control, config, log)

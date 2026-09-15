@@ -224,6 +224,21 @@ function ship.bodyVelocity()
     return { x = state.bx, y = state.by, z = state.bz }
 end
 
+-- Yaw rate out of CC: Sable, in the units and the sign the rest of the program
+-- thinks in. getAngularVelocity is radians about the world axes, and its y runs
+-- opposite to this yaw convention, which is the single easiest sign in the
+-- program to get backwards and the hardest to notice. It lives here rather than
+-- in the control loop because calibration measures the same number the
+-- controller flies by, and two readings of it would be two conventions.
+function ship.yawRate()
+    if type(sublevel) ~= "table" or not sublevel.getAngularVelocity then return nil end
+    local ok, raw = pcall(sublevel.getAngularVelocity)
+    if not ok then return nil end
+    local vec = util.toVec(raw)
+    if not vec then return nil end
+    return -math.deg(vec.y)
+end
+
 -- Extras that are nice on the panel and never load-bearing. Each one is
 -- optional hardware, so each one is allowed to come back nil.
 function ship.readExtras()

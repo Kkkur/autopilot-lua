@@ -184,7 +184,7 @@ function fuel.status()
     -- What it would manage at the cruise it is allowed to ask for, which is the
     -- number worth planning the next leg against.
     local cruise = math.min(config.get("cruiseSpeed"),
-        cal.topSpeed("z") or cal.topSpeed("x") or config.get("cruiseSpeed"))
+        cal.topForward() or config.get("cruiseSpeed"))
     if out.endurance and cruise and cruise > 0 then
         out.rangeAtCruise = out.endurance * cruise
     end

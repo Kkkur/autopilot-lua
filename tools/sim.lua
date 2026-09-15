@@ -23,10 +23,9 @@ local options = { frames = 1600, verbose = false, script = "fly" }
 for index = 1, #(arg or {}) do
     if arg[index] == "--frames" then options.frames = tonumber(arg[index + 1]) or 1600 end
     if arg[index] == "--verbose" then options.verbose = true end
-    if arg[index] == "--vcal" then options.script = "vcal"; options.frames = 4000 end
     if arg[index] == "--tabs" then options.script = "tabs"; options.frames = 400 end
 if arg[index] == "--clicks" then options.script = "clicks"; options.frames = 400 end
-    if arg[index] == "--cal" then options.script = "cal"; options.frames = 3000 end
+    if arg[index] == "--cal" then options.script = "cal"; options.frames = 9000 end
     if arg[index] == "--test" then options.script = "test" end
     -- The physics probe is about the hull, so it picks its own ship and there is
     -- no sense in asking for it against the other one.
@@ -262,14 +261,17 @@ local stepPhysics, poseOf, angularVelocityOf
 --   the main propeller is nearly three times the turbine
 --   nothing is wired to this computer, so ship.discover() sees zero lines
 --
--- Levers are signed, left negative and right positive, and a positive torque
--- raises yaw. Which of those the autopilot calls left is not written down
--- anywhere it can read: it has to spin each one and watch.
+-- Levers are signed and a positive torque raises yaw, which is the ship turning
+-- to its own right. At yaw 0 the hull faces +Z and its own right is -X, so the
+-- left side sits at +X, and a forward push there swings the nose right. The left
+-- lever is the positive one for that reason and no other. Which line the
+-- autopilot calls left is not written down anywhere it can read: it has to spin
+-- each one and watch.
 
 local TANK_TURBINE_POWER = 0.0045
 local TANK_MAIN_POWER    = 0.0120
-local TANK_LEVER_LEFT    = -1.45   -- the weaker side, on purpose
-local TANK_LEVER_RIGHT   =  1.60
+local TANK_LEVER_LEFT    =  1.45   -- the weaker side, on purpose
+local TANK_LEVER_RIGHT   = -1.60
 
 -- Steady yaw rate at a full differential is deg(torque / inertia) / drag, which
 -- with these comes out near 32 deg/s, a little over the 30 the tank phase caps
@@ -456,6 +458,24 @@ files["starcatcher/cal.cfg"] = [[{
   meta = { sidesAt = "seeded", yawAt = "seeded", forwardAt = "seeded",
            brakeAt = "seeded", balloonAt = "seeded" },
 }]]
+
+-- The wizard, driven headless, measures a ship that is not really there in real
+-- time. Every rung waits for a number to stop moving, and at the shipped
+-- defaults five stages take about eight minutes of simulated time. These are
+-- the same settings a pilot can reach from the TUNE tab, wound down to what the
+-- toy ship needs, so what is being tested is the wizard and not the patience of
+-- whoever runs it.
+if options.script == "cal" then
+    files["starcatcher/config.cfg"] = [[{
+      calSettle = 8, calHold = 1, calStable = 0.3, calYawStable = 1.5,
+      calCooldown = 1, calSample = 0.2, calSteps = 3,
+      calBalloonDwell = 4, calRunup = 5,
+    }]]
+    -- and it starts from a ship nobody has ever measured, because a run that
+    -- began from the seeded answers would be testing the file rather than the
+    -- five stages that write it.
+    files["starcatcher/cal.cfg"] = nil
+end
 
 peripheral = {}
 function peripheral.getNames()
@@ -792,6 +812,17 @@ local function runAll(waitForAll, ...)
         end
     end
 
+    -- Time passing wakes everything that was due, whatever else the script
+    -- happened to have queued. Leaving this out of any branch is a deadlock:
+    -- a key waiting for a task that is asleep, and a task that is never woken
+    -- because a key is waiting. That is what made the calibration scripts sit
+    -- at their first prompt for the whole run.
+    local function wakeDue()
+        for index in ipairs(routines) do
+            if wakeAt[index] and wakeAt[index] <= clock + 1e-9 then step(index, nil) end
+        end
+    end
+
     for index, fn in ipairs(tasks) do routines[index] = coroutine.create(fn) end
     for index in ipairs(routines) do step(index, nil) end
 
@@ -814,6 +845,7 @@ local function runAll(waitForAll, ...)
             event.wait = event.wait - 1
             if event.wait <= 0 then table.remove(eventQueue, 1) end
             advanceTo(clock + 0.05)
+            wakeDue()
         elseif event then
             local target = nil
             for index in ipairs(routines) do
@@ -833,6 +865,7 @@ local function runAll(waitForAll, ...)
             else
                 -- Something is queued and nobody is listening for it yet.
                 advanceTo(clock + 0.05)
+                wakeDue()
             end
         else
             local earliest = nil
@@ -847,11 +880,7 @@ local function runAll(waitForAll, ...)
                 advanceTo(clock + 0.05)
             else
                 advanceTo(earliest)
-                for index in ipairs(routines) do
-                    if wakeAt[index] and wakeAt[index] <= clock + 1e-9 then
-                        step(index, nil)
-                    end
-                end
+                wakeDue()
             end
         end
     end
@@ -873,24 +902,44 @@ local function typeLine(text)
 end
 
 if options.script == "cal" then
-    -- Walk the direction wizard with a pilot who agrees with everything: spin
-    -- it, let it drift, stop it, yes that is the right way, yes that is the
-    -- direction.
+    -- Walk the five stage wizard with a pilot who agrees with everything: run
+    -- the stage, accept the side it read, yes run the brake test.
+    --
+    -- The waits are what makes this work rather than decoration. A key pressed
+    -- while a rung is settling is swallowed by the abort watcher the settle runs
+    -- against, so every answer has to arrive after the measurement it answers
+    -- has finished. Generous is safe: the wizard sits at its prompt.
+    -- Nothing is on the network at boot. Every propeller on this ship is on a
+    -- relay and they adopt about a second in, so a wizard started before that
+    -- measures a ship with no propellers on it.
+    queueWait(60)
     typeLine("cal")
-    -- Five wired lines and the two the turbine relay hands over, plus slack, so
-    -- the wizard is always answered to the end no matter what the toy ship gains.
-    for _ = 1, 8 do
-        queueWait(10)
-        queueEvent("key", keys.enter)      -- spin this one
-        queueWait(60)
-        queueEvent("key", keys.enter)      -- stop it
-        queueWait(5)
-        queueEvent("key", keys.enter)      -- yes, right way round
-        queueWait(5)
-        queueEvent("key", keys.enter)      -- take the suggested direction
+
+    -- Sides: one prompt to spin each line and one to accept what it read.
+    queueWait(20); queueEvent("key", keys.enter)
+    for _ = 1, 5 do
+        queueWait(20);  queueEvent("key", keys.enter)
+        queueWait(230); queueEvent("key", keys.enter)
     end
-    queueWait(5)
+
+    -- Balloon: a sweep and a refinement, and nothing to answer while it runs.
+    queueWait(20); queueEvent("key", keys.enter)
+    queueWait(900)
+
+    -- Yaw, then forward. Both ladders, both ways, no questions.
     queueEvent("key", keys.enter)
+    queueWait(1300)
+    queueEvent("key", keys.enter)
+    queueWait(1300)
+
+    -- Braking: four run ups, each one confirmed on its own.
+    queueEvent("key", keys.enter)
+    for _ = 1, 4 do
+        queueWait(20);  queueEvent("key", keys.enter)
+        queueWait(420)
+    end
+
+    queueWait(20); queueEvent("key", keys.enter)
 elseif options.script == "tabs" then
     -- Walk every tab and photograph each one, which is the cheapest way to
     -- catch a draw that indexes off the end of something.
@@ -910,10 +959,6 @@ elseif options.script == "clicks" then
     for _, x in ipairs({ 12, 20, 27, 34, 41, 48, 51, 4 }) do
         queueEvent("mouse_click", 1, x, 1)
     end
-elseif options.script == "vcal" then
-    -- Drive the velocity calibration wizard end to end. Nothing answers it, so
-    -- it runs its whole ladder on the toy ship and writes the curves out.
-    typeLine("vcal y")
 else
 
 -- A short flight: save where we are, fly somewhere, watch it get there.
@@ -1004,7 +1049,9 @@ if options.script == "physics" then
     print("")
     print("=== the tank turn ===")
     reset()
-    turbines(-256, -256, 256, 256)
+    -- Left hard forward and right hard back, which is what the mixer does with
+    -- a positive differential, and what turns the ship to its own right.
+    turbines(256, 256, -256, -256)
     settle(12)
     local fullRate = sim.yawRate
     report("full differential yaw rate", fullRate, 32.0, 3.0, "deg/s")
@@ -1132,6 +1179,90 @@ if options.script == "cal" then
     print("")
     print("=== cal.cfg ===")
     print(files["starcatcher/cal.cfg"] or "(nothing written)")
+
+    -- The wizard is only worth running headless if something reads what it
+    -- wrote. The toy ship's own constants are the answer key: a run that files
+    -- a turbine on the wrong side, or a top speed the hull cannot do, is a run
+    -- that would fly the real ship into something.
+    print("")
+    print("=== what it measured, against the toy ship ===")
+    local failures = 0
+    local function claim(name, ok, detail)
+        if not ok then failures = failures + 1 end
+        print(string.format("%-34s %-24s %s", name, detail or "", ok and "ok" or "FAILED"))
+    end
+
+    local measured = textutils.unserialize(files["starcatcher/cal.cfg"] or "")
+    if type(measured) ~= "table" then
+        claim("the wizard wrote a file", false, "nothing readable")
+    else
+        local truth = {
+            ["2:Create_RotationSpeedController_0"] = "left",
+            ["2:Create_RotationSpeedController_1"] = "left",
+            ["2:Create_RotationSpeedController_2"] = "right",
+            ["2:Create_RotationSpeedController_3"] = "right",
+            ["3:Create_RotationSpeedController_0"] = "main",
+        }
+        for name, side in pairs(truth) do
+            local got = measured.sides and measured.sides[name]
+            claim("side of " .. name:gsub("Create_RotationSpeedController", "rsc"),
+                got ~= nil and got.side == side and got.reverse == false,
+                (got and got.side or "nothing") .. ", wanted " .. side)
+        end
+
+        local function top(pair)
+            local best = 0
+            for _, way in ipairs({ "pos", "neg" }) do
+                for _, rung in ipairs((pair or {})[way] or {}) do
+                    if rung.speed > best then best = rung.speed end
+                end
+            end
+            return best
+        end
+
+        local yawTop = top(measured.yawCurve)
+        claim("top yaw rate", yawTop > 28 and yawTop < 34,
+            string.format("%.1f deg/s, want 32", yawTop))
+        local fwdTop = top(measured.fwdCurve)
+        claim("top speed", fwdTop > 12.5 and fwdTop < 14.5,
+            string.format("%.2f m/s, want 13.96", fwdTop))
+        claim("hover strength", measured.altHover == 7 or measured.altHover == 8,
+            tostring(measured.altHover) .. ", want 7 or 8")
+        claim("both sides have an authority",
+            measured.yawAuth ~= nil and (measured.yawAuth.left or 0) > 0
+                and (measured.yawAuth.right or 0) > 0,
+            string.format("%.4f and %.4f", (measured.yawAuth or {}).left or 0,
+                (measured.yawAuth or {}).right or 0))
+        -- The weaker side is the left one on this hull, by construction, and a
+        -- run that got that backwards would compensate a turn the wrong way.
+        claim("the left side is the weaker",
+            ((measured.yawAuth or {}).left or 0) < ((measured.yawAuth or {}).right or 0),
+            "left under right")
+
+        local mainRungs = measured.brakeCurve and measured.brakeCurve.main
+        local allRungs = measured.brakeCurve and measured.brakeCurve.all
+        claim("both brake ladders measured",
+            mainRungs and #mainRungs == 2 and allRungs and #allRungs == 2,
+            string.format("%d main, %d all", mainRungs and #mainRungs or 0,
+                allRungs and #allRungs or 0))
+        if mainRungs and allRungs then
+            claim("all five stops harder than the main",
+                allRungs[#allRungs].speed > mainRungs[#mainRungs].speed,
+                string.format("%.2f against %.2f", allRungs[#allRungs].speed,
+                    mainRungs[#mainRungs].speed))
+            claim("and noses over further doing it",
+                (allRungs[#allRungs].pitch or 0) > (mainRungs[#mainRungs].pitch or 0),
+                string.format("%.1f against %.1f deg", allRungs[#allRungs].pitch or 0,
+                    mainRungs[#mainRungs].pitch or 0))
+        end
+    end
+
+    print("")
+    if failures > 0 then
+        print("FAILED: " .. failures .. " of the measurements are wrong")
+        error("calibration measured the wrong ship", 0)
+    end
+    print("every measurement matches the toy ship, over " .. frames .. " frames")
     return
 end
 
@@ -1156,15 +1287,6 @@ if options.script == "clicks" then
     end
     print("")
     print("clicked " .. #shots .. " times over " .. frames .. " frames")
-    return
-end
-
-if options.script == "vcal" then
-    print("")
-    print("=== cal.cfg ===")
-    print(files["starcatcher/cal.cfg"] or "(nothing written)")
-    print("")
-    print("simulation finished after " .. frames .. " frames")
     return
 end
 

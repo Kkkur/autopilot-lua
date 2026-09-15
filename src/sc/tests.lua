@@ -78,16 +78,7 @@ function tests.run()
     check(util.compass(0) == "S", "0 degrees is south")
     check(util.compass(180) == "N", "180 degrees is north")
 
-    -- == labels and directions ==
-    check(util.dominantDirection(0, 0, -2.4) == "north", "reads a north drift")
-    check(util.dominantDirection(-1.1, 0.2, 0.3) == "west", "reads the dominant axis")
-    check(util.dominantDirection(0.01, 0, -0.02) == "none", "ignores noise")
-    check(util.labelFor({ 0, 0, 1 }) == "south", "labels a known axis")
-    check(util.labelFor({ 0.5, 0.5, 0 }) == "custom", "does not invent a label")
-    check(util.labelFor(nil) == "?", "an uncalibrated line has no label")
-    check(util.makeAxis("up", true).reverse == true, "the reverse flag is carried")
-    check(util.DIRECTIONS.up.reverse == nil, "the shared direction is never tagged")
-    check(util.labelFor(util.makeAxis("up", true)) == "up", "reversing does not change the label")
+    -- == names ==
     check(util.shortName("Create_RotationSpeedController_3") == "#3", "short name")
 
     -- == PID ==
@@ -140,42 +131,122 @@ function tests.run()
             "the default for " .. entry.key .. " passes its own bounds")
     end
 
-    -- == calibration file ==
-    local axes, missing = cal.parseAxes(nil, { "a", "b", "c" })
-    check(next(axes) == nil and #missing == 3, "no config means everything is missing")
-    axes, missing = cal.parseAxes({ a = { 0, 1, 0 }, b = "junk", c = { 1, 2 } }, { "a", "b", "c" })
-    check(axes.a[2] == 1, "a good entry loads")
-    check(#missing == 2 and missing[1] == "b" and missing[2] == "c", "bad entries are named")
-    axes, missing = cal.parseAxes({ a = { 0, 1, 0 }, z = { 1, 0, 0 } }, { "a" })
-    check(#missing == 0 and axes.z == nil, "a controller that left is dropped")
-    check(axes.a.reverse == false, "an old file with no reverse flag still loads")
-    axes = cal.parseAxes({ a = { 0, 1, 0, reverse = true } }, { "a" })
-    check(axes.a.reverse == true, "and the flag round trips")
-
-    local curves = cal.parseCurves({
-        y = { pos = { { rpm = 100, speed = 3 }, { rpm = 50, speed = 1 } }, neg = {} },
-        q = { pos = { { rpm = 10, speed = 1 } } },
+    -- == the calibration file ==
+    -- Every field is allowed to be missing and none of them may be guessed at,
+    -- so what is tested is that junk is refused rather than rounded off.
+    local sides = cal.parseSides({
+        a = { side = "left" },
+        b = { side = "right", reverse = true },
+        c = { side = "sideways" },
+        d = "junk",
     })
-    check(curves.y and #curves.y.pos == 2, "a curve loads")
-    check(curves.y.pos[1].rpm == 50, "and comes back sorted")
-    check(curves.y.neg == nil, "an empty direction is dropped")
-    check(curves.q == nil, "a bogus axis name is dropped")
+    check(sides.a and sides.a.side == "left", "a side loads")
+    check(sides.a.reverse == false, "an entry with no reverse flag still loads")
+    check(sides.b.reverse == true, "and the flag round trips")
+    check(sides.c == nil, "a side that is not a side is dropped")
+    check(sides.d == nil, "a line that is not a table is dropped")
+    check(next(cal.parseSides(nil)) == nil, "no file means no sides")
+
+    local pair = cal.parsePair({
+        pos = { { rpm = 128, speed = 6 }, { rpm = 64, speed = 3 } },
+        neg = {},
+    })
+    check(pair and #pair.pos == 2, "a ladder loads")
+    check(pair.pos[1].rpm == 64, "and comes back sorted")
+    check(pair.neg == nil, "an empty direction is dropped")
+    check(cal.parsePair({ pos = {}, neg = {} }) == nil, "an empty pair is no pair at all")
+
+    local brake = cal.parseBrake({
+        main = { { rpm = 256, speed = 3, pitch = 6.4 }, { rpm = -128, speed = -1.5 } },
+        all = "junk",
+    })
+    check(brake and #brake.main == 2, "a brake ladder loads")
+    check(brake.main[1].rpm == 128 and brake.main[1].speed == 1.5,
+        "a rung written negative is read as a magnitude")
+    check(brake.main[2].pitch == 6.4, "the pitch util does not know about survives")
+    check(brake.main[1].pitch == nil, "and a rung without one keeps nil")
+    check(brake.all == nil, "a ladder that is not a table is dropped")
+
+    -- The balloon ladder crosses zero, so it must not be folded onto itself the
+    -- way the magnitude ladders are.
+    local balloon = cal.parseBalloon({
+        { rpm = 8, speed = 0.12 }, { rpm = 0, speed = -1.78 }, { rpm = 15, speed = 1.78 },
+    })
+    check(balloon and #balloon == 3, "the balloon ladder loads")
+    check(balloon[1].rpm == 0 and balloon[1].speed < 0, "sinking stays negative")
+    check(cal.parseBalloon({}) == nil, "an empty balloon ladder is nil")
+
+    -- == the wizard, without a ship ==
+    config.values = config.defaults()
+    local ladder = cal.rpmLadder()
+    check(#ladder == config.get("calSteps"), "the ladder has as many rungs as asked for")
+    check(ladder[1] == config.get("calStartRpm"), "and starts where it was told to")
+    check(ladder[#ladder] == config.get("calEndRpm"), "and ends where it was told to")
+    for _, stage in ipairs(cal.STAGES) do
+        check(cal.stageById(stage.id) == stage, stage.id .. " is reachable by name")
+    end
+    check(cal.stageById("axes") == nil, "a stage that does not exist is not invented")
+    check(#cal.summary() == #cal.STAGES, "the screen gets a row for every stage")
+    for _, row in ipairs(cal.summary()) do
+        check(row.done == false, "an unmeasured stage does not claim to be done")
+    end
+
+    -- == the inventory ==
+    -- The checker compares the ship on the network against the one that was
+    -- measured, so what it must never do is pass a ship with a part missing.
+    cal.inventory = nil
+    check(select(1, cal.inventoryCheck()) == false, "a ship never measured does not pass")
+    cal.inventory = {
+        relays = { { id = 2, lines = 4 }, { id = 3, lines = 1 } },
+        sides = { left = 2, right = 2, main = 1 },
+        total = 5,
+    }
+    local invOk, invItems = cal.inventoryCheck()
+    check(invOk == false, "a ship with no lines on the network fails against a measured one")
+    local named = false
+    for _, item in ipairs(invItems) do
+        if item.text:find("relay #2") then named = true end
+    end
+    check(named, "and the relay that is missing is named")
+    cal.inventory = nil
 
     -- == mixing ==
-    -- Two propellers on the same axis, one mounted up and one mounted down,
-    -- both wired forwards. Asking to climb must drive them opposite ways so
-    -- they push the same real direction.
-    local up = util.makeAxis("up")
-    local down = util.makeAxis("down")
-    local index = util.AXIS_INDEX.y
-    near(up[index], 1, "up is +y")
-    near(down[index], -1, "down is -y")
-    local rpmUp = 100 * up[index] * (up.reverse and -1 or 1)
-    local rpmDown = 100 * down[index] * (down.reverse and -1 or 1)
-    check(rpmUp > 0 and rpmDown < 0, "opposed propellers get opposite signs")
-    local revUp = util.makeAxis("up", true)
-    check(100 * revUp[index] * (revUp.reverse and -1 or 1) < 0,
-        "a reversed line is negated on top of where it points")
+    -- The mixer is the one place a side becomes an RPM. What matters is that a
+    -- differential pushes the two sides opposite ways, that a line mounted
+    -- backwards is negated on top of that, and that the main is never part of
+    -- a turn.
+    config.values = config.defaults()
+    local mixCal = {
+        sides = {
+            l = { side = "left" }, r = { side = "right" },
+            m = { side = "main" }, rev = { side = "left", reverse = true },
+        },
+        yawAuth = { left = 0.06, right = 0.06 },
+    }
+    local lines = { "l", "r", "m", "rev" }
+    local out = flight.mix(0, 128, lines, mixCal, config.values)
+    check(out.l > 0 and out.r < 0, "a differential drives the two sides opposite ways")
+    check(out.m == 0, "and leaves the main out of it")
+    check(out.rev < 0, "a line mounted backwards is negated on top of its side")
+
+    out = flight.mix(200, 0, lines, mixCal, config.values)
+    check(out.l == out.r and out.l > 0, "plain thrust drives both sides the same")
+    check(out.m > 0, "and the main with them")
+
+    -- Graduated braking is the reason the main and the turbines are given their
+    -- thrust separately. A plan that reverses the main alone has to arrive at
+    -- the propellers as the main alone, which a single common number cannot say.
+    out = flight.mixParts(-200, 0, 0, lines, mixCal, config.values)
+    check(out.m < 0, "the main alone reverses")
+    check(out.l == 0 and out.r == 0, "and the turbines stay out of it")
+
+    -- The two sides of a hand built hull are never the same distance out, so
+    -- equal torque needs the stronger side held back.
+    local scaleL, scaleR = flight.sideScales(0.04, 0.08)
+    near(scaleL, 1, "the weaker side runs at full")
+    near(scaleR, 0.5, "and the stronger is halved to match")
+    scaleL, scaleR = flight.sideScales(nil, 0.08)
+    check(scaleL == 1 and scaleR == 1, "an unmeasured side is not scaled at all")
 
     -- == fuel ==
     -- The relay is a computer that is not here, so what gets tested is the
@@ -448,13 +519,15 @@ function tests.run()
 
     local pid = util.newPID(4, 0, 0, -1000, 1000)
     local demand = flight.tankDemand(20, pid, calShip, cfg, 0.2)
-    check(demand.left < 0 and demand.right > 0, "a right hand error drives the sides opposite")
+    -- Positive error means the target is off to the right, and the way a tank
+    -- hull turns right is by pushing harder on its left.
+    check(demand.left > 0 and demand.right < 0, "a right hand error pushes the left side")
     check(demand.main == 0, "and the main stays out of a tank turn")
     near(demand.rate, 30, "the wanted rate is capped at yawRateMax")
 
     pid:reset()
     demand = flight.tankDemand(-20, pid, calShip, cfg, 0.2)
-    check(demand.left > 0 and demand.right < 0, "and the other way round the other way")
+    check(demand.left < 0 and demand.right > 0, "and the other way round the other way")
 
     pid:reset()
     demand = flight.tankDemand(0.01, pid, calShip, cfg, 0.2)
@@ -535,7 +608,7 @@ function tests.run()
     check(mixed.xx == 0, "a line calibrated as none is left alone")
 
     mixed = flight.mix(0, 64, lines, calShip, cfg)
-    check(mixed.ta < 0 and mixed.tc > 0, "a positive differential raises yaw")
+    check(mixed.ta > 0 and mixed.tc < 0, "a positive differential pushes the left side")
     check(mixed.mn == 0, "and the main takes no part in a turn")
 
     mixed = flight.mix(300, 0, lines, calShip, cfg)
