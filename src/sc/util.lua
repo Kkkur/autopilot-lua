@@ -154,7 +154,16 @@ end
 
 -- Trailing number off a peripheral name, so the screen can say "#3" instead of
 -- "Create_RotationSpeedController_3".
+--
+-- A line on a relay arrives named "<relay id>:<peripheral name>" and reads as
+-- "#2.3", line 3 on relay 2. Without the relay in it, the two ships' worth of
+-- propellers that both end in _0 would be two rows on the screen with the same
+-- label, which is the display half of the collision the qualified name fixes.
 function util.shortName(name)
+    local relay, rest = tostring(name):match("^(%d+):(.+)$")
+    if relay then
+        return "#" .. relay .. "." .. (rest:match("_(%d+)$") or rest)
+    end
     return "#" .. (name:match("_(%d+)$") or name)
 end
 

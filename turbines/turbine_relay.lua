@@ -1,20 +1,36 @@
--- turbine_relay.lua -- the turbine half of the ship, on its own computer.
+-- turbine_relay.lua -- a propeller half of the ship, on its own computer.
 --
--- Two Create rotation speed controllers and a stressometer sit on this
--- computer's network. It drives the controllers when the autopilot tells it to,
--- reports the stress the whole time, and stops the turbines the moment the
--- autopilot stops talking.
+-- Create rotation speed controllers and a stressometer sit on this computer's
+-- network. It drives the controllers when the autopilot tells it to, reports the
+-- stress the whole time, and stops the turbines the moment the autopilot stops
+-- talking.
+--
+-- One program, more than one computer. The ship has two of these: the turbine
+-- relay holding the four turbines and the stressometer, and the cruise relay
+-- holding the main propeller and a redstone relay driving the balloon. They run
+-- the same file, because two programs for one job drift apart.
+--
+-- Two computers means two things this program has to get right that a single
+-- relay never had to:
+--
+--   Peripheral names are per network, not global, so both relays will happily
+--   offer a Create_RotationSpeedController_0. Every line this one advertises is
+--   therefore named "<this computer's id>:<peripheral name>", and a command
+--   addressed to another relay's id is not ours to obey.
+--
+--   The deadman is not the same for everything. See DEADMAN below.
 --
 -- setTargetSpeed is a mainThread call and costs a server tick each, which is
 -- the reason this is worth being a separate computer: those ticks are spent
 -- here instead of inside the flight loop. The pattern is the one from
 -- src/old/autopilot.lua, which is where the flush below comes from.
 --
---   turbine_relay          run it
---   turbine_relay --once   print one reading and exit, for checking the wiring
---   turbine_relay --spin N drive both lines at N rpm for ten seconds, by hand
+--   turbine_relay            run it
+--   turbine_relay --once     print one reading and exit, for checking the wiring
+--   turbine_relay --spin N   drive every line at N rpm for ten seconds, by hand
+--   turbine_relay --balloon N  hold the balloon at strength N for ten seconds
 --
--- Everything it writes lives in turbinerelay/logs/ next to this file.
+-- Everything it writes lives in turbinerelay/ next to this file.
 
 local ARGS = { ... }
 
@@ -40,8 +56,27 @@ local PROTOCOL    = "starcatcher-turbine"  -- must match the flight computer
 local HOSTNAME    = "turbines"
 local SEND_EVERY  = 1.0     -- seconds between stress broadcasts
 local MAX_RPM     = 256     -- what a speed controller will take, either way
-local DEADMAN     = 3.0     -- seconds without a command before the turbines stop
 local MODEM_SIDES = { "top", "bottom", "left", "right", "front", "back" }
+
+-- The deadman, and the one place in this program where two things that look
+-- like each other are deliberately opposite. Do not tidy them into agreement.
+--
+-- A radio goes quiet when a chunk unloads, when the flight computer crashes, or
+-- when someone breaks it. Turbines left running at the last thing they were told
+-- fly the ship into terrain, so thrust expires. A balloon left at the last thing
+-- it was told is the only reason the ship is still in the air, so lift does not.
+--
+-- Zeroing the balloon on silence would mean a chunk unload drops the ship out of
+-- the sky, which is the exact failure the whole fuel and relay design exists to
+-- avoid.
+local DEADMAN     = 3.0     -- seconds without a command before thrust goes to 0
+local BALLOON_HOLDS_ON_SILENCE = true
+
+-- Which side of the redstone relay the balloon is wired to. Only the cruise
+-- relay has one of these; the turbine relay finds no redstone relay and every
+-- balloon command it hears is not addressed to it anyway.
+local BALLOON_SIDE = "back"
+local BALLOON_FILE = "balloon.cfg"
 
 local log = loadModule("log")
 
@@ -50,17 +85,30 @@ local log = loadModule("log")
 local lines = {}        -- name -> wrapped controller
 local order = {}        -- names, sorted, so line 1 is always line 1
 local stressometer = nil
+local balloonRelay = nil
 local modemSide = nil
 
+local ID = os.getComputerID()
+
+-- Every line this relay advertises carries the id of the computer holding it.
+-- Two relays on one ship will both offer a Create_RotationSpeedController_0, and
+-- a flight computer that keyed on the bare name would file them as one propeller
+-- and fly on half a ship.
+local function qualify(name)
+    return ID .. ":" .. name
+end
+
+-- "#2.0" reads as line 0 on relay 2, which is what a pilot standing in front of
+-- two relays needs the screen to say.
 local function shortName(name)
-    return "#" .. (name:match("_(%d+)$") or name)
+    return "#" .. ID .. "." .. (name:match("_(%d+)$") or name)
 end
 
 -- Matching on the methods rather than on the type string, the way the old
 -- autopilot did, keeps this working for peripherals that report more than one
 -- type and for whatever Avionics renames next.
 local function findPeripherals()
-    lines, order, stressometer = {}, {}, nil
+    lines, order, stressometer, balloonRelay = {}, {}, nil, nil
     for _, name in ipairs(peripheral.getNames()) do
         local p = peripheral.wrap(name)
         if p and p.setTargetSpeed and p.getTargetSpeed then
@@ -68,6 +116,8 @@ local function findPeripherals()
             order[#order + 1] = name
         elseif p and p.getStress and p.getStressCapacity and not stressometer then
             stressometer = { name = name, p = p }
+        elseif p and p.setAnalogOutput and not balloonRelay then
+            balloonRelay = { name = name, p = p }
         end
     end
     table.sort(order)
@@ -99,6 +149,53 @@ local function allStop()
     flush()
 end
 
+-- == THE BALLOON =============================================
+--
+-- A strength from 0 to 15 on one side of a redstone relay, where 0 is off and
+-- higher is more lift. Only the cruise relay has the hardware; every other
+-- computer running this file simply never finds one.
+
+local balloonLevel = 0
+
+local function clampLevel(value)
+    local level = tonumber(value) or 0
+    if level ~= level then return 0 end
+    return math.max(0, math.min(15, math.floor(level + 0.5)))
+end
+
+-- Written down the way the fuel relay persists the tank capacities it learned,
+-- and for a sharper reason: a relay that reboots in the air comes back holding
+-- what it was holding rather than at zero, which is the ground.
+local function saveBalloon()
+    local handle = fs.open(fs.combine(DATA, BALLOON_FILE), "w")
+    if not handle then return false end
+    handle.write(tostring(balloonLevel))
+    handle.close()
+    return true
+end
+
+local function loadBalloon()
+    local path = fs.combine(DATA, BALLOON_FILE)
+    if not fs.exists(path) then return false end
+    local handle = fs.open(path, "r")
+    if not handle then return false end
+    local text = handle.readAll()
+    handle.close()
+    local level = tonumber(text)
+    if not level then return false end
+    balloonLevel = clampLevel(level)
+    return true
+end
+
+local function driveBalloon(level)
+    if not balloonRelay then return false, "no redstone relay on this computer" end
+    balloonLevel = clampLevel(level)
+    local ok, err = pcall(balloonRelay.p.setAnalogOutput, BALLOON_SIDE, balloonLevel)
+    if not ok then return false, tostring(err) end
+    saveBalloon()
+    return true
+end
+
 local function clampRpm(value)
     local rpm = tonumber(value) or 0
     if rpm ~= rpm then return 0 end          -- a NaN off the wire is a zero here
@@ -107,30 +204,49 @@ local function clampRpm(value)
     return math.floor(rpm + 0.5)
 end
 
--- A command can name its lines or number them. Naming is what the flight
--- computer does once it has seen a reading; numbering is what a human types.
+-- Which local controller a key in a command refers to, or nil when the key is
+-- not this relay's business.
+--
+-- The qualified form is what the flight computer sends once it has seen a
+-- reading, and it is the only form that is safe with two relays on one protocol:
+-- a bare name matches on both computers and would have the cruise relay obeying
+-- an order meant for a turbine. The unqualified forms are kept for a human at a
+-- keyboard, who is talking to one relay on purpose.
+local function resolveLine(key)
+    if type(key) == "number" then return order[key] end
+    if type(key) ~= "string" then return nil end
+
+    local owner, rest = key:match("^(%d+):(.+)$")
+    if owner then
+        if tonumber(owner) ~= ID then return nil end
+        return lines[rest] and rest or nil
+    end
+
+    if lines[key] then return key end
+    -- "#2.3", or "3", which is what the short name on the screen says.
+    for _, candidate in ipairs(order) do
+        if shortName(candidate) == key or candidate:match("_(%d+)$") == key then
+            return candidate
+        end
+    end
+    return nil
+end
+
 local function applyCommand(message)
     local wanted = message.rpm
     if type(wanted) ~= "table" then return false, "no rpm table" end
     local touched = 0
     for key, value in pairs(wanted) do
-        local name = nil
-        if type(key) == "number" then name = order[key]
-        elseif lines[key] then name = key
-        else
-            -- "#3" or "3", which is what the short name on the screen says.
-            for _, candidate in ipairs(order) do
-                if shortName(candidate) == key or shortName(candidate) == "#" .. key then
-                    name = candidate
-                end
-            end
-        end
+        local name = resolveLine(key)
         if name then
             demand[name] = clampRpm(value)
             touched = touched + 1
         end
     end
-    if touched == 0 then return false, "no line matched" end
+    -- Not an error. With two relays on one protocol, every broadcast that is
+    -- meant for the other one lands here naming lines this computer does not
+    -- have, and that is the system working.
+    if touched == 0 then return true, "nothing here was named" end
     flush()
     return true
 end
@@ -168,7 +284,7 @@ local function buildMessage()
         local ok, value = pcall(lines[name].getTargetSpeed)
         if ok then actual = value end
         list[index] = {
-            name = name,
+            name = qualify(name),
             short = shortName(name),
             demand = demand[name] or 0,
             actual = actual,
@@ -176,8 +292,10 @@ local function buildMessage()
     end
     return {
         v = 1,
-        id = os.getComputerID(),
+        id = ID,
         label = os.getComputerLabel(),
+        balloon = balloonRelay and balloonLevel or nil,
+        hasBalloon = balloonRelay ~= nil,
         clock = os.clock(),
         lines = list,
         maxRpm = MAX_RPM,
@@ -272,6 +390,14 @@ local function draw()
         y = y + 1
     end
 
+    if balloonRelay then
+        term.setTextColour(balloonLevel > 0 and colours.lightBlue or colours.orange)
+        term.setCursorPos(2, y)
+        term.write(string.format("balloon %2d / 15 on %s", balloonLevel, BALLOON_SIDE))
+        drawBar(math.min(W - 18, 18), y, 17, balloonLevel / 15, colours.lightBlue)
+        y = y + 1
+    end
+
     y = math.min(y + 1, H - 2)
     term.setTextColour(colours.lightGrey)
     term.setCursorPos(2, y)
@@ -283,7 +409,11 @@ local function draw()
         term.write("waiting for the flight computer")
     elseif age > DEADMAN then
         term.setTextColour(colours.orange)
-        term.write(string.format("no orders for %.0fs, turbines stopped", age))
+        if balloonRelay then
+            term.write(string.format("no orders %.0fs, thrust off, balloon held", age))
+        else
+            term.write(string.format("no orders for %.0fs, turbines stopped", age))
+        end
     else
         term.write(string.format("flying, last order %.1fs ago", age))
     end
@@ -316,13 +446,33 @@ else
 end
 
 local found = findPeripherals()
-log.infof("found %d speed controller(s), stressometer %s", found,
-    stressometer and stressometer.name or "none")
+log.infof("found %d speed controller(s), stressometer %s, redstone relay %s", found,
+    stressometer and stressometer.name or "none",
+    balloonRelay and balloonRelay.name or "none")
 for index, name in ipairs(order) do
-    log.infof("  line %d  %s  %s", index, shortName(name), name)
+    log.infof("  line %d  %s  %s", index, shortName(name), qualify(name))
 end
 
-if found == 0 then
+-- A relay that rebooted in the air comes back holding what it was holding. The
+-- alternative is a ship that descends every time a chunk reloads.
+if balloonRelay then
+    if loadBalloon() then
+        log.infof("balloon restored to %d from the last run", balloonLevel)
+    else
+        log.info("no saved balloon level, starting at 0")
+    end
+    local ok, err = pcall(balloonRelay.p.setAnalogOutput, BALLOON_SIDE, balloonLevel)
+    if not ok then log.error("balloon: " .. tostring(err)) end
+end
+
+-- A computer holding the balloon and nothing that spins is a legitimate relay
+-- and stopping here would leave the ship with no lift. It says what it is
+-- missing and carries on with the half of the job it can do.
+if found == 0 and balloonRelay then
+    log.warn("no rotation speed controllers here, running as a balloon relay only")
+end
+
+if found == 0 and not balloonRelay then
     log.error("no rotation speed controllers on the network")
     print("No rotation speed controller found. Attached:")
     for _, name in ipairs(peripheral.getNames()) do
@@ -347,7 +497,7 @@ end
 -- which no amount of telemetry replaces.
 if ARGS[1] == "--spin" then
     local rpm = clampRpm(ARGS[2])
-    print(("driving both lines at %d rpm for 10s"):format(rpm))
+    print(("driving %d line(s) at %d rpm for 10s"):format(#order, rpm))
     for _, name in ipairs(order) do demand[name] = rpm end
     flush()
     sleep(10)
@@ -357,12 +507,32 @@ if ARGS[1] == "--spin" then
     return
 end
 
+-- The balloon needs the same walk out and look at it check the propellers get,
+-- and it is the one part of the ship whose failure is not audible.
+if ARGS[1] == "--balloon" then
+    if not balloonRelay then
+        print("No redstone relay on this computer. The balloon is on another one.")
+        log.close()
+        return
+    end
+    local level = clampLevel(ARGS[2])
+    print(("holding the balloon at %d for 10s"):format(level))
+    driveBalloon(level)
+    sleep(10)
+    log.infof("manual balloon at %d finished, left there", level)
+    log.close()
+    return
+end
+
 -- == LOOPS ===================================================
 
 -- Orders arrive over a radio. A radio goes quiet when a chunk unloads, when the
 -- flight computer crashes, or when someone breaks it, and turbines left running
 -- at the last thing they were told fly the ship into terrain. So the last order
--- has a shelf life, and when it expires the turbines stop.
+-- has a shelf life, and when it expires the thrust stops.
+--
+-- The balloon is untouched here, on purpose. See DEADMAN at the top of the file
+-- for why these two are opposite and must stay that way.
 local function deadmanLoop()
     while true do
         if lastCommand and (os.clock() - lastCommand) > DEADMAN then
@@ -372,6 +542,9 @@ local function deadmanLoop()
             end
             if running then
                 log.warnf("no orders for %.1fs, stopping the turbines", os.clock() - lastCommand)
+                if BALLOON_HOLDS_ON_SILENCE and balloonRelay then
+                    log.infof("balloon held at %d. Lift is not thrust.", balloonLevel)
+                end
                 allStop()
             end
         end
@@ -387,9 +560,20 @@ local function commandLoop()
                 lastCommand = os.clock()
                 local ok, err = applyCommand(message)
                 if not ok then log.warnf("bad set from %d: %s", id, tostring(err)) end
+            elseif message.cmd == "balloon" then
+                lastCommand = os.clock()
+                if balloonRelay then
+                    local ok, err = driveBalloon(message.level)
+                    if not ok then log.warnf("balloon from %d: %s", id, tostring(err)) end
+                end
+                -- A relay with no redstone relay says nothing. On this ship the
+                -- balloon command reaches both computers and only one of them
+                -- has anything to do about it.
             elseif message.cmd == "stop" then
                 lastCommand = os.clock()
                 allStop()
+                -- stop is thrust, not lift. A pilot who wants the balloon down
+                -- says so with a balloon command.
                 log.infof("stop from %d", id)
             elseif message.cmd == "ping" then
                 rednet.send(id, buildMessage(), PROTOCOL)

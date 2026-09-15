@@ -28,7 +28,12 @@ ship.lastRpm = {}      -- what the controller last decided, sent or not
 -- calibration and the screen cannot tell the difference: a line is a name that
 -- takes an RPM, and whether that RPM crosses a wired network or a radio is the
 -- business of ship.flush and nothing else.
-ship.remoteLines = {}  -- name -> { relay = id, short = "#3" }
+--
+-- The name a relay line is filed under is the qualified one the relay itself
+-- advertises, "<relay id>:<peripheral name>". Peripheral names are per network,
+-- so two relays both offer a Create_RotationSpeedController_0, and keying on the
+-- bare name files two propellers as one and flies the ship on half its engines.
+ship.remoteLines = {}  -- name -> { relay = id, short = "#2.3" }
 ship.sendRemote = nil  -- set by sc/turbine.lua; nil means there is no relay
 
 -- == DISCOVERY ===============================================
@@ -97,6 +102,9 @@ function ship.addRemote(name, entry)
             wrap = nil,
             remote = true,
             relay = entry.relay,
+            -- The bare peripheral name, for the one place it is still wanted:
+            -- telling a human which block on that computer's network this is.
+            port = tostring(name):match("^%d+:(.+)$") or name,
             short = entry.short,
             bearings = {},
             kinetic = false,

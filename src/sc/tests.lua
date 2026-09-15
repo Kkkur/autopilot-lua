@@ -248,30 +248,63 @@ function tests.run()
     -- the radio instead of into a peripheral that does not exist.
     config.values = config.defaults()
 
-    local function relayLines(names, extra)
+    -- Lines arrive named the way a relay names them: its own computer id, then
+    -- the peripheral name. Both relays on this ship hold a controller ending _0,
+    -- which is exactly why the id is in there.
+    local function relayLines(id, ports, extra)
         local list = {}
-        for index, name in ipairs(names) do
-            list[index] = { name = name, short = "#" .. name:match("%d+$"), demand = 0, actual = 0 }
+        for index, port in ipairs(ports) do
+            list[index] = { name = id .. ":" .. port, short = util.shortName(id .. ":" .. port),
+                            demand = 0, actual = 0 }
         end
-        local message = { v = 1, lines = list, maxRpm = 256,
+        local message = { v = 1, id = id, lines = list, maxRpm = 256,
                           stress = 6000, stressCapacity = 8000, stressFraction = 0.75,
                           stressOk = true, overstressed = false }
         for key, value in pairs(extra or {}) do message[key] = value end
         return message
     end
 
+    check(util.shortName("2:Create_RotationSpeedController_3") == "#2.3",
+        "a relay line reads as its relay and its number")
+    check(util.shortName("Create_RotationSpeedController_3") == "#3",
+        "and a wired one is unchanged")
+
     check(turbine.accept(19, { v = 1, lines = {} }) == true, "a well formed message is taken")
     check(turbine.accept(19, { v = 2, lines = {} }) == false, "a future version is refused")
     check(turbine.accept(19, 42) == false, "junk on the protocol is refused")
 
     turbine.modem = "top"
-    turbine.accept(19, relayLines({ "Create_RotationSpeedController_7",
-                                    "Create_RotationSpeedController_8" }))
+    turbine.accept(2, relayLines(2, { "Create_RotationSpeedController_0",
+                                      "Create_RotationSpeedController_1" }))
     check(#ship.order == 2, "the relay's lines are adopted as the ship's own")
-    check(ship.lines["Create_RotationSpeedController_7"].remote == true,
+    check(ship.lines["2:Create_RotationSpeedController_0"].remote == true,
         "and they are marked as living on a radio")
-    check(cal ~= nil and ship.lines["Create_RotationSpeedController_7"].wrap == nil,
+    check(ship.lines["2:Create_RotationSpeedController_0"].wrap == nil,
         "a remote line has no peripheral to wrap")
+    check(ship.lines["2:Create_RotationSpeedController_0"].port
+        == "Create_RotationSpeedController_0",
+        "the bare name is kept, for telling a human which block this is")
+
+    -- The second relay. Its controller has the same peripheral name as the first
+    -- relay's, which is the collision the whole qualified name exists for, and
+    -- neither relay's message says anything about the other one's lines.
+    turbine.accept(3, relayLines(3, { "Create_RotationSpeedController_0" },
+        { hasBalloon = true, balloon = 7 }))
+    check(#ship.order == 3, "two relays make three lines, not one")
+    check(ship.lines["3:Create_RotationSpeedController_0"] ~= nil
+        and ship.lines["2:Create_RotationSpeedController_0"] ~= nil,
+        "two controllers with the same peripheral name are two propellers")
+
+    -- The defect this stage exists for. Relay 2 speaking again must not read as
+    -- relay 3 having lost everything, or the two of them delete each other's
+    -- half of the ship once a second and the ship flies on nothing.
+    turbine.accept(2, relayLines(2, { "Create_RotationSpeedController_0",
+                                      "Create_RotationSpeedController_1" }))
+    check(#ship.order == 3, "one relay talking does not drop the other relay's lines")
+
+    check(turbine.ownerOf("3:Create_RotationSpeedController_0") == 3, "a line knows its relay")
+    local hasBalloon, balloonId = turbine.hasBalloon()
+    check(hasBalloon and balloonId == 3, "and the relay holding the balloon is known")
 
     -- Sending twice with the same number has to put it on the air twice, or the
     -- relay's deadman reads the silence as this computer having died.
@@ -281,25 +314,30 @@ function tests.run()
         for name, rpm in pairs(demands) do copy[name] = rpm end
         outbox[#outbox + 1] = copy
     end
-    ship.flush({ ["Create_RotationSpeedController_7"] = 120 })
-    ship.flush({ ["Create_RotationSpeedController_7"] = 120 })
+    ship.flush({ ["2:Create_RotationSpeedController_0"] = 120 })
+    ship.flush({ ["2:Create_RotationSpeedController_0"] = 120 })
     check(#outbox == 2, "an unchanged remote demand is sent again anyway")
-    check(outbox[2]["Create_RotationSpeedController_7"] == 120, "and it is the right number")
+    check(outbox[2]["2:Create_RotationSpeedController_0"] == 120, "and it is the right number")
     ship.sendRemote = nil
 
     local status = turbine.status()
     near(status.fraction, 0.75, "stress comes through as a fraction")
     near(status.headroom, 2000, "headroom is capacity less stress")
     check(status.link == "live", "a message just received is a live link")
+    local seenRelay = {}
+    for _, one in ipairs(status.relays) do seenRelay[one.relayId] = true end
+    check(seenRelay[2] and seenRelay[3], "the status carries every relay that has spoken")
+    check(status.hasBalloon == true and status.balloon == 7,
+        "and says who is holding the balloon and at what")
 
     local warned = false
     for _, item in ipairs(turbine.advice(status)) do
         if item.kind == "warn" or item.kind == "bad" then warned = true end
     end
-    check(warned, "75% stress is worth saying out loud")
+    check(warned, "75 percent stress is worth saying out loud")
 
-    turbine.accept(19, relayLines({ "Create_RotationSpeedController_7",
-                                    "Create_RotationSpeedController_8" },
+    turbine.accept(2, relayLines(2, { "Create_RotationSpeedController_0",
+                                      "Create_RotationSpeedController_1" },
                                   { overstressed = true }))
     local shouted = false
     for _, item in ipairs(turbine.advice(turbine.status())) do
@@ -310,9 +348,11 @@ function tests.run()
     -- A controller broken off the relay stops being named, and a line the mixer
     -- still believes in would have it dividing thrust between a propeller that
     -- is not there and one that is.
-    turbine.accept(19, relayLines({ "Create_RotationSpeedController_7" }))
-    check(#ship.order == 1 and ship.lines["Create_RotationSpeedController_8"] == nil,
+    turbine.accept(2, relayLines(2, { "Create_RotationSpeedController_0" }))
+    check(ship.lines["2:Create_RotationSpeedController_1"] == nil,
         "a line the relay stops naming is dropped")
+    check(ship.lines["3:Create_RotationSpeedController_0"] ~= nil,
+        "and the other relay's line is not collateral")
 
     turbine.modem = nil
     check(turbine.status().link == "nomodem", "no modem is a link state, not an error")

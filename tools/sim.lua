@@ -609,34 +609,44 @@ end
 -- tests that a line on a radio is indistinguishable from a line on a wire
 -- everywhere except ship.flush.
 --
--- The omni hull has one such relay. The tank hull has two, and they name their
--- controllers exactly the way the real relay program does today, which is to say
--- by the bare peripheral name. Peripheral names are per network, so both relays
--- offer a Create_RotationSpeedController_0 and the flight computer cannot tell
--- them apart. That collision is not an oversight here: it is the defect stage 3
--- has to fix, and a simulator that quietly worked around it would hide the one
--- thing worth seeing.
+-- The omni hull has one such relay. The tank hull has two, and both of them
+-- offer a Create_RotationSpeedController_0, because peripheral names are per
+-- network. That collision is the reason every line a relay advertises is named
+-- "<that relay's computer id>:<peripheral name>", and the reason this stub
+-- builds the names the same way the real relay program does rather than handing
+-- over something already tidy.
 
 local turbineRelays
+
+-- The same two functions the relay program has, kept in step with it by hand
+-- the way everything else on these computers is.
+local function qualify(id, name) return id .. ":" .. name end
+local function shortFor(id, name) return "#" .. id .. "." .. name:match("_(%d+)$") end
+
+local function relayLine(id, name)
+    return { name = qualify(id, name), port = name, short = shortFor(id, name),
+             demand = 0, actual = 0 }
+end
 
 if options.hull == "tank" then
     turbineRelays = {
         {
             id = 2, label = "turbines", capacity = 8192, overstressed = false,
             lines = {
-                { name = "Create_RotationSpeedController_0", short = "#0", demand = 0, actual = 0 },
-                { name = "Create_RotationSpeedController_1", short = "#1", demand = 0, actual = 0 },
-                { name = "Create_RotationSpeedController_2", short = "#2", demand = 0, actual = 0 },
-                { name = "Create_RotationSpeedController_3", short = "#3", demand = 0, actual = 0 },
+                relayLine(2, "Create_RotationSpeedController_0"),
+                relayLine(2, "Create_RotationSpeedController_1"),
+                relayLine(2, "Create_RotationSpeedController_2"),
+                relayLine(2, "Create_RotationSpeedController_3"),
             },
         },
         {
             -- The cruise relay also holds the redstone relay driving the balloon,
             -- which is why the balloon command has an address to go to at all.
+            -- Its one controller is named _0 on purpose: so is a turbine.
             id = 3, label = "cruise", capacity = 8192, overstressed = false,
             balloon = true,
             lines = {
-                { name = "Create_RotationSpeedController_0", short = "#0", demand = 0, actual = 0 },
+                relayLine(3, "Create_RotationSpeedController_0"),
             },
         },
     }
@@ -654,8 +664,8 @@ else
         {
             id = 19, label = "turbines", capacity = 8192, overstressed = false,
             lines = {
-                { name = "Create_RotationSpeedController_7", short = "#7", demand = 0, actual = 0 },
-                { name = "Create_RotationSpeedController_8", short = "#8", demand = 0, actual = 0 },
+                relayLine(19, "Create_RotationSpeedController_7"),
+                relayLine(19, "Create_RotationSpeedController_8"),
             },
         },
     }
@@ -673,6 +683,8 @@ local function turbineMessage(unit)
     return {
         v = 1, id = unit.id, label = unit.label, clock = clock,
         lines = list, maxRpm = 256,
+        hasBalloon = unit.balloon == true,
+        balloon = unit.balloon and sim.balloon or nil,
         stress = 900 + drawn, stressCapacity = unit.capacity,
         stressFraction = (900 + drawn) / unit.capacity,
         overstressed = unit.overstressed,
@@ -706,7 +718,12 @@ local function deliverTo(unit, message)
     end
     if message.cmd == "set" and type(message.rpm) == "table" then
         for _, entry in ipairs(unit.lines) do
+            -- The qualified name is what the flight computer sends. The bare one
+            -- is kept because a human at a keyboard talks to one relay on
+            -- purpose, and because it is what catches a command that was meant
+            -- for the other relay and arrived here unqualified.
             local rpm = message.rpm[entry.name]
+            if rpm == nil then rpm = message.rpm[entry.port] end
             if rpm then entry.demand, entry.actual = rpm, rpm end
         end
     end
@@ -982,12 +999,19 @@ if options.script == "physics" then
     -- Through rednet rather than by reaching into the tables, so a relay that
     -- ignores an order it should have obeyed shows up here as a ship that does
     -- not move.
+    -- Addressed by the qualified name, which is the whole point: relay 2 and
+    -- relay 3 both hold a Create_RotationSpeedController_0, and an order that
+    -- named the bare one would turn two propellers on two computers.
     local function order(id, rpm) rednet.send(id, { cmd = "set", rpm = rpm }) end
     local function turbines(l1, l2, r1, r2)
-        order(2, { Create_RotationSpeedController_0 = l1, Create_RotationSpeedController_1 = l2,
-                   Create_RotationSpeedController_2 = r1, Create_RotationSpeedController_3 = r2 })
+        order(2, {
+            ["2:Create_RotationSpeedController_0"] = l1,
+            ["2:Create_RotationSpeedController_1"] = l2,
+            ["2:Create_RotationSpeedController_2"] = r1,
+            ["2:Create_RotationSpeedController_3"] = r2,
+        })
     end
-    local function main(rpm) order(3, { Create_RotationSpeedController_0 = rpm }) end
+    local function main(rpm) order(3, { ["3:Create_RotationSpeedController_0"] = rpm }) end
     local function balloon(level) rednet.send(3, { cmd = "balloon", level = level }) end
 
     local function settle(secs)
@@ -1027,6 +1051,21 @@ if options.script == "physics" then
     report("right side authority", rightOnly, 16.8, 1.0, "deg/s")
     claim("the sides differ", rightOnly > leftOnly + 0.5,
         string.format("%.2f against %.2f", rightOnly, leftOnly))
+
+    print("")
+    print("=== two relays, one protocol ===")
+    local twoRelay, threeRelay = turbineRelays[1], turbineRelays[2]
+    reset()
+    -- Both relays hold a controller whose peripheral name ends _0. An order for
+    -- one of them must leave the other alone, or the ship turns when it was told
+    -- to go straight.
+    order(2, { ["3:Create_RotationSpeedController_0"] = 256 })
+    claim("a line belonging elsewhere is ignored", twoRelay.lines[1].actual == 0,
+        "turbine _0 stayed at " .. tostring(twoRelay.lines[1].actual))
+    reset()
+    main(256)
+    claim("the main turns when named", threeRelay.lines[1].actual == 256, "main at 256")
+    claim("and no turbine turned with it", twoRelay.lines[1].actual == 0, "turbines at 0")
 
     print("")
     print("=== braking and the tip ===")
