@@ -347,23 +347,39 @@ local function drawFlight(snap, reads)
         line(y, "", C("bg")); y = y + 1
     end
 
-    rule(y, "AXES  want / have / rpm"); y = y + 1
-    for _, axis in ipairs(util.AXIS_ORDER) do
-        local info = snap.axisInfo and snap.axisInfo[axis]
-        local label = axis:upper() .. (axis == "y" and " up" or (axis == "z" and " fwd" or " side"))
-        if not info then
-            line(y, string.format(" %-7s %s", label,
-                cal.hasAxis(axis) and "idle" or "no propeller on this axis"),
-                cal.hasAxis(axis) and C("dim") or C("warn"))
-        elseif info.blind then
-            line(y, string.format(" %-7s no propeller on this axis", label), C("warn"))
-        else
-            line(y, string.format(" %-7s %+6.2f %+6.2f %+6.0f", label,
-                info.want or 0, info.have or 0, info.rpm or 0), C("hi"))
-            local maxRpm = config.get("maxRpm")
-            biBar(W - 14, y, 13, info.rpm or 0, maxRpm)
-        end
-        y = y + 1
+    -- This ship has one axis it can push along and one it can turn about, so
+    -- three axis rows describe a vessel that is not here. What matters is the
+    -- heading it is trying to hold, the speed it is trying to make, and the
+    -- balloon, which is the only thing keeping it up.
+    --
+    -- The full rebuild of this tab is stage 7. This is the honest short version.
+    local info = snap.info or {}
+    rule(y, "STEERING  want / have"); y = y + 1
+
+    if info.err then
+        line(y, string.format(" HDG    %+6.1f deg off   %+5.1f deg/s",
+            info.err, info.yawRate or 0), C("hi"))
+        biBar(W - 14, y, 13, info.differential or 0, config.get("tankRpmMax"))
+    else
+        line(y, " HDG    no leg running", C("dim"))
+    end
+    y = y + 1
+
+    line(y, string.format(" SPD    %+6.2f %+6.2f m/s", info.want or 0, info.have or 0), C("hi"))
+    biBar(W - 14, y, 13, info.common or 0, config.get("cruiseMaxRpm"))
+    y = y + 1
+
+    if info.balloon then
+        line(y, string.format(" LIFT   strength %2d of 15   %+5.1f blk",
+            info.balloon, info.altErr or 0),
+            info.balloon <= config.get("balloonFloor") and C("warn") or C("hi"))
+    else
+        line(y, " LIFT   no relay is holding the balloon", C("bad"))
+    end
+    y = y + 1
+
+    if snap.reason then
+        line(y, " " .. tostring(snap.reason), C("dim")); y = y + 1
     end
 
     if y < H - 2 then

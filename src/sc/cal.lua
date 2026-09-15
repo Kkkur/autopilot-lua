@@ -23,6 +23,29 @@ cal.axes = {}     -- line name -> {x, y, z, reverse = bool}
 cal.curves = {}   -- "x"|"y"|"z" -> { pos = {{rpm,speed},...}, neg = {...} }
 cal.meta = {}     -- when each half was last run, for the screen
 
+-- == WHAT THE TANK TURN HULL MEASURES ========================
+--
+-- The fields sc/flight.lua reads. The five stage wizard that fills them is
+-- stage 5; this is the file they live in and the shape they are written down
+-- in. flight.lua carries the full description at the top, because it is the
+-- file that has to understand them.
+--
+-- Every one of them is allowed to be missing. A ship that has not been
+-- calibrated still flies, badly, on the fallbacks in flight.lua, and an
+-- uncalibrated ship saying so beats an uncalibrated ship pretending.
+
+cal.sides = {}        -- line name -> { side, reverse }
+cal.noseOffset = nil
+cal.yawAuth = {}      -- { left, right }, deg/s per RPM
+cal.yawCurve = nil    -- { pos, neg }, differential RPM against yaw rate
+cal.fwdCurve = nil    -- { pos, neg }, common RPM against settled speed
+cal.brakeCurve = nil  -- { main, all }, reverse RPM against deceleration
+cal.balloonCurve = nil
+cal.altHover = nil
+cal.stressAtTurn = nil
+cal.stressAtCruise = nil
+cal.inventory = nil   -- what the ship looked like when it was last measured
+
 -- == PERSISTENCE =============================================
 
 function cal.init(dataDir)
@@ -65,8 +88,69 @@ function cal.parseCurves(data)
     return curves
 end
 
+-- Which side each line pushes from, keyed by the saved name.
+--
+-- Deliberately not filtered against what is on the network. At boot every line
+-- on this ship is on a relay and none of them have adopted yet, so filtering
+-- here threw away the whole calibration a second before the propellers arrived,
+-- and nothing ever loaded it again. A line in the file that never turns up is
+-- harmless: the mixer only ever iterates lines the ship actually has.
+function cal.parseSides(data)
+    local sides = {}
+    if type(data) ~= "table" then return sides end
+    local allowed = { left = true, right = true, main = true, none = true }
+    for name, entry in pairs(data) do
+        if type(name) == "string" and type(entry) == "table"
+                and allowed[entry.side] then
+            sides[name] = { side = entry.side, reverse = entry.reverse == true }
+        end
+    end
+    return sides
+end
+
+-- A pair of ladders, the shape util's curve family reads.
+local function parsePair(data)
+    if type(data) ~= "table" then return nil end
+    local out = {}
+    for _, way in ipairs({ "pos", "neg" }) do
+        local samples = util.tidyCurve(data[way])
+        if #samples > 0 then out[way] = samples end
+    end
+    if not out.pos and not out.neg then return nil end
+    return out
+end
+
+-- The brake ladders carry a pitch per rung, which util.tidyCurve neither knows
+-- nor keeps, so they are tidied here instead.
+local function parseBrake(data)
+    if type(data) ~= "table" then return nil end
+    local out = {}
+    for _, which in ipairs({ "main", "all" }) do
+        local rungs = {}
+        for _, rung in ipairs(type(data[which]) == "table" and data[which] or {}) do
+            if type(rung) == "table" and type(rung.rpm) == "number"
+                    and type(rung.speed) == "number" then
+                rungs[#rungs + 1] = {
+                    rpm = math.abs(rung.rpm),
+                    speed = math.abs(rung.speed),
+                    pitch = type(rung.pitch) == "number" and rung.pitch or nil,
+                }
+            end
+        end
+        table.sort(rungs, function(a, b) return a.rpm < b.rpm end)
+        if #rungs > 0 then out[which] = rungs end
+    end
+    if not out.main and not out.all then return nil end
+    return out
+end
+
 function cal.load()
     cal.axes, cal.curves, cal.meta = {}, {}, {}
+    cal.sides, cal.yawAuth = {}, {}
+    cal.noseOffset, cal.yawCurve, cal.fwdCurve, cal.brakeCurve = nil, nil, nil, nil
+    cal.balloonCurve, cal.altHover, cal.inventory = nil, nil, nil
+    cal.stressAtTurn, cal.stressAtCruise = nil, nil
+
     if not cal.FILE or not fs.exists(cal.FILE) then return false end
     local handle = fs.open(cal.FILE, "r")
     if not handle then return false end
@@ -79,6 +163,33 @@ function cal.load()
     cal.axes = cal.parseAxes(axisData, ship.order)
     cal.curves = cal.parseCurves(data.curves)
     cal.meta = type(data.meta) == "table" and data.meta or {}
+
+    cal.sides = cal.parseSides(data.sides)
+    cal.noseOffset = tonumber(data.noseOffset)
+    if type(data.yawAuth) == "table" then
+        cal.yawAuth = { left = tonumber(data.yawAuth.left),
+                        right = tonumber(data.yawAuth.right) }
+    end
+    cal.yawCurve = parsePair(data.yawCurve)
+    cal.fwdCurve = parsePair(data.fwdCurve)
+    cal.brakeCurve = parseBrake(data.brakeCurve)
+    -- util.tidyCurve takes magnitudes, which folds the sinking half of this one
+    -- onto the climbing half, so the balloon ladder is read straight instead.
+    if type(data.balloonCurve) == "table" then
+        local rungs = {}
+        for _, rung in ipairs(data.balloonCurve) do
+            if type(rung) == "table" and type(rung.rpm) == "number"
+                    and type(rung.speed) == "number" then
+                rungs[#rungs + 1] = { rpm = rung.rpm, speed = rung.speed }
+            end
+        end
+        table.sort(rungs, function(a, b) return a.rpm < b.rpm end)
+        if #rungs > 0 then cal.balloonCurve = rungs end
+    end
+    cal.altHover = tonumber(data.altHover)
+    cal.stressAtTurn = tonumber(data.stressAtTurn)
+    cal.stressAtCruise = tonumber(data.stressAtCruise)
+    cal.inventory = type(data.inventory) == "table" and data.inventory or nil
     return true
 end
 
@@ -93,6 +204,11 @@ function cal.save()
     end
     handle.write(textutils.serialize({
         axes = cal.axes, curves = cal.curves, meta = cal.meta,
+        sides = cal.sides, noseOffset = cal.noseOffset, yawAuth = cal.yawAuth,
+        yawCurve = cal.yawCurve, fwdCurve = cal.fwdCurve,
+        brakeCurve = cal.brakeCurve, balloonCurve = cal.balloonCurve,
+        altHover = cal.altHover, inventory = cal.inventory,
+        stressAtTurn = cal.stressAtTurn, stressAtCruise = cal.stressAtCruise,
     }))
     handle.close()
     return true

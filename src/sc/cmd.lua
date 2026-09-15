@@ -167,16 +167,19 @@ define("resume", {
 
 define("manual", {
     aliases = { "man" },
-    usage = "manual <side> <up> <fwd>",
-    help = "Fly by hand: a body-frame speed in m/s. All zeros gives it back.",
+    usage = "manual <throttle> <yaw> [level]",
+    help = "Fly by hand. Throttle and yaw are -1 to 1, level is the balloon 0 to 15.",
     run = function(args)
-        local sx = tonumber(args[1]) or 0
-        local sy = tonumber(args[2]) or 0
-        local sz = tonumber(args[3]) or 0
-        control.setManual(sx, sy, sz)
+        -- Fractions rather than m/s, so what you ask for means the same thing on
+        -- a ship whose curves have been measured and one whose have not.
+        local throttle = util.clamp(tonumber(args[1]) or 0, -1, 1)
+        local yaw = util.clamp(tonumber(args[2]) or 0, -1, 1)
+        local level = args[3] and util.clamp(tonumber(args[3]) or 0, 0, 15) or nil
+        control.setManual(throttle, yaw, level)
         if not control.manual then return "manual off", "warn" end
         ui.tab = 1
-        return string.format("manual %+.1f %+.1f %+.1f m/s", sx, sy, sz), "warn"
+        return string.format("manual throttle %+.2f yaw %+.2f%s", throttle, yaw,
+            level and string.format(" level %d", level) or ""), "warn"
     end,
 })
 

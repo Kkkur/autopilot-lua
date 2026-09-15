@@ -94,22 +94,26 @@ log.init(DATA, function() return config.get("logLevel") end)
 
 local ship = loadModule("ship", util)
 local cal = loadModule("cal", util, ship, config, log)
-local control = loadModule("control", util, ship, cal, config, log)
+local flight = loadModule("flight", util)
+-- turbine before control: the control loop commands the balloon, and the
+-- balloon is a relay, so the link has to exist before the loop that drives it.
+local turbine = loadModule("turbine", util, ship, config, log)
+local control = loadModule("control", util, ship, cal, config, log, flight, turbine)
 local nav = loadModule("nav", util, control, log)
 local fuel = loadModule("fuel", util, ship, cal, control, config, log)
-local turbine = loadModule("turbine", util, ship, config, log)
 local ui = loadModule("ui", util, ship, cal, control, nav, fuel, turbine, config, log)
 local cmd = loadModule("cmd", util, ship, cal, control, nav, fuel, turbine, config, ui, log)
 
 log.info("=== starcatcher starting ===")
 log.infof("computer %d, screen %dx%d", os.getComputerID(), ui.size())
 
-local found = ship.discover()
-log.infof("network: %d propeller lines, %d bearings, altimeter %s",
-    found, #ship.bearings, ship.altimeter and "yes" or "no")
+local wired = ship.discover()
+log.infof("network: %d wired propeller lines, %d bearings, altimeter %s",
+    wired, #ship.bearings, ship.altimeter and "yes" or "no")
 -- Relay lines arrive a second later, over the radio, and adopt themselves into
--- `ship` when they do. So this count is the wired ones only, and the boot
--- warning below is about those.
+-- `ship` when they do, so this count is the wired ones only. On this ship that
+-- number is zero and always will be: computer 0 carries a modem and owns
+-- nothing that spins. A boot warning built on it would fire every single time.
 
 cal.init(DATA)
 nav.init(DATA)
@@ -141,23 +145,48 @@ end
 -- Said once, on the status line, rather than as a modal that has to be clicked
 -- through before the screen appears.
 
-if type(sublevel) ~= "table" then
-    ui.say("no CC: Sable on this computer, so there is no pose to fly by", "bad")
-    log.error("boot: sublevel global missing")
-elseif found == 0 then
-    ui.say("no rotation speed controllers on the network. Check the modems.", "bad")
-    log.error("boot: no speed controllers found")
-else
-    local missing = cal.missingLines()
-    if #missing == #ship.order then
-        ui.say(string.format("%d lines, none calibrated. Type `cal` to start.", found), "warn")
-    elseif #missing > 0 then
-        ui.say(string.format("%d of %d lines not calibrated. Type `cal`.", #missing, found), "warn")
-    elseif not cal.meta.velocityAt then
-        ui.say("directions known, speeds unmeasured. Type `vcal` when you have room.", "warn")
-    else
-        ui.say(string.format("%d propeller lines ready.", found), "good")
+-- Counted across the relays as well as the wire, and counted late, because every
+-- propeller on this ship arrives about a second after boot. Reporting on the
+-- wired count alone is what made this warning fire on every single start.
+local function propellerReport()
+    local total = #ship.order
+    if type(sublevel) ~= "table" then
+        ui.say("no CC: Sable on this computer, so there is no pose to fly by", "bad")
+        log.error("boot: sublevel global missing")
+        return
     end
+    if total == 0 then
+        ui.say("no propellers yet, wired or on a relay. Check the relay computers.", "bad")
+        log.error("boot: no speed controllers on the wire or the radio")
+        return
+    end
+
+    local uncalibrated = 0
+    for _, name in ipairs(ship.order) do
+        if not cal.sides[name] then uncalibrated = uncalibrated + 1 end
+    end
+
+    if uncalibrated == total then
+        ui.say(string.format("%d propellers, none calibrated. Type `cal` to start.", total), "warn")
+    elseif uncalibrated > 0 then
+        ui.say(string.format("%d of %d propellers not calibrated. Type `cal`.",
+            uncalibrated, total), "warn")
+    elseif not cal.fwdCurve then
+        ui.say("sides known, speeds unmeasured. Run `cal` where there is room.", "warn")
+    elseif not turbine.hasBalloon() then
+        ui.say("no relay is holding the balloon. Nothing here controls lift.", "bad")
+    else
+        ui.say(string.format("%d propellers ready.", total), "good")
+    end
+end
+
+-- Said once the relays have had their second to speak up. It then sleeps rather
+-- than returning, because this runs under waitForAny and a task that finishes
+-- there takes the whole program down with it.
+local function bootReport()
+    sleep(1.5)
+    pcall(propellerReport)
+    while true do sleep(60) end
 end
 
 -- == LOOPS ===================================================
@@ -231,7 +260,7 @@ log.info("boot complete")
 ui.draw()
 
 local ok, err = pcall(parallel.waitForAny, controlLoop, screenLoop, inputLoop,
-    fuel.listen, turbine.listen, turbine.heartbeat)
+    fuel.listen, turbine.listen, turbine.heartbeat, bootReport)
 
 -- setTargetSpeed yields, and a yield after Ctrl+T raises Terminated again, so
 -- the stop has to survive being interrupted or the propellers keep spinning

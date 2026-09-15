@@ -6,34 +6,23 @@
 -- change to the control loop or the screen can be caught on the desktop instead
 -- of at 300 blocks up.
 --
--- There are two toy ships, because the program is mid rewrite and the two halves
--- need different vessels to be checkable at all.
---
---   omni  the hull the current src/ flies: five speed controllers wired to this
---         computer, four around the sides pushing north, south, east and west,
---         a big one underneath for lift, and an orientation that never changes.
---   tank  the hull the rewrite is for: nothing wired to this computer at all,
---         four turbines on one relay and a main propeller on another, all five
---         pointing the same way, steering on differential thrust and floating on
---         a balloon driven by a redstone strength signal.
---
--- `omni` stays the default until control.lua is rewritten in stage 4, because
--- until then nothing in src/ can produce a torque and the tank hull would simply
--- sit there. Pick the other one with --hull tank.
+-- The ship is a tank turn hull: nothing wired to this computer at all, four
+-- turbines on one relay and a main propeller on another, all five pointing the
+-- same way, steering on differential thrust and floating on a balloon driven by
+-- a redstone strength signal.
 --
 -- Run it with any Lua 5.2+ that can see this folder, or through tools/sim.js.
 --
 --   lua tools/sim.lua            boot, fly a leg, print the screen
 --   lua tools/sim.lua --frames 400
---   lua tools/sim.lua --hull tank
+--   lua tools/sim.lua --physics   check the hull, without the autopilot
 
 local SRC = SIM_SRC or "../src/"
 
-local options = { frames = 250, verbose = false, script = "fly", hull = "omni" }
+local options = { frames = 1600, verbose = false, script = "fly" }
 for index = 1, #(arg or {}) do
-    if arg[index] == "--frames" then options.frames = tonumber(arg[index + 1]) or 250 end
+    if arg[index] == "--frames" then options.frames = tonumber(arg[index + 1]) or 1600 end
     if arg[index] == "--verbose" then options.verbose = true end
-    if arg[index] == "--hull" then options.hull = tostring(arg[index + 1] or "omni") end
     if arg[index] == "--vcal" then options.script = "vcal"; options.frames = 4000 end
     if arg[index] == "--tabs" then options.script = "tabs"; options.frames = 400 end
 if arg[index] == "--clicks" then options.script = "clicks"; options.frames = 400 end
@@ -41,11 +30,7 @@ if arg[index] == "--clicks" then options.script = "clicks"; options.frames = 400
     if arg[index] == "--test" then options.script = "test" end
     -- The physics probe is about the hull, so it picks its own ship and there is
     -- no sense in asking for it against the other one.
-    if arg[index] == "--physics" then options.script = "physics"; options.hull = "tank" end
-end
-
-if options.hull ~= "omni" and options.hull ~= "tank" then
-    error("no such hull: " .. options.hull .. ". It is omni or tank.", 0)
+    if arg[index] == "--physics" then options.script = "physics" end
 end
 
 math.atan2 = math.atan2 or math.atan
@@ -263,52 +248,6 @@ local sim = {
 
 local stepPhysics, poseOf, angularVelocityOf
 
--- == THE OMNI HULL ===========================================
---
--- Four propellers around the hull, north, south, east and west, plus a big one
--- underneath doing lift. Each has a speed controller wired to this computer.
--- Drag is linear, thrust is proportional to RPM, and the big one is four times
--- the propeller of the small ones, which is what makes the velocity calibration
--- curves come out different per axis, which is the whole point of measuring
--- them.
---
--- This ship never turns, which is honest, because nothing in the autopilot that
--- flies it produces a torque.
-
-local OMNI_LAYOUT = {
-    { name = "Create_RotationSpeedController_0", axis = { 0, 0, -1 }, power = 0.0060 },
-    { name = "Create_RotationSpeedController_1", axis = { 0, 0,  1 }, power = 0.0060 },
-    { name = "Create_RotationSpeedController_2", axis = { 1, 0,  0 }, power = 0.0055 },
-    { name = "Create_RotationSpeedController_3", axis = { -1, 0, 0 }, power = 0.0055 },
-    { name = "Create_RotationSpeedController_4", axis = { 0, 1,  0 }, power = 0.0220 },
-}
-
-local OMNI_DRAG = 0.55
-
-local function omniStep(dt)
-    local ax, ay, az = 0, 0, 0
-    for _, line in pairs(sim.lines) do
-        ax = ax + line.axis[1] * line.rpm * line.power
-        ay = ay + line.axis[2] * line.rpm * line.power
-        az = az + line.axis[3] * line.rpm * line.power
-    end
-    local v = sim.velocity
-    v.x = v.x + (ax - v.x * OMNI_DRAG) * dt
-    v.y = v.y + (ay - v.y * OMNI_DRAG) * dt
-    v.z = v.z + (az - v.z * OMNI_DRAG) * dt
-    sim.position.x = sim.position.x + v.x * dt
-    sim.position.y = sim.position.y + v.y * dt
-    sim.position.z = sim.position.z + v.z * dt
-end
-
-local function omniPose()
-    return { x = 0, y = 0, z = 0, w = 1 }
-end
-
-local function omniAngularVelocity()
-    return { x = 0, y = 0, z = 0 }
-end
-
 -- == THE TANK TURN HULL ======================================
 --
 -- Five propellers all pointing along the hull, each reversible. Four are
@@ -428,19 +367,16 @@ end
 
 -- == WHICH SHIP ==============================================
 
-if options.hull == "tank" then
-    stepPhysics, poseOf, angularVelocityOf = tankStep, tankPose, tankAngularVelocity
-    sim.position = { x = 0, y = 120, z = 0 }
-    sim.balloon = 8      -- roughly hovering, which is where a ship is found
-    -- Create: Avionics puts gravity on this computer. The omni hull is left
-    -- without it so that this stage changes nothing about how that ship reads.
-    aero = { getGravity = function() return TANK_GRAVITY end }
-else
-    stepPhysics, poseOf, angularVelocityOf = omniStep, omniPose, omniAngularVelocity
-    for index, entry in ipairs(OMNI_LAYOUT) do
-        sim.lines[entry.name] = { rpm = 0, axis = entry.axis, power = entry.power, id = index }
-    end
-end
+-- == THE SHIP ================================================
+
+local START_Y = 120
+
+stepPhysics, poseOf, angularVelocityOf = tankStep, tankPose, tankAngularVelocity
+sim.position = { x = 0, y = START_Y, z = 0 }
+sim.balloon = 8      -- roughly hovering, which is where a ship is found
+
+-- Create: Avionics puts gravity on the flight computer.
+aero = { getGravity = function() return TANK_GRAVITY end }
 
 sublevel = {
     getLogicalPose = function()
@@ -463,68 +399,63 @@ sublevel = {
 -- maths and owns nothing that spins, so ship.discover() finds no lines at all
 -- and every propeller arrives a second later over the radio.
 local wrapped = {}
-for _, entry in ipairs(options.hull == "tank" and {} or OMNI_LAYOUT) do
-    local line = sim.lines[entry.name]
-    wrapped[entry.name] = {
-        setTargetSpeed = function(rpm) line.rpm = rpm end,
-        getTargetSpeed = function() return line.rpm end,
-        getSelfId = function() return line.id end,
-        getSpeed = function() return line.rpm end,
-        getKind = function() return "split_shaft" end,
-        isOverstressed = function() return false end,
-        hasSource = function() return true end,
-    }
-    local bearingName = "create_avionics:propeller_bearing_" .. (line.id - 1)
-    wrapped[bearingName] = {
-        getThrust = function() return math.abs(line.rpm) * 40 end,
-        getThrustVector = function() return { line.axis[1], line.axis[2], line.axis[3] } end,
-        getFacingVector = function() return { line.axis[1], line.axis[2], line.axis[3] } end,
-        getAxis = function() return line.axis[2] ~= 0 and "up" or "north" end,
-        getSailPower = function() return line.power > 0.01 and 64 or 16 end,
-        getSubnetworkAnchorId = function() return line.id end,
-        isAssembled = function() return true end,
-    }
-end
--- The altimeter is on the omni hull only. On the tank hull the flight computer
--- carries a modem and nothing else, so height comes off the pose like everything
--- else does, and readExtras is left with nothing to report.
-if options.hull ~= "tank" then
-    wrapped["create_avionics:altitude_sensor_0"] = {
-        getHeight = function() return sim.position.y end,
-        getAirPressure = function() return math.max(0, 1 - sim.position.y / 500) end,
-        getVerticalSpeed = function() return sim.velocity.y end,
-    }
-end
 
-local function SEED_CURVE(a, b, c)
-    return string.format(
-        "{ [1] = { rpm = 48, speed = %s }, [2] = { rpm = 152, speed = %s }, [3] = { rpm = 256, speed = %s } }",
-        a, b, c)
-end
+-- No altimeter either. The flight computer carries a modem and nothing else, so
+-- height comes off the pose like everything else does and readExtras is left
+-- with nothing to report.
 
--- A ship that has already been through `cal` and `vcal`, so a headless run can get
--- straight to the part worth testing. The directions match OMNI_LAYOUT above.
+-- A ship that has already been through `cal`, so a headless run gets straight to
+-- the part worth testing. Every number below is what the toy ship above actually
+-- does, worked out from its own constants rather than guessed, because a seeded
+-- calibration that disagrees with the physics tests the autopilot against a ship
+-- that does not exist.
 --
--- The tank hull is deliberately left uncalibrated. Its calibration is five
--- stages that do not exist yet, and seeding it in the old file's shape would
--- describe a ship of six directions that this one does not have.
-if options.hull ~= "tank" then
+--   yaw      rate is linear in the differential, 32 deg/s at 256
+--   forward  0.030 thrust per rpm over 0.55 drag, so 13.96 m/s at 256
+--   brake    the main is 0.012 of that 0.030, and pitch is 2.08 deg per m/s/s
+--   balloon  (3.2 * level / 15 - 1.6) / 0.9, which crosses zero near 7.5
 files["starcatcher/cal.cfg"] = [[{
-  axes = {
-    Create_RotationSpeedController_0 = { [1] = 0, [2] = 0, [3] = -1, reverse = false },
-    Create_RotationSpeedController_1 = { [1] = 0, [2] = 0, [3] = 1, reverse = false },
-    Create_RotationSpeedController_2 = { [1] = 1, [2] = 0, [3] = 0, reverse = false },
-    Create_RotationSpeedController_3 = { [1] = -1, [2] = 0, [3] = 0, reverse = false },
-    Create_RotationSpeedController_4 = { [1] = 0, [2] = 1, [3] = 0, reverse = false },
+  sides = {
+    ["2:Create_RotationSpeedController_0"] = { side = "left",  reverse = false },
+    ["2:Create_RotationSpeedController_1"] = { side = "left",  reverse = false },
+    ["2:Create_RotationSpeedController_2"] = { side = "right", reverse = false },
+    ["2:Create_RotationSpeedController_3"] = { side = "right", reverse = false },
+    ["3:Create_RotationSpeedController_0"] = { side = "main",  reverse = false },
   },
-  curves = {
-    x = { pos = ]] .. SEED_CURVE(1.7, 5.4, 9.2) .. [[, neg = ]] .. SEED_CURVE(1.7, 5.4, 9.2) .. [[ },
-    y = { pos = ]] .. SEED_CURVE(1.9, 6.0, 10.2) .. [[, neg = ]] .. SEED_CURVE(1.9, 6.0, 10.2) .. [[ },
-    z = { pos = ]] .. SEED_CURVE(1.8, 5.9, 10.0) .. [[, neg = ]] .. SEED_CURVE(1.8, 5.9, 10.0) .. [[ },
+  noseOffset = 0,
+  yawAuth = { left = 0.0594, right = 0.0655 },
+  yawCurve = {
+    pos = { { rpm = 64, speed = 8.0 }, { rpm = 128, speed = 16.0 },
+            { rpm = 192, speed = 24.0 }, { rpm = 256, speed = 32.0 } },
+    neg = { { rpm = 64, speed = 8.0 }, { rpm = 128, speed = 16.0 },
+            { rpm = 192, speed = 24.0 }, { rpm = 256, speed = 32.0 } },
   },
-  meta = { directionAt = "seeded", velocityAt = "seeded" },
+  fwdCurve = {
+    pos = { { rpm = 64, speed = 3.49 }, { rpm = 128, speed = 6.98 },
+            { rpm = 192, speed = 10.47 }, { rpm = 256, speed = 13.96 } },
+    neg = { { rpm = 64, speed = 3.49 }, { rpm = 128, speed = 6.98 },
+            { rpm = 192, speed = 10.47 }, { rpm = 256, speed = 13.96 } },
+  },
+  brakeCurve = {
+    main = { { rpm = 128, speed = 1.54, pitch = 3.2 },
+             { rpm = 256, speed = 3.07, pitch = 6.4 } },
+    all  = { { rpm = 128, speed = 3.84, pitch = 8.0 },
+             { rpm = 256, speed = 7.68, pitch = 16.0 } },
+  },
+  balloonCurve = {
+    { rpm = 0, speed = -1.78 }, { rpm = 4, speed = -0.83 },
+    { rpm = 7, speed = -0.12 }, { rpm = 8, speed = 0.12 },
+    { rpm = 11, speed = 0.83 }, { rpm = 15, speed = 1.78 },
+  },
+  altHover = 8,
+  stressAtTurn = 3360,
+  stressAtCruise = 3360,
+  inventory = {
+    relays = { { id = 2, lines = 4 }, { id = 3, lines = 1 } },
+  },
+  meta = { sidesAt = "seeded", yawAt = "seeded", forwardAt = "seeded",
+           brakeAt = "seeded", balloonAt = "seeded" },
 }]]
-end
 
 peripheral = {}
 function peripheral.getNames()
@@ -568,7 +499,7 @@ end
 
 -- Computer ids match the ship the hull is pretending to be, so what the screen
 -- says lines up with what you would read off the computers in the world.
-local FUEL_RELAY_ID = options.hull == "tank" and 1 or 12
+local FUEL_RELAY_ID = 1
 
 local relay = {
     tanks = {
@@ -609,14 +540,11 @@ end
 -- tests that a line on a radio is indistinguishable from a line on a wire
 -- everywhere except ship.flush.
 --
--- The omni hull has one such relay. The tank hull has two, and both of them
--- offer a Create_RotationSpeedController_0, because peripheral names are per
--- network. That collision is the reason every line a relay advertises is named
+-- There are two of them, and both offer a Create_RotationSpeedController_0,
+-- because peripheral names are per network. That collision is the reason every line a relay advertises is named
 -- "<that relay's computer id>:<peripheral name>", and the reason this stub
 -- builds the names the same way the real relay program does rather than handing
 -- over something already tidy.
-
-local turbineRelays
 
 -- The same two functions the relay program has, kept in step with it by hand
 -- the way everything else on these computers is.
@@ -628,55 +556,43 @@ local function relayLine(id, name)
              demand = 0, actual = 0 }
 end
 
-if options.hull == "tank" then
-    turbineRelays = {
-        {
-            id = 2, label = "turbines", capacity = 8192, overstressed = false,
-            lines = {
-                relayLine(2, "Create_RotationSpeedController_0"),
-                relayLine(2, "Create_RotationSpeedController_1"),
-                relayLine(2, "Create_RotationSpeedController_2"),
-                relayLine(2, "Create_RotationSpeedController_3"),
-            },
+local turbineRelays = {
+    {
+        id = 2, label = "turbines", capacity = 8192, overstressed = false,
+        lines = {
+            relayLine(2, "Create_RotationSpeedController_0"),
+            relayLine(2, "Create_RotationSpeedController_1"),
+            relayLine(2, "Create_RotationSpeedController_2"),
+            relayLine(2, "Create_RotationSpeedController_3"),
         },
-        {
-            -- The cruise relay also holds the redstone relay driving the balloon,
-            -- which is why the balloon command has an address to go to at all.
-            -- Its one controller is named _0 on purpose: so is a turbine.
-            id = 3, label = "cruise", capacity = 8192, overstressed = false,
-            balloon = true,
-            lines = {
-                relayLine(3, "Create_RotationSpeedController_0"),
-            },
+    },
+    {
+        -- The cruise relay also holds the redstone relay driving the balloon,
+        -- which is why the balloon command has an address to go to at all.
+        -- Its one controller is named _0 on purpose: so is a turbine.
+        id = 3, label = "cruise", capacity = 8192, overstressed = false,
+        balloon = true,
+        lines = {
+            relayLine(3, "Create_RotationSpeedController_0"),
         },
-    }
+    },
+}
 
-    local two, three = turbineRelays[1], turbineRelays[2]
-    sim.props = {
-        { line = two.lines[1], power = TANK_TURBINE_POWER, lever = TANK_LEVER_LEFT,  side = "left" },
-        { line = two.lines[2], power = TANK_TURBINE_POWER, lever = TANK_LEVER_LEFT,  side = "left" },
-        { line = two.lines[3], power = TANK_TURBINE_POWER, lever = TANK_LEVER_RIGHT, side = "right" },
-        { line = two.lines[4], power = TANK_TURBINE_POWER, lever = TANK_LEVER_RIGHT, side = "right" },
-        { line = three.lines[1], power = TANK_MAIN_POWER,  lever = 0,                side = "main" },
-    }
-else
-    turbineRelays = {
-        {
-            id = 19, label = "turbines", capacity = 8192, overstressed = false,
-            lines = {
-                relayLine(19, "Create_RotationSpeedController_7"),
-                relayLine(19, "Create_RotationSpeedController_8"),
-            },
-        },
-    }
-end
+local two, three = turbineRelays[1], turbineRelays[2]
+sim.props = {
+    { line = two.lines[1], power = TANK_TURBINE_POWER, lever = TANK_LEVER_LEFT,  side = "left" },
+    { line = two.lines[2], power = TANK_TURBINE_POWER, lever = TANK_LEVER_LEFT,  side = "left" },
+    { line = two.lines[3], power = TANK_TURBINE_POWER, lever = TANK_LEVER_RIGHT, side = "right" },
+    { line = two.lines[4], power = TANK_TURBINE_POWER, lever = TANK_LEVER_RIGHT, side = "right" },
+    { line = three.lines[1], power = TANK_MAIN_POWER,  lever = 0,                side = "main" },
+}
 
 local function turbineMessage(unit)
     local list, drawn = {}, 0
     for index, entry in ipairs(unit.lines) do
         -- Stress rises with how hard the turbines are being driven, which is the
         -- only part of Create's stress model worth pretending about here.
-        drawn = drawn + math.abs(entry.actual) * 12
+        drawn = drawn + math.abs(entry.actual) * 2.4
         list[index] = { name = entry.name, short = entry.short,
                         demand = entry.demand, actual = entry.actual }
     end
@@ -815,11 +731,41 @@ local function snapshotScreen()
     if not blank then lastScreen = copy end
 end
 
-local function advance(secs)
+-- Minecraft runs at twenty ticks a second and so does this, however long the
+-- scheduler step that got here was. A relay loop sleeping a whole second would
+-- otherwise hand the physics a dt of 1.0, and explicit Euler on a drag of 2.2
+-- per second is unstable at that step size: the sideways velocity flips sign and
+-- doubles every step until the ship is a hundred orders of magnitude away.
+-- Minecraft runs at twenty ticks a second and so does this, however long the
+-- scheduler step that got here was. A relay loop sleeping a whole second would
+-- otherwise hand the physics a dt of 1.0, and explicit Euler on a drag of 2.2
+-- per second is unstable at that step size: the sideways velocity flips sign and
+-- doubles every step until the ship is a hundred orders of magnitude away.
+local MAX_STEP = 0.05
+
+-- Time moves once, for everybody.
+--
+-- The obvious way to write this scheduler is to advance the clock by each task's
+-- own sleep as that task is resumed. That is wrong, and wrong in a way that only
+-- shows up once something depends on how old a message is: with seven loops
+-- running, the clock races ahead about seven times faster than any one loop's
+-- own sleeps, so a relay broadcasting once a second looks, from the flight
+-- computer, like a relay that speaks every fourteen seconds. Every link in the
+-- program reads as permanently stale.
+--
+-- So the clock is advanced to the earliest thing waiting to wake, and everything
+-- due at that moment wakes together, which is what a cooperative scheduler
+-- actually does.
+local function advanceTo(when)
     snapshotScreen()
-    secs = secs or 0.05
-    clock = clock + secs
-    stepPhysics(secs)
+    local secs = when - clock
+    if secs < 0 then secs = 0 end
+    clock = when
+    while secs > 1e-9 do
+        local step = secs > MAX_STEP and MAX_STEP or secs
+        stepPhysics(step)
+        secs = secs - step
+    end
     frames = frames + 1
     if frames > options.frames then
         finished = true
@@ -829,12 +775,21 @@ end
 
 local function runAll(waitForAll, ...)
     local tasks = { ... }
-    local routines, pending = {}, {}
+    local routines, wakeAt, waiting = {}, {}, {}
 
     local function step(index, value)
         local ok, request = coroutine.resume(routines[index], value)
         if not ok then error(request, 0) end
-        pending[index] = request
+        if coroutine.status(routines[index]) == "dead" then
+            wakeAt[index], waiting[index] = nil, nil
+            return
+        end
+        if type(request) == "table" and request.kind == "event" then
+            waiting[index], wakeAt[index] = true, nil
+        else
+            waiting[index] = nil
+            wakeAt[index] = clock + ((type(request) == "table" and request.secs) or 0.05)
+        end
     end
 
     for index, fn in ipairs(tasks) do routines[index] = coroutine.create(fn) end
@@ -847,39 +802,58 @@ local function runAll(waitForAll, ...)
                 if not waitForAll then return index end
             else
                 alive = true
-                local request = pending[index]
-                if type(request) == "table" and request.kind == "event" then
-                    local event = eventQueue[1]
-                    if event and event.wait then
-                        event.wait = event.wait - 1
-                        if event.wait <= 0 then table.remove(eventQueue, 1) end
-                        advance(0.05)
-                        event = nil
-                    else
-                        event = table.remove(eventQueue, 1)
-                    end
-                    if event then
-                        step(index, event)
-                        if event[1] == "key" or event[1] == "mouse_click" then
-                            snapshotScreen()
-                            shots[#shots + 1] = {
-                                label = event[1] == "key" and "after key" or
-                                    ("click x=" .. tostring(event[3])),
-                                rows = lastScreen,
-                            }
-                        end
-                    else
-                        -- Nobody is pressing anything. This loop stays blocked
-                        -- while the others keep flying.
-                        advance(0.05)
-                    end
-                else
-                    advance(type(request) == "table" and request.secs or 0.05)
-                    step(index, nil)
-                end
             end
         end
         if not alive then return 0 end
+
+        local event = eventQueue[1]
+
+        if event and event.wait then
+            -- A pause the script asked for: the pilot sitting there watching the
+            -- drift build up before pressing the next key.
+            event.wait = event.wait - 1
+            if event.wait <= 0 then table.remove(eventQueue, 1) end
+            advanceTo(clock + 0.05)
+        elseif event then
+            local target = nil
+            for index in ipairs(routines) do
+                if waiting[index] then target = index; break end
+            end
+            if target then
+                table.remove(eventQueue, 1)
+                step(target, event)
+                if event[1] == "key" or event[1] == "mouse_click" then
+                    snapshotScreen()
+                    shots[#shots + 1] = {
+                        label = event[1] == "key" and "after key" or
+                            ("click x=" .. tostring(event[3])),
+                        rows = lastScreen,
+                    }
+                end
+            else
+                -- Something is queued and nobody is listening for it yet.
+                advanceTo(clock + 0.05)
+            end
+        else
+            local earliest = nil
+            for index in ipairs(routines) do
+                if wakeAt[index] and (earliest == nil or wakeAt[index] < earliest) then
+                    earliest = wakeAt[index]
+                end
+            end
+            if not earliest then
+                -- Everything is blocked on an event and nobody is pressing
+                -- anything. The world still turns.
+                advanceTo(clock + 0.05)
+            else
+                advanceTo(earliest)
+                for index in ipairs(routines) do
+                    if wakeAt[index] and wakeAt[index] <= clock + 1e-9 then
+                        step(index, nil)
+                    end
+                end
+            end
+        end
     end
 end
 
@@ -1135,22 +1109,14 @@ end
 print("")
 print(string.format("position  %.1f %.1f %.1f", sim.position.x, sim.position.y, sim.position.z))
 print(string.format("velocity  %.2f %.2f %.2f", sim.velocity.x, sim.velocity.y, sim.velocity.z))
+-- Attitude is the whole point of this hull, so it goes on the report beside the
+-- position. Two propellers can read the same and be on different relays, so each
+-- RPM is named by the side it turns rather than by its controller.
 local rpms = {}
-if options.hull == "tank" then
-    -- Attitude is the whole point of this hull, so it goes on the report beside
-    -- the position. Two propellers can read the same and be on different relays,
-    -- so each RPM is named by the side it turns rather than by its controller.
-    print(string.format("attitude  yaw %.1f (%.1f deg/s)  pitch %.1f", sim.yaw, sim.yawRate, sim.pitch))
-    print(string.format("balloon   %d of 15", sim.balloon))
-    for _, prop in ipairs(sim.props) do
-        rpms[#rpms + 1] = prop.side .. "=" .. tostring(prop.line.actual)
-    end
-else
-    for _, entry in ipairs(OMNI_LAYOUT) do
-        -- tostring rather than %d: a nil here means the run already failed, and
-        -- a report that crashes on its way to saying so tells you nothing.
-        rpms[#rpms + 1] = entry.name:match("_(%d+)$") .. "=" .. tostring(sim.lines[entry.name].rpm)
-    end
+print(string.format("attitude  yaw %.1f (%.1f deg/s)  pitch %.1f", sim.yaw, sim.yawRate, sim.pitch))
+print(string.format("balloon   %d of 15", sim.balloon))
+for _, prop in ipairs(sim.props) do
+    rpms[#rpms + 1] = prop.side .. "=" .. tostring(prop.line.actual)
 end
 print("rpm       " .. table.concat(rpms, " "))
 if not ok and not finished and tostring(err):find("Terminated") == nil then
@@ -1202,22 +1168,11 @@ if options.script == "vcal" then
     return
 end
 
--- The tank hull has no arrival assertion yet, and saying so is the point. Its
--- control loop is stage 4: until then every propeller it owns is on a relay this
--- program cannot route to, so the ship sits where it was left and a FAILED here
--- would be the harness reporting a stage that has not been written as a bug.
--- Turn this into the same assertion the omni hull gets when control.lua lands.
-if options.hull == "tank" then
-    print("the tank hull is not flown yet: control.lua is stage 4")
-    print("simulation finished cleanly after " .. frames .. " frames")
-    return
-end
-
 local target = { x = 120, y = 95, z = 60 }
 local left = math.sqrt((target.x - sim.position.x) ^ 2
                      + (target.y - sim.position.y) ^ 2
                      + (target.z - sim.position.z) ^ 2)
-local began = math.sqrt(target.x ^ 2 + (target.y - 80) ^ 2 + target.z ^ 2)
+local began = math.sqrt(target.x ^ 2 + (target.y - START_Y) ^ 2 + target.z ^ 2)
 print(string.format("distance to the target: %.1f of the %.1f it started with", left, began))
 print("")
 if left >= began then

@@ -1,16 +1,18 @@
 -- control.lua -- the flight loop.
 --
--- Two nested loops per body axis. The outer one turns "we are 140 blocks short"
--- into "fly at 12 m/s". The inner one turns "fly at 12 m/s" into RPM, and that
--- is where velocity calibration earns its keep: the curve says what 12 m/s
--- costs on this ship, so the loop starts from the right answer and only has to
--- trim it, instead of hunting for it from zero every flight.
+-- A shell over sc/flight.lua. This file reads the pose, keeps the phase and the
+-- timers, and writes RPM. Every decision worth arguing about is made in
+-- flight.lua, where it is pure and can be tested on a computer that is not on a
+-- ship.
 --
--- With no curve it degrades to what the old autopilot did, proportional with
--- damping, which flies but overshoots. `useCurves off` forces that path if you
--- want to compare.
+-- The ship it flies turns by driving one side against the other and holds its
+-- altitude on a balloon. So a leg is not one problem, it is three in order:
+-- point at the target, run at it, stop. That is the phase machine, and the
+-- altitude loop runs underneath all three because the balloon is the only thing
+-- holding the ship up and there is no phase in which it should stop being
+-- commanded.
 
-local util, ship, cal, config, log = ...
+local util, ship, cal, config, log, flight, turbine = ...
 
 local control = {}
 
@@ -18,42 +20,56 @@ control.running = false        -- is the autopilot commanding anything
 control.target = nil           -- {x, y, z} world
 control.targetName = nil
 control.phase = "idle"
+control.reason = nil           -- why the phase machine last changed its mind
 control.status = "IDLE"
 control.statusKind = "dim"
 control.state = nil            -- last good ship state
 control.fault = nil            -- why the last read failed, if it did
 control.dist = nil
 control.eta = nil
-control.axisInfo = {}          -- per axis: want, have, rpm, ff, trim
 control.demands = {}           -- line name -> rpm last decided
 control.arrivedAt = nil        -- set once on arrival, cleared by whoever reads it
 control.onArrive = nil         -- hook the navigator hangs its queue off
-control.manual = nil           -- {x, y, z} body-frame speed command, or nil
-control.hold = nil             -- position being station kept, when arrived
+control.manual = nil           -- { throttle, yaw, level } or nil
+control.hold = nil             -- position being held, once arrived
 
-local posPID, spdPID = {}, {}
+-- What the screen wants to see and the pilot wants to argue with.
+control.info = {
+    err = nil, bearing = nil, yawRate = nil, pitch = nil,
+    want = nil, have = nil, lateral = nil,
+    common = nil, differential = nil, balloon = nil,
+}
+
+-- Seconds the ship has been inside the padding band and no longer swinging.
+-- The phase machine will not commit to cruise on the strength of one tick, and
+-- this is the memory that lets it insist.
+local alignedFor = 0
+local legBegan = 0
+local creepTries = 0
+local lastTrim = 0
 local lastTick = nil
 
+local yawPID, spdPID, altPID
+
 local function makePIDs()
-    for _, axis in ipairs(util.AXIS_ORDER) do
-        posPID[axis] = util.newPID(config.get("posKp"), config.get("posKi"), config.get("posKd"),
-            -1e6, 1e6, 50)
-        spdPID[axis] = util.newPID(config.get("spdKp"), config.get("spdKi"), config.get("spdKd"),
-            -config.get("maxRpm"), config.get("maxRpm"), config.get("spdILimit"))
-    end
+    yawPID = util.newPID(config.get("yawKp"), config.get("yawKi"), config.get("yawKd"),
+        -1e6, 1e6, 50)
+    spdPID = util.newPID(config.get("spdKp"), config.get("spdKi"), config.get("spdKd"),
+        -config.get("cruiseMaxRpm"), config.get("cruiseMaxRpm"), config.get("spdILimit"))
+    altPID = util.newPID(config.get("altKp"), config.get("altKi"), config.get("altKd"),
+        -1e6, 1e6, 50)
 end
 
 -- Gains can move while flying, from the TUNE tab or a `set` command, so the
--- PIDs are told rather than rebuilt. Rebuilding would drop the integral and
--- put a step in the output.
+-- PIDs are told rather than rebuilt. Rebuilding would drop the integral and put
+-- a step in the output.
 function control.refreshGains()
-    for _, axis in ipairs(util.AXIS_ORDER) do
-        if posPID[axis] then
-            posPID[axis]:setGains(config.get("posKp"), config.get("posKi"), config.get("posKd"))
-            spdPID[axis]:setGains(config.get("spdKp"), config.get("spdKi"), config.get("spdKd"))
-            spdPID[axis]:setLimits(-config.get("maxRpm"), config.get("maxRpm"), config.get("spdILimit"))
-        end
-    end
+    if not yawPID then return end
+    yawPID:setGains(config.get("yawKp"), config.get("yawKi"), config.get("yawKd"))
+    spdPID:setGains(config.get("spdKp"), config.get("spdKi"), config.get("spdKd"))
+    spdPID:setLimits(-config.get("cruiseMaxRpm"), config.get("cruiseMaxRpm"),
+        config.get("spdILimit"))
+    altPID:setGains(config.get("altKp"), config.get("altKi"), config.get("altKd"))
 end
 
 function control.init()
@@ -63,21 +79,31 @@ function control.init()
 end
 
 function control.resetPIDs()
-    for _, axis in ipairs(util.AXIS_ORDER) do
-        if posPID[axis] then posPID[axis]:reset() end
-        if spdPID[axis] then spdPID[axis]:reset() end
-    end
+    if yawPID then yawPID:reset(); spdPID:reset(); altPID:reset() end
+    alignedFor = 0
     lastTick = nil
 end
 
 -- == COMMANDS ================================================
+
+local function enterPhase(phase, why)
+    if control.phase ~= phase then
+        control.phase = phase
+        alignedFor = 0
+        log.infof("phase %s: %s", phase, tostring(why))
+    end
+    control.reason = why
+end
 
 function control.setTarget(x, y, z, name)
     control.target = { x = x, y = y, z = z }
     control.targetName = name
     control.hold = nil
     control.arrivedAt = nil
+    creepTries = 0
+    legBegan = os.clock()
     control.resetPIDs()
+    enterPhase("tank", "new target")
     log.infof("target set: %s (%.1f, %.1f, %.1f)", name or "coords", x, y, z)
 end
 
@@ -90,11 +116,16 @@ end
 function control.start()
     if not control.target and not control.manual then return false, "no target" end
     control.running = true
+    legBegan = os.clock()
+    creepTries = 0
     control.resetPIDs()
+    enterPhase("tank", "engaged")
     log.infof("autopilot engaged towards %s", control.targetName or "coords")
     return true
 end
 
+-- Thrust stops. The balloon does not, and the difference is the whole reason
+-- this is two sentences rather than one loop over everything.
 function control.stop(why)
     control.running = false
     control.manual = nil
@@ -108,92 +139,188 @@ function control.stop(why)
     log.info("stopped: " .. (why or "by command"))
 end
 
--- Fly by hand: a body-frame speed command that goes through the same inner
--- loop, so the calibrated curves and the slew limit apply to it too.
-function control.setManual(bx, by, bz)
-    if bx == 0 and by == 0 and bz == 0 then
+-- Fly by hand. Throttle and yaw are fractions of the ship's own maxima, so what
+-- the pilot asks for means the same thing on a ship whose curves have been
+-- measured and on one whose have not. Level is the balloon, straight through.
+function control.setManual(throttle, yaw, level)
+    if throttle == 0 and yaw == 0 and level == nil then
         control.manual = nil
         if not control.target then control.stop("MANUAL OFF") end
         return
     end
-    control.manual = { x = bx, y = by, z = bz }
+    control.manual = { throttle = throttle or 0, yaw = yaw or 0, level = level }
     control.target = nil
     control.targetName = nil
     control.running = true
+    enterPhase("manual", "by hand")
+end
+
+-- == READING THE SHIP ========================================
+
+-- Yaw rate out of CC: Sable, in the units and the sign the rest of the program
+-- thinks in. getAngularVelocity is radians about the world axes, and its y runs
+-- opposite to this yaw convention, which is the single easiest sign in the
+-- program to get backwards and the hardest to notice.
+local function yawRateOf()
+    if type(sublevel) ~= "table" or not sublevel.getAngularVelocity then return nil end
+    local ok, raw = pcall(sublevel.getAngularVelocity)
+    if not ok then return nil end
+    local vec = util.toVec(raw)
+    if not vec then return nil end
+    return -math.deg(vec.y)
+end
+
+-- Speed along the hull rather than speed through the air. A ship that has just
+-- turned is still carrying the velocity of where it used to be pointing, and
+-- braking against that number would brake against a crosswind.
+local function forwardSpeed(state)
+    return state.bz or 0
+end
+
+-- == THE BALLOON =============================================
+--
+-- Runs in every phase, including none of them. There is no state of this
+-- program in which the thing holding the ship up should stop being told what to
+-- do, which is why this is not inside the phase machine below.
+local function driveBalloon(state, wantY)
+    if not turbine or not turbine.setBalloon then return nil end
+    local haveY = state.position.y
+    local altErr = (wantY or haveY) - haveY
+    local vspeed = state.velocity and state.velocity.y or 0
+    local level = flight.balloonLevel(altErr, vspeed, cal, config.values)
+    control.info.balloon = level
+    control.info.altErr = altErr
+    if level ~= control.lastBalloon then
+        control.lastBalloon = level
+        pcall(turbine.setBalloon, level)
+    end
+    return level
 end
 
 -- == THE LOOP ================================================
 
--- Desired body-frame speed along one axis, given how far off we are on it and
--- how far the whole leg still has to run. The taper is what stops the ship
--- arriving at 20 m/s and sailing straight through the waypoint.
-local function wantedSpeed(axis, err, dist, dt)
-    local cap = axis == "y" and config.get("climbSpeed") or config.get("cruiseSpeed")
-
-    -- What the axis has actually been measured doing caps it further. Asking
-    -- for 30 m/s out of a line that tops out at 9 only winds up the integral.
-    local top = cal.topSpeed(axis)
-    if top and top > 0.2 and config.get("useCurves") then cap = math.min(cap, top) end
-
-    local want = posPID[axis]:update(err, dt)
-
-    -- Bleed off over the last slowRadius blocks of the leg, on distance rather
-    -- than on this axis alone, so a diagonal approach slows as one machine.
-    local radius = config.get("slowRadius")
-    if dist and radius > 0 then
-        cap = cap * util.clamp(dist / radius, 0.02, 1.0)
-    end
-    return util.clamp(want, -cap, cap)
-end
-
--- Desired speed to RPM for one axis. Feed-forward off the curve, trim off the
--- PID. Returns the axis RPM plus the two halves, because seeing them split is
--- how you tell a bad curve from bad gains on the PROPS tab.
-local function axisRpm(axis, want, have, dt)
-    local maxRpm = config.get("maxRpm")
-    local ff = 0
-    if config.get("useCurves") then
-        local curve = cal.curveFor(axis, want)
-        local guess = util.curveRpmFor(curve, want)
-        if guess then ff = guess * util.sign(want) end
-    end
-    local trim = spdPID[axis]:update(want - have, dt)
-    local total = util.clamp(ff + trim, -maxRpm, maxRpm)
-    return total, ff, trim
-end
-
--- Spread an axis demand over the lines that serve it, then apply the floor and
--- the slew limit per line.
-local function spread(demands, axis, rpm)
-    local lines = cal.linesOnAxis(axis)
-    if #lines == 0 then return end
-    local minRpm = config.get("minRpm")
-    local maxRpm = config.get("maxRpm")
-    for _, line in ipairs(lines) do
-        local value = rpm * line.share
-        if line.reverse then value = -value end
-        if math.abs(value) < minRpm then value = 0 end
-        demands[line.name] = (demands[line.name] or 0) + util.clamp(value, -maxRpm, maxRpm)
-    end
-end
-
-local function applySlew(demands)
-    local slew = config.get("rpmSlew")
-    local maxRpm = config.get("maxRpm")
-    local out = {}
-    for _, name in ipairs(ship.order) do
-        local wanted = util.clamp(demands[name] or 0, -maxRpm, maxRpm)
-        local previous = control.demands[name] or 0
-        local delta = util.clamp(wanted - previous, -slew, slew)
-        out[name] = util.round(previous + delta)
-    end
-    return out
-end
-
-local function setStatus(text, kind, phase)
+local function setStatus(text, kind)
     control.status = text
     control.statusKind = kind or "hi"
-    if phase then control.phase = phase end
+end
+
+-- One tick of a leg: where the phase machine is, and what the propellers are
+-- told because of it. Returns the common thrust and the differential, both
+-- signed RPM, for the mixer.
+local function flyLeg(state, goal, dt)
+    local cfg = config.values
+    local p = state.position
+
+    local bearing = flight.bearingTo(p.x, p.z, goal.x, goal.z)
+    local err = flight.headingError(bearing, state.yaw, cal.noseOffset)
+    local yawRate = yawRateOf() or 0
+    local pitch = util.pitchOf(state.orientation)
+    local dx, dz = goal.x - p.x, goal.z - p.z
+    local d = math.sqrt(dx * dx + dz * dz)
+    local v = forwardSpeed(state)
+    local lateral = flight.lateralError(p, goal, state.yaw)
+
+    control.dist = d
+    control.info.bearing = bearing
+    control.info.err = err
+    control.info.yawRate = yawRate
+    control.info.pitch = pitch
+    control.info.have = v
+    control.info.lateral = lateral
+
+    -- The memory the phase machine insists on: not just lined up, but lined up
+    -- and no longer swinging, for long enough to believe.
+    if math.abs(err) <= cfg.tankPadding and math.abs(yawRate) <= cfg.tankHoldRate then
+        alignedFor = alignedFor + dt
+    else
+        alignedFor = 0
+    end
+
+    local stopped = math.abs(v) < 0.3 and math.abs(state.speed or 0) < 0.5
+    local nextPhase, why = flight.phaseNext(control.phase, {
+        err = err, yawRate = yawRate, d = d, v = v,
+        lateral = lateral, alignedFor = alignedFor, stopped = stopped,
+    }, cfg, cal)
+
+    if nextPhase ~= control.phase then
+        if nextPhase == "tank" and control.phase == "brake" then
+            -- Turning around for a second run at the point. It is allowed a few
+            -- of these and then it says so rather than pirouetting forever.
+            creepTries = creepTries + 1
+        end
+        if nextPhase == "cruise" then legBegan = os.clock() end
+        enterPhase(nextPhase, why)
+    else
+        control.reason = why
+    end
+
+    if control.phase == "arrived" then
+        return 0, 0, d
+    end
+
+    -- Two different ways to fail to arrive, and they get two different strings.
+    -- Being off to the side is a hull that cannot strafe; being short or past is
+    -- a stop that did not land where it was aimed, and the fix for one is not the
+    -- fix for the other.
+    if creepTries > cfg.creepTries then
+        if math.abs(lateral) > cfg.lateralCorrect then
+            setStatus(string.format("GAVE UP, %.1f blk OFF THE LINE", math.abs(lateral)), "bad")
+        else
+            setStatus(string.format("GAVE UP, STOPPED %.1f blk OUT", d), "bad")
+        end
+        return 0, 0, d
+    end
+
+    -- Tank: rotate, do not translate.
+    if control.phase == "tank" then
+        local demand = flight.tankDemand(err, yawPID, cal, cfg, dt)
+        control.info.want = 0
+        control.info.common = 0
+        control.info.differential = demand.diff
+        setStatus(string.format("TURN %+.0f deg  %.0f blk", err, d), "warn")
+        return 0, demand.diff, d
+    end
+
+    -- Cruise: run at it, trimming the heading rather than turning.
+    if control.phase == "cruise" then
+        local elapsed = os.clock() - legBegan
+        -- Creeping is the same run at a speed the pilot would call walking, so
+        -- it shares this whole path rather than being a fourth phase.
+        local want = creepTries > 0 and cfg.creepSpeed
+            or flight.wantSpeed(d, elapsed, cfg, cal)
+        local common = flight.thrustRpm(want, v, cal.fwdCurve, spdPID, dt, cfg.cruiseMaxRpm)
+        if math.abs(common) < cfg.cruiseMinRpm then common = 0 end
+
+        -- The trim is on its own clock. Nudging the heading every tick fights
+        -- the hull's own swing and costs stress for nothing.
+        local now = os.clock()
+        if now - lastTrim >= cfg.yawTrimInterval then
+            lastTrim = now
+            control.trim = flight.yawTrim(err, cfg)
+        end
+
+        control.info.want = want
+        control.info.common = common
+        control.info.differential = control.trim or 0
+        setStatus(string.format("RUN %.0f blk  %.1f m/s", d, v), "good")
+        return common, control.trim or 0, d
+    end
+
+    -- Brake: reverse, graduated, heading still trimmed.
+    if control.phase == "brake" then
+        local plan, reason = flight.brakePlan(v, d, pitch, cal, cfg)
+        control.reason = reason
+        control.info.want = 0
+        control.info.common = plan.main
+        control.info.differential = control.trim or 0
+        control.brakePlan = plan
+        setStatus(string.format("STOP %.0f blk  %.1f m/s", d, v), "warn")
+        -- The turbines hold back whatever the heading trim is asking for, so the
+        -- ship never loses its nose in the middle of a stop.
+        return plan.main, plan.turbines ~= 0 and (control.trim or 0) or 0, d
+    end
+
+    return 0, 0, d
 end
 
 function control.tick()
@@ -207,9 +334,11 @@ function control.tick()
     control.fault = state and nil or why
 
     if not state then
-        -- This is what a disassembled ship looks like. Stop, do not guess.
-        setStatus(why, "bad", "fault")
-        control.axisInfo = {}
+        -- This is what a disassembled ship looks like. Stop, do not guess. The
+        -- balloon is left where it is: with no pose there is no telling whether
+        -- changing it would help, and the last level was at least flying.
+        setStatus(why, "bad")
+        control.phase = "fault"
         if control.running then
             control.running = false
             log.warn("pose read failed, autopilot disengaged: " .. tostring(why))
@@ -219,97 +348,67 @@ function control.tick()
         return
     end
 
+    local cfg = config.values
+    local goal = control.hold or control.target
+
+    -- Altitude first, and unconditionally, because it is the only loop whose
+    -- failure is measured in metres per second downwards.
+    driveBalloon(state, goal and goal.y or nil)
+
     if not control.running then
         setStatus(control.target and "READY" or "NO TARGET",
-            control.target and "warn" or "dim", "idle")
-        control.axisInfo = {}
+            control.target and "warn" or "dim")
+        control.phase = "idle"
         local zeros = {}
         for _, name in ipairs(ship.order) do zeros[name] = 0 end
-        control.demands = applySlew(zeros)
+        control.demands = flight.applySlew(control.demands, zeros, cfg.rpmSlew)
         ship.flush(control.demands)
         return
     end
 
-    -- Where we are trying to be, in world space, and how wrong that is.
-    local wantVel = nil
-    local dist = nil
+    local common, differential = 0, 0
 
     if control.manual then
-        wantVel = control.manual
-        setStatus(string.format("MANUAL %+.0f %+.0f %+.0f",
-            wantVel.x, wantVel.y, wantVel.z), "warn", "manual")
-    else
-        local goal = control.hold or control.target
-        local p = state.position
-        local dx, dy, dz = goal.x - p.x, goal.y - p.y, goal.z - p.z
-        if not config.get("holdAlt") and not control.hold then dy = 0 end
-        dist = util.len3(dx, dy, dz)
-        control.dist = dist
+        common = control.manual.throttle * cfg.cruiseMaxRpm
+        differential = control.manual.yaw * cfg.tankRpmMax
+        control.info.common = common
+        control.info.differential = differential
+        setStatus(string.format("MANUAL thr %+.0f%%  yaw %+.0f%%",
+            control.manual.throttle * 100, control.manual.yaw * 100), "warn")
+    elseif goal then
+        local d
+        common, differential, d = flyLeg(state, goal, dt)
 
-        if not control.hold and dist <= config.get("arriveDist") then
-            -- Arrived. Either park here and keep fighting the drift, or let go.
+        if control.phase == "arrived" and not control.hold then
             local name = control.targetName
             control.arrivedAt = name or "target"
-            log.infof("arrived at %s, %.1f blocks out", name or "target", dist)
             control.eta = nil
-            if config.get("stationKeep") then
-                control.hold = { x = goal.x, y = goal.y, z = goal.z }
-                setStatus("ARRIVED, HOLDING", "good", "hold")
-            else
-                control.stop("ARRIVED")
-                setStatus("ARRIVED", "good", "idle")
-                if control.onArrive then control.onArrive(name) end
-                return
-            end
+            log.infof("arrived at %s, %.1f blocks out", name or "target", d or 0)
+            control.hold = { x = goal.x, y = goal.y, z = goal.z }
+            setStatus(string.format("ARRIVED, HOLDING %.1f blk", d or 0), "good")
             if control.onArrive then control.onArrive(name) end
-        elseif control.hold then
-            control.eta = nil
-            setStatus(string.format("HOLDING %.1f blk", dist), "good", "hold")
-        else
-            local top = cal.topSpeed("x") or config.get("cruiseSpeed")
-            local along = state.speed
-            control.eta = along > 0.4 and dist / along or nil
-            if config.get("holdAlt") and math.abs(dy) > config.get("arriveDist") * 2
-                    and dist > config.get("slowRadius") then
-                setStatus(string.format("CLIMB %+.0f m   %.0f blk out", dy, dist), "warn", "climb")
-            else
-                setStatus(string.format("CRUISE %.0f blk  %.1f m/s", dist, along), "good", "cruise")
+        elseif control.phase == "arrived" then
+            setStatus(string.format("HOLDING %.1f blk", d or 0), "good")
+            -- Holding is the same behaviour as a leg, continuously. Drift past
+            -- holdDrift is a new leg onto the same point.
+            if d and d > cfg.holdDrift then
+                creepTries = 0
+                enterPhase("tank", string.format("drifted %.1f blk", d))
             end
-            local _ = top
         end
 
-        -- World error into the ship's own frame, which is the only frame the
-        -- propellers know anything about.
-        local ex, ey, ez = util.worldToBody(state.orientation, dx, dy, dz)
-        local errs = { x = ex, y = ey, z = ez }
-        wantVel = {}
-        for _, axis in ipairs(util.AXIS_ORDER) do
-            wantVel[axis] = wantedSpeed(axis, errs[axis], dist, dt)
-        end
-        control.axisErr = errs
+        local v = forwardSpeed(state)
+        control.eta = (v > 0.4 and d) and d / v or nil
+    else
+        setStatus("NO TARGET", "dim")
     end
 
-    local have = { x = state.bx, y = state.by, z = state.bz }
-    local demands = {}
-    for _, name in ipairs(ship.order) do demands[name] = 0 end
+    -- Braking has its own slew, because how fast reverse comes on is what tips
+    -- the hull, and it is not the same number as the one that softens a launch.
+    local slew = control.phase == "brake" and cfg.brakeSlew or cfg.rpmSlew
 
-    control.axisInfo = {}
-    for _, axis in ipairs(util.AXIS_ORDER) do
-        local want = wantVel[axis] or 0
-        if not cal.hasAxis(axis) then
-            -- Nothing on the ship can push this way. Say so rather than
-            -- pretending the demand went somewhere.
-            control.axisInfo[axis] = { want = want, have = have[axis], rpm = 0, blind = true }
-        else
-            local rpm, ff, trim = axisRpm(axis, want, have[axis], dt)
-            spread(demands, axis, rpm)
-            control.axisInfo[axis] = {
-                want = want, have = have[axis], rpm = rpm, ff = ff, trim = trim,
-            }
-        end
-    end
-
-    control.demands = applySlew(demands)
+    local wanted = flight.mix(common, differential, ship.order, cal, cfg)
+    control.demands = flight.applySlew(control.demands, wanted, slew)
     ship.flush(control.demands)
 end
 
@@ -319,6 +418,7 @@ function control.snapshot()
     return {
         running = control.running,
         phase = control.phase,
+        reason = control.reason,
         status = control.status,
         statusKind = control.statusKind,
         state = control.state,
@@ -328,7 +428,7 @@ function control.snapshot()
         hold = control.hold,
         dist = control.dist,
         eta = control.eta,
-        axisInfo = control.axisInfo,
+        info = control.info,
         demands = control.demands,
     }
 end
