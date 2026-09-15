@@ -1,0 +1,344 @@
+-- util.lua -- vectors, quaternions, small formatters, a PID.
+--
+-- Everything here is pure. No peripherals, no screen, no files, so the whole
+-- module can be exercised by `starcatcher --test` on a computer that is not on
+-- a ship and has nothing attached to it.
+
+local util = {}
+
+-- == DIRECTIONS ==============================================
+-- The vocabulary calibration answers in. Body frame, the ship's own, so these
+-- line up with world directions only while the ship sits at identity
+-- orientation.
+util.DIRECTIONS = {
+    up    = {  0,  1,  0 },
+    down  = {  0, -1,  0 },
+    north = {  0,  0, -1 },
+    south = {  0,  0,  1 },
+    east  = {  1,  0,  0 },
+    west  = { -1,  0,  0 },
+    none  = {  0,  0,  0 },
+}
+
+util.DIR_ORDER = { "up", "down", "north", "south", "east", "west", "none" }
+
+-- Which body axis each direction lives on, so the controller can group the
+-- lines that fight over the same degree of freedom.
+util.DIR_AXIS = {
+    up = "y", down = "y", north = "z", south = "z", east = "x", west = "x",
+}
+
+util.AXIS_ORDER = { "x", "y", "z" }
+util.AXIS_INDEX = { x = 1, y = 2, z = 3 }
+
+-- == QUATERNIONS =============================================
+
+-- Rotate v by the quaternion (ux, uy, uz, w): v + 2u x (u x v + w v).
+-- Negate the vector part to rotate the other way, which is what turns a world
+-- vector into a body frame one.
+function util.qRotate(ux, uy, uz, w, vx, vy, vz)
+    local tx = uy * vz - uz * vy + w * vx
+    local ty = uz * vx - ux * vz + w * vy
+    local tz = ux * vy - uy * vx + w * vz
+    return vx + 2 * (uy * tz - uz * ty),
+           vy + 2 * (uz * tx - ux * tz),
+           vz + 2 * (ux * ty - uy * tx)
+end
+
+function util.worldToBody(q, vx, vy, vz)
+    return util.qRotate(-q.x, -q.y, -q.z, q.w, vx, vy, vz)
+end
+
+function util.bodyToWorld(q, vx, vy, vz)
+    return util.qRotate(q.x, q.y, q.z, q.w, vx, vy, vz)
+end
+
+-- CC: Sable has shipped more than one shape for these. A vector is {x, y, z} in
+-- the current source and an array in some builds, and a quaternion is either
+-- flat {x, y, z, w} or the CC: Advanced Math pair of a scalar a and a vector v.
+-- Read whichever turned up rather than guessing from the version.
+function util.toVec(v)
+    if type(v) ~= "table" then return nil end
+    local x, y, z = v.x, v.y, v.z
+    if type(x) ~= "number" then x, y, z = v[1], v[2], v[3] end
+    if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
+        return nil
+    end
+    return { x = x, y = y, z = z }
+end
+
+function util.toQuat(q)
+    if type(q) ~= "table" then return nil end
+    local x, y, z, w
+    if type(q.w) == "number" and type(q.x) == "number" then
+        x, y, z, w = q.x, q.y, q.z, q.w
+    elseif type(q.a) == "number" and type(q.v) == "table" then
+        local v = util.toVec(q.v)
+        if not v then return nil end
+        x, y, z, w = v.x, v.y, v.z, q.a
+    elseif type(q[1]) == "number" and type(q[4]) == "number" then
+        x, y, z, w = q[1], q[2], q[3], q[4]
+    else
+        return nil
+    end
+    if type(y) ~= "number" or type(z) ~= "number" then return nil end
+    -- qRotate is only a rotation for a unit quaternion, anything else scales
+    -- the vector it is given.
+    local len = math.sqrt(x * x + y * y + z * z + w * w)
+    if len < 1e-9 then return nil end
+    return { x = x / len, y = y / len, z = z / len, w = w / len }
+end
+
+-- == SCALARS =================================================
+
+-- Into (-180, 180]. 180 stays 180 rather than flipping to -180, because a
+-- heading readout that jumps sign when the ship points due north is a bug
+-- report waiting to happen.
+function util.wrapAngle(a)
+    a = (a + 180) % 360
+    if a <= 0 then a = a + 360 end
+    return a - 180
+end
+
+function util.clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+function util.round(v)
+    return math.floor(v + 0.5)
+end
+
+function util.len3(x, y, z)
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+function util.sign(v)
+    if v > 0 then return 1 elseif v < 0 then return -1 else return 0 end
+end
+
+-- Yaw of the body +Z axis once it is taken out to the world, in degrees,
+-- Minecraft convention: 0 faces +Z, +90 faces -X. Rotating the axis by the
+-- quaternion never has to pick a sign convention for the quaternion itself,
+-- which is exactly where CC: Sable and the navigation table disagree.
+function util.yawOf(q)
+    local fx, _, fz = util.bodyToWorld(q, 0, 0, 1)
+    if math.abs(fx) < 1e-9 and math.abs(fz) < 1e-9 then return 0 end
+    return util.wrapAngle(math.deg(math.atan2(-fx, fz)))
+end
+
+-- For the screen when a peripheral shape is not understood, so the keys can be
+-- read off rather than guessed at.
+function util.keyList(t)
+    if type(t) ~= "table" then return type(t) end
+    local keys = {}
+    for k in pairs(t) do keys[#keys + 1] = tostring(k) end
+    table.sort(keys)
+    return "{" .. table.concat(keys, ",") .. "}"
+end
+
+-- == NAMES AND LABELS ========================================
+
+-- Trailing number off a peripheral name, so the screen can say "#3" instead of
+-- "Create_RotationSpeedController_3".
+function util.shortName(name)
+    return "#" .. (name:match("_(%d+)$") or name)
+end
+
+-- Which named direction a measured drift is closest to, for calibration to
+-- offer as its suggested answer.
+function util.dominantDirection(bx, by, bz, minMag)
+    if util.len3(bx, by, bz) < (minMag or 0.15) then return "none" end
+    local best, bestDot = "none", 0
+    for _, name in ipairs(util.DIR_ORDER) do
+        local d = util.DIRECTIONS[name]
+        local dot = bx * d[1] + by * d[2] + bz * d[3]
+        if dot > bestDot then best, bestDot = name, dot end
+    end
+    return best
+end
+
+function util.labelFor(axis)
+    if not axis then return "?" end
+    for _, name in ipairs(util.DIR_ORDER) do
+        local d = util.DIRECTIONS[name]
+        if axis[1] == d[1] and axis[2] == d[2] and axis[3] == d[3] then return name end
+    end
+    return "custom"
+end
+
+-- A calibrated line is one of the named directions plus which way it has to
+-- spin to get there. DIRECTIONS is shared, so never hand it out to be tagged.
+function util.makeAxis(direction, reverse)
+    local d = util.DIRECTIONS[direction]
+    if not d then return nil end
+    return { d[1], d[2], d[3], reverse = reverse or false }
+end
+
+-- == FORMATTERS ==============================================
+
+function util.fmtETA(secs)
+    if not secs or secs ~= secs or secs == math.huge or secs < 0 then return "---" end
+    secs = math.floor(secs)
+    if secs > 86400 then return "---" end
+    local h = math.floor(secs / 3600)
+    local m = math.floor((secs % 3600) / 60)
+    local s = secs % 60
+    local parts = {}
+    if h > 0 then parts[#parts + 1] = h .. "h" end
+    if m > 0 then parts[#parts + 1] = m .. "m" end
+    if s > 0 or #parts == 0 then parts[#parts + 1] = s .. "s" end
+    return table.concat(parts, " ")
+end
+
+-- 16 points is more resolution than anyone flying a brick needs, but it reads
+-- nicely next to a heading in degrees.
+-- Indexed from yaw -180, which is due north, and running the way yaw does:
+-- 0 is south, -90 is east, +90 is west. That is Minecraft's convention, not a
+-- compass rose's, and getting it backwards is the classic way to fly a ship
+-- confidently in the wrong direction.
+local COMPASS = { "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW" }
+
+function util.compass(yaw)
+    local idx = math.floor(((util.wrapAngle(yaw) + 180) % 360) / 22.5 + 0.5) % 16
+    return COMPASS[idx + 1]
+end
+
+function util.pad(s, n)
+    s = tostring(s)
+    if #s >= n then return s:sub(1, n) end
+    return s .. string.rep(" ", n - #s)
+end
+
+function util.padLeft(s, n)
+    s = tostring(s)
+    if #s >= n then return s:sub(1, n) end
+    return string.rep(" ", n - #s) .. s
+end
+
+-- == PID =====================================================
+-- Same shape starcatcher flew with, plus a clamp on the integral so a long
+-- approach cannot wind it up into a lurch on arrival.
+local PID = {}
+PID.__index = PID
+
+function util.newPID(kp, ki, kd, minOut, maxOut, iLimit)
+    return setmetatable({
+        kp = kp, ki = ki, kd = kd,
+        minOut = minOut or -math.huge,
+        maxOut = maxOut or math.huge,
+        iLimit = iLimit or math.huge,
+        integral = 0, lastErr = nil,
+    }, PID)
+end
+
+function PID:update(err, dt)
+    if dt <= 0 then dt = 0.001 end
+    self.integral = util.clamp(self.integral + err * dt, -self.iLimit, self.iLimit)
+    local deriv = self.lastErr and (err - self.lastErr) / dt or 0
+    self.lastErr = err
+    local out = self.kp * err + self.ki * self.integral + self.kd * deriv
+    return util.clamp(out, self.minOut, self.maxOut)
+end
+
+function PID:setGains(kp, ki, kd)
+    self.kp, self.ki, self.kd = kp, ki, kd
+end
+
+function PID:setLimits(minOut, maxOut, iLimit)
+    self.minOut, self.maxOut = minOut, maxOut
+    if iLimit then self.iLimit = iLimit end
+end
+
+function PID:reset()
+    self.integral = 0
+    self.lastErr = nil
+end
+
+-- == SPEED CURVES ============================================
+-- What velocity calibration produces: a list of {rpm, speed} samples per body
+-- axis, sorted by rpm, measured on the real ship. Each direction of travel
+-- gets its own curve, because a ship is rarely symmetric. Climbing against
+-- gravity is not the same machine as sinking with it.
+
+-- Speed the ship settles at when this axis is driven at `rpm`. Both arguments
+-- are magnitudes; the caller keeps track of sign.
+function util.curveSpeedAt(curve, rpm)
+    if not curve or #curve == 0 then return nil end
+    rpm = math.abs(rpm)
+    local first = curve[1]
+    if rpm <= first.rpm then
+        -- Below the lowest sample, scale the lowest one down rather than
+        -- pretending it was measured.
+        if first.rpm <= 0 then return first.speed end
+        return first.speed * (rpm / first.rpm)
+    end
+    for i = 1, #curve - 1 do
+        local a, b = curve[i], curve[i + 1]
+        if rpm <= b.rpm then
+            local span = b.rpm - a.rpm
+            local t = span > 1e-9 and (rpm - a.rpm) / span or 0
+            return a.speed + (b.speed - a.speed) * t
+        end
+    end
+    -- Past the top sample the curve is flat, not extrapolated. A propeller that
+    -- is already saturated does not go faster because we asked nicely.
+    return curve[#curve].speed
+end
+
+-- The inverse: what RPM to ask for to fly at `speed`. Returns nil when there is
+-- no curve, which is the caller's cue to fall back on plain proportional.
+function util.curveRpmFor(curve, speed)
+    if not curve or #curve < 1 then return nil end
+    local want = math.abs(speed)
+    local prev = nil
+    for i = 1, #curve do
+        local s = curve[i]
+        if s.speed >= want then
+            if not prev then
+                if s.speed <= 1e-6 then return s.rpm end
+                return s.rpm * (want / s.speed)
+            end
+            local span = s.speed - prev.speed
+            local t = span > 1e-6 and (want - prev.speed) / span or 0
+            return prev.rpm + (s.rpm - prev.rpm) * t
+        end
+        prev = s
+    end
+    -- Asked for more than the ship has ever done. Give it everything.
+    return curve[#curve].rpm
+end
+
+-- Fastest this axis was ever seen to go, for the ETA and the cruise clamp.
+function util.curveTopSpeed(curve)
+    if not curve or #curve == 0 then return nil end
+    local best = 0
+    for _, s in ipairs(curve) do if s.speed > best then best = s.speed end end
+    return best
+end
+
+-- Samples come in as they are measured and are not necessarily in order if a
+-- run was interrupted and resumed. Sort and drop duplicates before saving.
+function util.tidyCurve(samples)
+    local out = {}
+    for _, s in ipairs(samples or {}) do
+        if type(s) == "table" and type(s.rpm) == "number" and type(s.speed) == "number" then
+            out[#out + 1] = { rpm = math.abs(s.rpm), speed = math.abs(s.speed) }
+        end
+    end
+    table.sort(out, function(a, b) return a.rpm < b.rpm end)
+    local dedup = {}
+    for _, s in ipairs(out) do
+        local last = dedup[#dedup]
+        if last and math.abs(last.rpm - s.rpm) < 0.5 then
+            dedup[#dedup] = s
+        else
+            dedup[#dedup + 1] = s
+        end
+    end
+    return dedup
+end
+
+return util

@@ -1,0 +1,6 @@
+{
+  "name": "starcatcher-sim",
+  "private": true,
+  "description": "Desktop harness for the starcatcher autopilot. npm install, then node sim.js",
+  "dependencies": { "fengari": "^0.1.4" }
+}

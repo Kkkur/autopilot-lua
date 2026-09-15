@@ -1,0 +1,8 @@
+# desktop harness dependencies
+node_modules/
+
+# mod sources and docs, reference only, never loaded
+deps/
+
+# working notes, plans and handoffs
+md/
