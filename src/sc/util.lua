@@ -128,6 +128,18 @@ function util.yawOf(q)
     return util.wrapAngle(math.deg(math.atan2(-fx, fz)))
 end
 
+-- Pitch of the body +Z axis once it is taken out to the world, in degrees,
+-- positive nose up. Read the same way yawOf is, off the rotated axis rather than
+-- out of the quaternion's components, so neither of them has to agree with CC:
+-- Sable about which sign convention the quaternion itself uses.
+--
+-- This is the tip axis. A hull braking hard noses over, and that is the one
+-- attitude that ends a flight early.
+function util.pitchOf(q)
+    local _, fy, _ = util.bodyToWorld(q, 0, 0, 1)
+    return math.deg(math.asin(util.clamp(fy, -1, 1)))
+end
+
 -- For the screen when a peripheral shape is not understood, so the keys can be
 -- read off rather than guessed at.
 function util.keyList(t)

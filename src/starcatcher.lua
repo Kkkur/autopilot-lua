@@ -58,8 +58,11 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     -- ship.lua touches a peripheral until discover is called, and it is not.
     local shipModule = loadModule("ship", util)
     local turbineModule = loadModule("turbine", util, shipModule, config, stubLog)
+    -- flight is pure the way util is, so it needs nothing stubbed at all. That
+    -- is the whole point of it being its own module.
+    local flightModule = loadModule("flight", util)
     local tests = loadModule("tests", util, config, calModule, fuelModule,
-        turbineModule, shipModule)
+        turbineModule, shipModule, flightModule)
     return tests.run() and 0 or 1
 end
 

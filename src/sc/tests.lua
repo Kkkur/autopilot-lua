@@ -1,11 +1,12 @@
 -- tests.lua -- `starcatcher --test`.
 --
--- Everything checked here is pure: quaternions, mixing, curve lookup, config
--- coercion, calibration file parsing, and what the fuel relay's numbers mean.
+-- Everything checked here is pure: quaternions, the flight maths, curve lookup,
+-- config coercion, calibration file parsing, and what the fuel relay's numbers
+-- mean.
 -- No ship, no peripherals, no modem. If this passes on a bare computer, the
 -- maths that flies the ship is sound and anything still wrong is wiring.
 
-local util, config, cal, fuel, turbine, ship = ...
+local util, config, cal, fuel, turbine, ship, flight = ...
 
 local tests = {}
 
@@ -315,6 +316,286 @@ function tests.run()
 
     turbine.modem = nil
     check(turbine.status().link == "nomodem", "no modem is a link state, not an error")
+
+    -- == pitch ==
+    -- The tip axis. A quarter turn about +X takes body +Z to world -Y, which is
+    -- nose down, so the sign that reads as nose up is the other one.
+    near(util.pitchOf({ x = 0, y = 0, z = 0, w = 1 }), 0, "identity is level")
+    near(util.pitchOf({ x = -h, y = 0, z = 0, w = h }), 90, "nose straight up")
+    near(util.pitchOf({ x = h, y = 0, z = 0, w = h }), -90, "nose straight down")
+    -- Yaw alone never reads as pitch, which is the mistake that would have a
+    -- ship refuse to brake as soon as it stopped pointing at +Z.
+    near(util.pitchOf({ x = 0, y = h, z = 0, w = h }), 0, "a turn is not a tip")
+
+    -- == the flight maths ==
+    -- One calibrated ship, used by everything below. The two sides differ on
+    -- purpose, the main is worth more than a turbine, and the brake ladder has a
+    -- rung past the tip limit so graduated braking has something to refuse.
+    local calShip = {
+        sides = {
+            ta = { side = "left",  reverse = false },
+            tb = { side = "left",  reverse = false },
+            tc = { side = "right", reverse = false },
+            td = { side = "right", reverse = true },
+            mn = { side = "main",  reverse = false },
+            xx = { side = "none",  reverse = false },
+        },
+        noseOffset = 4,
+        yawAuth = { left = 0.059, right = 0.066 },
+        yawCurve = {
+            pos = { { rpm = 64, speed = 8 }, { rpm = 128, speed = 16 }, { rpm = 256, speed = 32 } },
+            neg = { { rpm = 64, speed = 8 }, { rpm = 128, speed = 16 }, { rpm = 256, speed = 32 } },
+        },
+        fwdCurve = {
+            pos = { { rpm = 64, speed = 3 }, { rpm = 128, speed = 7 }, { rpm = 256, speed = 13 } },
+            neg = { { rpm = 64, speed = 3 }, { rpm = 128, speed = 7 }, { rpm = 256, speed = 13 } },
+        },
+        brakeCurve = {
+            main = { { rpm = 128, speed = 1.7, pitch = 3 }, { rpm = 256, speed = 3.4, pitch = 6 } },
+            all  = { { rpm = 128, speed = 4.0, pitch = 8 }, { rpm = 256, speed = 7.5, pitch = 16 } },
+        },
+        balloonCurve = {
+            { rpm = 0, speed = -1.78 }, { rpm = 7, speed = -0.05 },
+            { rpm = 8, speed = 0.12 }, { rpm = 15, speed = 1.78 },
+        },
+        altHover = 7,
+        stressAtTurn = 2400, stressAtCruise = 3600,
+    }
+
+    local cfg = {
+        tankRpmMax = 256, tankRpmMin = 16, tankPadding = 2.0, tankHold = 2.0,
+        tankHoldRate = 2.0, tankReentry = 25, yawRateMax = 30,
+        cruiseSpeed = 12, cruiseRampTime = 7.0, yawTrimThresh = 0.5, yawTrimRpm = 128,
+        arriveDist = 1.0, brakeMargin = 1.3, brakeRpmMax = 256, pitchLimit = 12,
+        lateralCorrect = 4.0,
+        maxRpm = 256, minRpm = 16, mainShare = 1.0, turbineShare = 1.0,
+        altDeadband = 2.0, altKp = 0.5, altKd = 0.8, climbRateMax = 3, sinkRateMax = 3,
+        balloonFloor = 2,
+    }
+
+    -- Bearings answer in the convention yawOf does, or the two could not be
+    -- subtracted from one another, which is all headingError does.
+    near(flight.bearingTo(0, 0, 0, 10), 0, "due +Z is bearing 0")
+    near(flight.bearingTo(0, 0, -10, 0), 90, "due -X is bearing 90")
+    near(flight.bearingTo(0, 0, 10, 0), -90, "due +X is bearing -90")
+    near(flight.bearingTo(5, 5, 5, 5), 0, "no distance, no bearing")
+
+    near(flight.headingError(90, 0, 0), 90, "a target to the right is positive")
+    near(flight.headingError(0, 90, 0), -90, "and to the left is negative")
+    near(flight.headingError(10, 0, 4), 6, "the nose offset comes off the error")
+    near(flight.headingError(-170, 170, 0), 20, "the error wraps the short way")
+
+    -- A ship facing +Z with the target off to its right, which is -X.
+    near(flight.lateralError({ x = 0, z = 0 }, { x = -6, z = 40 }, 0), 6,
+        "lateral error is positive to the right")
+    near(flight.lateralError({ x = 0, z = 0 }, { x = 0, z = 40 }, 0), 0,
+        "dead ahead is not off the line")
+
+    local scaleL, scaleR = flight.sideScales(0.059, 0.066)
+    near(scaleL, 1, "the weaker side runs at full rpm")
+    check(scaleR < 1, "and the stronger is held back to match")
+    near(0.059 * scaleL, 0.066 * scaleR, "so the two sides make equal torque")
+    scaleL, scaleR = flight.sideScales(nil, 0.066)
+    check(scaleL == 1 and scaleR == 1, "an uncalibrated side is not scaled")
+
+    -- The ladder tops out at 256, so a rate past the fastest measured turn asks
+    -- for everything rather than extrapolating a rate the hull has never done.
+    near(flight.yawDifferential(16, calShip.yawCurve, 256), 128, "a rate reads back off the ladder")
+    near(flight.yawDifferential(-16, calShip.yawCurve, 256), -128, "and the other way is signed")
+    near(flight.yawDifferential(99, calShip.yawCurve, 256), 256, "past the top it asks for everything")
+    near(flight.yawDifferential(16, calShip.yawCurve, 64), 64, "the cap is obeyed")
+    check(flight.yawDifferential(16, nil, 256) == nil, "no ladder, no answer")
+
+    local pid = util.newPID(4, 0, 0, -1000, 1000)
+    local demand = flight.tankDemand(20, pid, calShip, cfg, 0.2)
+    check(demand.left < 0 and demand.right > 0, "a right hand error drives the sides opposite")
+    check(demand.main == 0, "and the main stays out of a tank turn")
+    near(demand.rate, 30, "the wanted rate is capped at yawRateMax")
+
+    pid:reset()
+    demand = flight.tankDemand(-20, pid, calShip, cfg, 0.2)
+    check(demand.left > 0 and demand.right < 0, "and the other way round the other way")
+
+    pid:reset()
+    demand = flight.tankDemand(0.01, pid, calShip, cfg, 0.2)
+    check(demand.left == 0 and demand.right == 0,
+        "a demand under tankRpmMin buzzes without turning, so it is dropped")
+
+    near(flight.yawTrim(0.2, cfg), 0, "inside the threshold there is nothing to trim")
+    near(flight.yawTrim(25, cfg), 128, "at the reentry angle the trim is at its ceiling")
+    near(flight.yawTrim(-25, cfg), -128, "and it is signed")
+    near(flight.yawTrim(12.5, cfg), 64, "and proportional in between")
+
+    near(flight.throttleFraction(0, 7), 0, "thrust starts at nothing")
+    near(flight.throttleFraction(7, 7), 1 - math.exp(-1), "and is 63 percent after one tau")
+    check(flight.throttleFraction(100, 7) > 0.99, "and is all of it eventually")
+    near(flight.throttleFraction(3, 0), 1, "no ramp means no ramping")
+
+    near(flight.maxDecel(calShip, cfg), 4.0,
+        "the brake cap is the last rung that kept pitch inside the limit")
+    near(flight.maxDecel(calShip, cfg, "main"), 3.4, "the main never tips it at all")
+    check(flight.maxDecel({}, cfg) == nil, "an unmeasured ship has no cap")
+
+    -- Worth pinning, because it is not obvious and it decides whether the ship
+    -- ever brakes gently. Braking begins at vLimit, where the deceleration the
+    -- distance demands is already aMax over brakeMargin. So the main is used
+    -- alone only on a ship whose main can supply that much on its own, and on a
+    -- hull where it cannot, every stop recruits the turbines however gentle it
+    -- looks. This ship is deliberately on the useful side of that line.
+    check(flight.maxDecel(calShip, cfg, "main")
+        > flight.maxDecel(calShip, cfg) / cfg.brakeMargin,
+        "the main can supply what the margin asks for, so gentle stops exist")
+
+    near(flight.speedLimitForDistance(100, 4, 1.3), math.sqrt(2 * 4 * 100 / 1.3), "stopping distance")
+    near(flight.speedLimitForDistance(0, 4, 1.3), 0, "on top of it, stopped")
+    check(flight.speedLimitForDistance(100, nil, 1.3) == math.huge,
+        "with no measurement there is no limit to impose")
+
+    -- Far away and long since up to speed, so cruiseSpeed is what is left after
+    -- both the ramp and the stopping distance have had their say.
+    near(flight.wantSpeed(5000, 600, cfg, calShip), 12, "a long leg asks for cruise speed")
+    check(flight.wantSpeed(5000, 0.5, cfg, calShip) < 2, "a leg that just began ramps up")
+    check(flight.wantSpeed(4, 600, cfg, calShip) < 12, "and close in, the distance caps it")
+
+    local spd = util.newPID(0, 0, 0, -1000, 1000)
+    near(flight.thrustRpm(7, 7, calShip.fwdCurve, spd, 0.2), 128,
+        "at speed the feed forward is the whole answer")
+    spd:reset()
+    near(flight.thrustRpm(-7, -7, calShip.fwdCurve, spd, 0.2), -128, "and reverse is signed")
+    spd:reset()
+    near(flight.thrustRpm(7, 7, calShip.fwdCurve, spd, 0.2, 64), 64, "the cap is obeyed")
+    spd = util.newPID(10, 0, 0, -1000, 1000)
+    check(flight.thrustRpm(7, 5, calShip.fwdCurve, spd, 0.2) > 128,
+        "and falling short of the wanted speed adds trim on top")
+
+    -- Braking, which is the part that ends flights when it is got wrong.
+    local plan, why = flight.brakePlan(2, 500, 0, calShip, cfg)
+    check(plan.main == 0 and plan.turbines == 0, "nothing to do a long way out")
+    check(why:find("inside") ~= nil, "and it says why")
+
+    plan, why = flight.brakePlan(8.8, 12, 0, calShip, cfg)
+    check(plan.main < 0 and plan.turbines == 0, "a gentle stop is the main alone")
+    check(why:find("main alone") ~= nil, "and it says so")
+
+    plan, why = flight.brakePlan(13, 12, 0, calShip, cfg)
+    check(plan.main < 0 and plan.turbines < 0, "a hard stop recruits the turbines")
+    check(why:find("all five") ~= nil, "and it says so in different words")
+
+    plan, why = flight.brakePlan(13, 12, 17, calShip, cfg)
+    check(plan.main == 0 and plan.turbines == 0, "already tipping, so it stops adding reverse")
+    check(why:find("pitch") ~= nil, "and names the pitch rather than a general message")
+
+    -- Mixing, where the differential is split and a backwards propeller is a
+    -- flag in a file rather than a special case in the code.
+    local lines = { "ta", "tb", "tc", "td", "mn", "xx" }
+    local mixed = flight.mix(128, 0, lines, calShip, cfg)
+    check(mixed.ta == mixed.tb, "two lines on the same side agree")
+    check(mixed.td == -mixed.tc, "and a reversed line is negated")
+    near(mixed.mn, 128, "the main takes its share")
+    check(mixed.xx == 0, "a line calibrated as none is left alone")
+
+    mixed = flight.mix(0, 64, lines, calShip, cfg)
+    check(mixed.ta < 0 and mixed.tc > 0, "a positive differential raises yaw")
+    check(mixed.mn == 0, "and the main takes no part in a turn")
+
+    mixed = flight.mix(300, 0, lines, calShip, cfg)
+    near(mixed.mn, 256, "nothing leaves here above maxRpm")
+    mixed = flight.mix(8, 0, lines, calShip, cfg)
+    check(mixed.mn == 0, "and nothing leaves here buzzing below minRpm")
+
+    local slewed = flight.applySlew({ mn = 0 }, { mn = 256 }, 16)
+    near(slewed.mn, 16, "a line climbs no faster than the slew")
+    slewed = flight.applySlew({ mn = 0 }, { mn = -256 }, 16)
+    near(slewed.mn, -16, "in either direction")
+    slewed = flight.applySlew({ mn = 100 }, { mn = 104 }, 16)
+    near(slewed.mn, 104, "and a small change arrives whole")
+    slewed = flight.applySlew({}, { mn = 8 }, 16)
+    near(slewed.mn, 8, "a line nobody has driven yet starts from zero")
+
+    -- The balloon ladder crosses zero, which is the one thing util's curve
+    -- family cannot read, so it has its own walk and its own tests.
+    near(flight.levelForClimb(calShip.balloonCurve, -1.78), 0, "full sink is strength 0")
+    near(flight.levelForClimb(calShip.balloonCurve, 1.78), 15, "full climb is strength 15")
+    check(flight.levelForClimb(calShip.balloonCurve, 0) > 7, "and holding is between them")
+    near(flight.levelForClimb(calShip.balloonCurve, -99), 0, "past the bottom it stays on the ladder")
+    near(flight.levelForClimb(calShip.balloonCurve, 99), 15, "and past the top as well")
+    check(flight.levelForClimb(nil, 0) == nil, "no ladder, no answer")
+
+    check(flight.balloonLevel(40, 0, calShip, cfg) == 15, "a long way below the target, climb")
+    check(flight.balloonLevel(-40, 0, calShip, cfg) == cfg.balloonFloor,
+        "and a long way above it, sink to the floor and no further")
+    check(flight.balloonLevel(0, 0, calShip, cfg) >= 7, "on the target, hold")
+    -- The floor is a safety property, not a preference. A balloon commanded to
+    -- zero is a ship on its way down, and the pilot asked for a descent, not that.
+    check(flight.balloonLevel(-999, 0, calShip, cfg) >= cfg.balloonFloor,
+        "nothing drives the balloon below the floor")
+    local uncal = { altHover = 9 }
+    check(flight.balloonLevel(50, 0, uncal, cfg) == 9,
+        "an uncalibrated ship holds its hover level rather than guessing")
+
+    -- The fuel gate is a time budget, because the engine burns at a flat rate
+    -- whatever the propellers are doing.
+    local legA = flight.legTime(1200, 0, 0, calShip, cfg)
+    local legB = flight.legTime(1200, 180, 0, calShip, cfg)
+    check(legB > legA, "a leg that has to turn first takes longer")
+    check(flight.legTime(1200, 0, 300, calShip, cfg) > legA, "and so does one that has to climb")
+    near(flight.legTime(0, 0, 0, calShip, cfg), 12 / 4.0, "a leg of no distance is still a stop")
+
+    near(flight.stressNeeded("tank", calShip), 2400, "a turn costs what the turn was measured at")
+    near(flight.stressNeeded("cruise", calShip), 3600, "and cruise what cruise was measured at")
+    near(flight.stressNeeded("brake", calShip), 3600, "braking is the worse of the two")
+    near(flight.stressNeeded("arrived", calShip), 0, "and arriving costs nothing")
+
+    -- The phase machine. Both conditions are tested before cruise is committed
+    -- to, which is the deliberate difference from the two reference autopilots.
+    local phase, reason = flight.phaseNext("tank",
+        { err = 40, yawRate = 20, d = 200, v = 0, alignedFor = 0 }, cfg, calShip)
+    check(phase == "tank", "a big error stays in the turn")
+    check(reason:find("deg to turn") ~= nil, "and says how far there is to go")
+
+    phase = flight.phaseNext("tank",
+        { err = 1, yawRate = 8, d = 200, v = 0, alignedFor = 99 }, cfg, calShip)
+    check(phase == "tank", "lined up but still swinging does not commit")
+
+    phase = flight.phaseNext("tank",
+        { err = 1, yawRate = 0.5, d = 200, v = 0, alignedFor = 0.5 }, cfg, calShip)
+    check(phase == "tank", "steady but not held long enough does not commit either")
+
+    phase, reason = flight.phaseNext("tank",
+        { err = 1, yawRate = 0.5, d = 200, v = 0, alignedFor = 3 }, cfg, calShip)
+    check(phase == "cruise", "lined up, steady and held is what commits")
+    check(reason:find("steady") ~= nil, "and says so")
+
+    phase = flight.phaseNext("cruise",
+        { err = 40, yawRate = 0, d = 200, v = 5, alignedFor = 0 }, cfg, calShip)
+    check(phase == "tank", "an error past tankReentry drops back to the turn")
+
+    phase, reason = flight.phaseNext("cruise",
+        { err = 0, yawRate = 0, d = 4, v = 12, alignedFor = 0 }, cfg, calShip)
+    check(phase == "brake", "too fast for what is left starts the stop")
+    check(reason:find("m/s") ~= nil, "and says how fast with how far")
+
+    phase = flight.phaseNext("cruise",
+        { err = 0, yawRate = 0, d = 4000, v = 12, alignedFor = 0 }, cfg, calShip)
+    check(phase == "cruise", "and a long way out it simply runs")
+
+    phase = flight.phaseNext("brake",
+        { err = 0, yawRate = 0, d = 30, v = 4, alignedFor = 0, stopped = false }, cfg, calShip)
+    check(phase == "brake", "still moving, still stopping")
+
+    phase = flight.phaseNext("brake",
+        { err = 0, yawRate = 0, d = 0.5, v = 0, lateral = 0.2, stopped = true }, cfg, calShip)
+    check(phase == "arrived", "stopped and close enough is the end of the leg")
+
+    phase, reason = flight.phaseNext("brake",
+        { err = 0, yawRate = 0, d = 8, v = 0, lateral = 7, stopped = true }, cfg, calShip)
+    check(phase == "tank", "stopped well off the line turns onto the point")
+    check(reason:find("off the line") ~= nil, "and says that is why")
+
+    phase, reason = flight.phaseNext("brake",
+        { err = 0, yawRate = 0, d = 8, v = 0, lateral = 0.1, stopped = true }, cfg, calShip)
+    check(phase == "tank", "stopped short but on the line simply goes again")
+    check(reason:find("short") ~= nil, "and says that instead, in different words")
 
     print(string.format("%d passed, %d failed", passed, failed))
     return failed == 0
