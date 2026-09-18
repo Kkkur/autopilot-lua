@@ -245,6 +245,36 @@ function cal.linesOfSide(side)
     return out
 end
 
+-- Left becomes right and right becomes left, authorities and all.
+--
+-- The sides stage decides handedness from one reading per line, and one
+-- reading is enough to get it backwards: a line read while the physics engine
+-- was reporting nothing, or a hull that was still swinging from the line
+-- before it. Every line filed the wrong way round is the same mistake made
+-- once, because they were all read against the same yaw. The yaw stage is
+-- where it shows, as a hull that turns the opposite way to the one it was
+-- asked for, and this is the whole of the fix: the mixer puts the differential
+-- on whichever lines are called left, so swapping the two labels swaps the
+-- turn. Nothing else in the file needs touching, since a side's authority
+-- travels with its name.
+function cal.swapSides()
+    -- Every filed line, not just the ones on the network now. A line that is
+    -- off the air is still on the side it was measured on, and leaving it
+    -- behind would file one propeller against the other three.
+    local swapped = 0
+    for _, entry in pairs(cal.sides) do
+        if entry.side == "left" then
+            entry.side = "right"
+            swapped = swapped + 1
+        elseif entry.side == "right" then
+            entry.side = "left"
+            swapped = swapped + 1
+        end
+    end
+    cal.yawAuth.left, cal.yawAuth.right = cal.yawAuth.right, cal.yawAuth.left
+    return swapped
+end
+
 -- Lines the ship has that calibration has never seen.
 function cal.missingLines()
     local out = {}
@@ -577,6 +607,22 @@ end
 --
 -- What is kept is the average over the last second and a half rather than the
 -- instant Enter landed on, because a hand on a key is not a measurement.
+-- How long a kept reading is averaged over. Not a tuning knob: it is the
+-- length of a hand coming down on a key, not a property of any ship.
+local KEEP_SPAN = 1.5
+
+-- One sample into a rolling window, and the average of what is in it. Whatever
+-- is kept from a rung goes through here, because the number on the screen at
+-- the instant Enter landed is a sample and the average of the last second and
+-- a half is a reading.
+local function windowMean(history, value, now)
+    history[#history + 1] = { t = now, v = value }
+    while #history > 2 and now - history[1].t > KEEP_SPAN do table.remove(history, 1) end
+    local sum = 0
+    for _, entry in ipairs(history) do sum = sum + entry.v end
+    return sum / #history
+end
+
 local function track(ctx, opts)
     local stable = opts.stable or config.get("calStable")
     local floor = opts.floor or 0
@@ -599,8 +645,7 @@ local function track(ctx, opts)
                 return
             end
 
-            history[#history + 1] = { t = now, v = value }
-            while #history > 2 and now - history[1].t > 1.5 do table.remove(history, 1) end
+            windowMean(history, value, now)
 
             local slope = 0
             if #history >= 2 then
@@ -768,12 +813,19 @@ local function stageSides(ctx)
             -- The yaw rate at the moment the speed settled, not the largest seen
             -- on the way there. A hull that is still coming up to speed is still
             -- swinging, and the swing it ends at is the one it can hold.
+            -- The yaw is averaged over the same window the speed is, and for
+            -- the same reason. A single reading taken at the moment Enter
+            -- landed is one sample of a number that arrives noisy, and a hull
+            -- the physics engine has stopped reporting a rate for hands back a
+            -- zero: one of those, caught at the wrong instant, files a
+            -- propeller on the wrong side or files it as the main.
             local yawRate, drift = 0, nil
+            local yawHistory = {}
             local speed, reason = track(ctx, {
                 apply = function() ship.driveOnly(name, config.get("calRpm")) end,
                 read = forwardSpeed,
                 live = function(live)
-                    yawRate = ship.yawRate() or 0
+                    yawRate = windowMean(yawHistory, ship.yawRate() or 0, os.clock())
                     drift = ship.bodyVelocity()
                     live.step = index
                     live.total = #names
@@ -999,6 +1051,12 @@ local function stageYaw(ctx)
     local total = #ladder * #ways
     local index = 0
     cal.yawCurve = cal.yawCurve or {}
+    -- The swap below is offered once, and only while the ladder has kept
+    -- nothing, because the offer is about how the sides were filed and not
+    -- about this rung. Past the first kept reading a hull that turns the wrong
+    -- way is a hull that did something else, and swapping the sides underneath
+    -- a half measured ladder leaves half of it measured the other handedness.
+    local kept, offeredSwap = 0, false
 
     for _, sign in ipairs(ways) do
         local way = sign > 0 and "pos" or "neg"
@@ -1007,56 +1065,90 @@ local function stageYaw(ctx)
             if ctx.aborted() then break end
             index = index + 1
 
-            local rate, reason = track(ctx, {
-                apply = function()
-                    ship.flush(flight.mix(0, diff * sign, ship.order, cal, cfg()))
-                end,
-                read = ship.yawRate,
-                stable = config.get("calYawStable"),
-                wantSign = sign,
-                -- Not calMinYaw. That number answers the sides stage's
-                -- question, whether a line swings the nose enough to be on a
-                -- side at all, and at one degree a second it would throw away
-                -- the bottom half of a heavy ship's ladder as no reading.
-                floor = config.get("calYawFloor"),
-                live = function(live)
-                    live.rungIndex = index
-                    live.rungTotal = total
-                    live.rungLabel = string.format("differential %+d", diff * sign)
-                    live.valueLabel = "yaw"
-                    live.unit = "deg/s"
-                    live.samples = samples
-                    ctx.panel(live)
-                end,
-            })
+            local again = true
+            while again do
+                again = false
+                local rate, reason = track(ctx, {
+                    apply = function()
+                        ship.flush(flight.mix(0, diff * sign, ship.order, cal, cfg()))
+                    end,
+                    read = ship.yawRate,
+                    stable = config.get("calYawStable"),
+                    wantSign = sign,
+                    -- Not calMinYaw. That number answers the sides stage's
+                    -- question, whether a line swings the nose enough to be on a
+                    -- side at all, and at one degree a second it would throw away
+                    -- the bottom half of a heavy ship's ladder as no reading.
+                    floor = config.get("calYawFloor"),
+                    live = function(live)
+                        live.rungIndex = index
+                        live.rungTotal = total
+                        live.rungLabel = string.format("differential %+d", diff * sign)
+                        live.valueLabel = "yaw"
+                        live.unit = "deg/s"
+                        live.samples = samples
+                        ctx.panel(live)
+                    end,
+                })
 
-            if ctx.aborted() then break end
-            -- A rung that never turned the hull is not a slow rung, it is not
-            -- a reading. Writing it down puts a rpm in the ladder that the
-            -- mixer will later ask the ship for and not get.
-            if rate and not reason then
-                samples[#samples + 1] = { rpm = diff, speed = math.abs(rate) }
-                ctx.note(string.format("%+4d rpm -> %s deg/s", diff * sign,
-                    fine(math.abs(rate))), "good")
-                log.infof("cal: yaw way=%s rpm=%d rate=%.2f %s", way, diff, rate, reason or "settled")
-                -- The stress of a full turn is read at the top rung, while the
-                -- ship is actually doing it. Read after the stop and it is the
-                -- stress of nothing happening.
-                if diff == ladder[#ladder] then
-                    local stress = stressNow()
-                    if stress then
-                        cal.stressAtTurn = stress
-                        ctx.note(string.format("a full turn draws %.0f su", stress))
+                if not ctx.aborted() then
+                    -- The hull turning the other way to the one it was asked
+                    -- for is not a bad rung. It is the two sides filed
+                    -- backwards, and every rung after this one reads the same,
+                    -- so the ladder ends empty and the stage never says why.
+                    -- Say why, and offer the one thing that fixes it.
+                    if reason == "went the wrong way" and kept == 0 and not offeredSwap then
+                        offeredSwap = true
+                        ctx.note(string.format(
+                            "asked for %+d and the hull turned %s deg/s, the other way",
+                            diff * sign, fine(rate or 0)), "bad")
+                        ctx.note("that is left and right filed backwards, not a bad reading", "warn")
+                        if ctx.yesno("Swap the two sides and measure this rung again?", true) then
+                            local moved = cal.swapSides()
+                            cal.save()
+                            ctx.note(string.format(
+                                "%d lines swapped over, and the authorities with them", moved), "good")
+                            log.infof("cal: yaw swapped %d lines, rung %+d read %.3f",
+                                moved, diff * sign, rate or 0)
+                            cooldown(ctx, function() return ship.yawRate() or 0 end, "yaw")
+                            again = not ctx.aborted()
+                        else
+                            ctx.note("left as it is, so the ladder turns the wrong way all the way up", "warn")
+                        end
                     end
                 end
-            else
-                ctx.note(string.format("%+4d rpm -> nothing kept: %s", diff * sign,
-                    tostring(reason or "no reading")), "bad")
-            end
 
-            cal.yawCurve[way] = util.tidyCurve(samples)
-            cal.save()
-            cooldown(ctx, function() return ship.yawRate() or 0 end, "yaw")
+                if not again and not ctx.aborted() then
+                    -- A rung that never turned the hull is not a slow rung, it
+                    -- is not a reading. Writing it down puts a rpm in the ladder
+                    -- that the mixer will later ask the ship for and not get.
+                    if rate and not reason then
+                        samples[#samples + 1] = { rpm = diff, speed = math.abs(rate) }
+                        kept = kept + 1
+                        ctx.note(string.format("%+4d rpm -> %s deg/s", diff * sign,
+                            fine(math.abs(rate))), "good")
+                        log.infof("cal: yaw way=%s rpm=%d rate=%.2f %s", way, diff, rate, reason or "settled")
+                        -- The stress of a full turn is read at the top rung, while the
+                        -- ship is actually doing it. Read after the stop and it is the
+                        -- stress of nothing happening.
+                        if diff == ladder[#ladder] then
+                            local stress = stressNow()
+                            if stress then
+                                cal.stressAtTurn = stress
+                                ctx.note(string.format("a full turn draws %.0f su", stress))
+                            end
+                        end
+                    else
+                        ctx.note(string.format("%+4d rpm -> nothing kept: %s", diff * sign,
+                            tostring(reason or "no reading")), "bad")
+                    end
+
+                    cal.yawCurve[way] = util.tidyCurve(samples)
+                    cal.save()
+                    cooldown(ctx, function() return ship.yawRate() or 0 end, "yaw")
+                end
+            end
+            if ctx.aborted() then break end
         end
         if ctx.aborted() then break end
     end

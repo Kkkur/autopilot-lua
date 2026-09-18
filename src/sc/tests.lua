@@ -210,6 +210,75 @@ function tests.run()
     check(named, "and the relay that is missing is named")
     cal.inventory = nil
 
+    -- == the sides, swapped ==
+    -- The yaw stage offers this when the hull turns the other way to the one it
+    -- was asked for, which is the sides filed backwards and nothing else.
+    local savedSides, savedAuth = cal.sides, cal.yawAuth
+    cal.sides = {
+        l = { side = "left", reverse = true }, r = { side = "right" },
+        m = { side = "main" }, off = { side = "none" },
+    }
+    cal.yawAuth = { left = 0.02, right = 0.08 }
+    local moved = cal.swapSides()
+    check(moved == 2, "only the two sides count as swapped")
+    check(cal.sides.l.side == "right" and cal.sides.r.side == "left",
+        "left and right change places")
+    check(cal.sides.l.reverse == true, "and a line mounted backwards stays backwards")
+    check(cal.sides.m.side == "main" and cal.sides.off.side == "none",
+        "the main and an idle line are left where they are")
+    near(cal.yawAuth.left, 0.08, "the authority travels with the side")
+    near(cal.yawAuth.right, 0.02, "both ways")
+    cal.sides, cal.yawAuth = savedSides, savedAuth
+
+    -- == a yaw rate the engine has stopped reporting ==
+    -- getAngularVelocity is the last figure the physics engine published, and a
+    -- hull creeping round slowly enough is close enough to still for it to stop
+    -- publishing: the reading drops to zero on a ship that never stopped
+    -- turning. Below yawAsleep the heading is differentiated instead.
+    config.values = config.defaults()
+    local savedSublevel = sublevel
+    local reportedY = -math.rad(12)
+    sublevel = { getAngularVelocity = function() return { x = 0, y = reportedY, z = 0 } end }
+
+    near(ship.yawRate(), 12, "a reported rate comes back in degrees, sign flipped")
+
+    -- Two headings a second apart, the second one further round: a turn to the
+    -- ship's own right, which is yaw rising, same as the reported one.
+    local now = os.clock()
+    reportedY = 0
+    ship.yawTrail = { { t = now - 1, yaw = 10 }, { t = now, yaw = 13 } }
+    near(ship.yawRate(), 3, "a reported zero falls back on the heading")
+
+    ship.yawTrail = { { t = now - 1, yaw = 13 }, { t = now, yaw = 10 } }
+    near(ship.yawRate(), -3, "and the fallback turns the other way when the hull does")
+
+    -- Past the end of the circle, which is the one way differentiating a
+    -- heading can hand back the wrong sign.
+    ship.yawTrail = { { t = now - 1, yaw = 179 }, { t = now, yaw = -179 } }
+    near(ship.yawRate(), 2, "a heading that wraps past 180 is still a small turn")
+
+    -- A ship that really is holding still has nothing to fall back on to.
+    ship.yawTrail = { { t = now - 1, yaw = 10 }, { t = now, yaw = 10 } }
+    near(ship.yawRate(), 0, "a hull that is actually still reads zero")
+
+    -- Two readings taken in the same instant are noise over nothing.
+    ship.yawTrail = { { t = now, yaw = 10 }, { t = now, yaw = 13 } }
+    near(ship.yawRate(), 0, "two headings from the same moment are not a rate")
+
+    -- And the window is not allowed to stretch: too long a span can have turned
+    -- past half a circle between its two ends.
+    ship.yawTrail = { { t = now - 30, yaw = 10 }, { t = now, yaw = 13 } }
+    near(ship.yawRate(), 0, "a stale pair of headings is not a rate either")
+
+    ship.yawTrail = {}
+    ship.noteYaw(10)
+    ship.noteYaw(nil)
+    ship.noteYaw(13)
+    check(#ship.yawTrail == 2, "a heading that is not a number is not written down")
+    check(ship.yawTrail[#ship.yawTrail].yaw == 13, "and the newest one is kept")
+    ship.yawTrail = {}
+    sublevel = savedSublevel
+
     -- == mixing ==
     -- The mixer is the one place a side becomes an RPM. What matters is that a
     -- differential pushes the two sides opposite ways, that a line mounted

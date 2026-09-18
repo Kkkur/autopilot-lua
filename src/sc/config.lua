@@ -185,6 +185,12 @@ config.SCHEMA = {
     { key = "tick",          group = "loop",   kind = "number", def = 0.1,  min = 0.05, max = 2.0, step = 0.05,
       help = "Control loop period, seconds. 0.05 is one server tick. Every number on the screen is as fresh as this, because the pose the screen draws is the one this loop read.",
       symptom = "the server is struggling, or the readouts lag behind the ship" },
+    { key = "yawAsleep",     group = "loop",   kind = "number", def = 0.05, min = 0,    max = 5,   step = 0.01,
+      help = "Reported yaw rate under this, deg/s, is read as the physics engine having gone quiet rather than as a hull standing still, and the heading is differentiated over yawWindow instead. Zero trusts the reported figure always.",
+      symptom = "a slow turn reads zero every few samples, and the yaw ladder comes out low" },
+    { key = "yawWindow",     group = "loop",   kind = "number", def = 1.0,  min = 0.2,  max = 5,   step = 0.1,
+      help = "Seconds of headings the differentiated yaw rate is worked out over. Longer reads a slower turn; too long and a fast one turns past half a circle between the two ends.",
+      symptom = "the fallback yaw rate is noisy, or lags a turn that is changing" },
 
     -- == CALIBRATION =========================================
     -- The five stage wizard measures the ship with these. They are the only

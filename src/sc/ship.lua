@@ -10,7 +10,7 @@
 -- two is the kinetic graph itself, through getSubnetworkAnchorId, so a bearing
 -- knows which controller drives it without anybody writing it down.
 
-local util = ...
+local util, config = ...
 
 local ship = {}
 
@@ -35,6 +35,12 @@ ship.lastRpm = {}      -- what the controller last decided, sent or not
 -- bare name files two propellers as one and flies the ship on half its engines.
 ship.remoteLines = {}  -- name -> { relay = id, short = "#2.3" }
 ship.sendRemote = nil  -- set by sc/turbine.lua; nil means there is no relay
+
+-- The last pose headings read, each with the clock it was read at. This is
+-- what a yaw rate is worked out from on the ticks where the physics engine has
+-- stopped reporting one. readState fills it for nothing, since the heading is
+-- something it works out anyway.
+ship.yawTrail = {}
 
 -- == DISCOVERY ===============================================
 
@@ -213,6 +219,7 @@ function ship.readState()
         speed = util.len3(velocity.x, velocity.y, velocity.z),
     }
     state.bx, state.by, state.bz = util.worldToBody(orientation, velocity.x, velocity.y, velocity.z)
+    ship.noteYaw(state.yaw)
     return state
 end
 
@@ -224,19 +231,74 @@ function ship.bodyVelocity()
     return { x = state.bx, y = state.by, z = state.bz }
 end
 
+-- A heading, kept with the moment it was read, so a rate can be made of it
+-- later. Everything that reads the pose feeds this, and nothing else has to
+-- know it exists.
+function ship.noteYaw(yaw)
+    if type(yaw) ~= "number" then return end
+    local trail = ship.yawTrail
+    local now = os.clock()
+    trail[#trail + 1] = { t = now, yaw = yaw }
+    local span = config and config.get("yawWindow") or 1
+    while #trail > 2 and now - trail[1].t > span do table.remove(trail, 1) end
+end
+
+-- Has the pose been read recently enough that the trail is worth reading and
+-- nobody needs to read it again? One mainThread call is a server tick, so this
+-- is the difference between the control loop, which reads the pose every tick
+-- anyway, and the calibration wizard, which on the yaw ladder reads nothing else.
+local function trailIsFresh()
+    local last = ship.yawTrail[#ship.yawTrail]
+    if not last then return false end
+    return os.clock() - last.t < (config and config.get("tick") or 0.1)
+end
+
+-- The turn the heading itself made, which is a yaw rate that owes the physics
+-- engine nothing.
+local function yawRateFromTrail()
+    local trail = ship.yawTrail
+    if #trail < 2 then return nil end
+    local first, last = trail[1], trail[#trail]
+    local span = last.t - first.t
+    -- Too short a span divides the pose's own jitter by almost nothing. Too
+    -- long a one can have turned past half a circle, and a turn that has
+    -- wrapped comes back with the wrong sign, which is worse than no reading.
+    local window = config and config.get("yawWindow") or 1
+    if span < 0.2 or span > window * 2 then return nil end
+    return util.wrapAngle(last.yaw - first.yaw) / span
+end
+
 -- Yaw rate out of CC: Sable, in the units and the sign the rest of the program
 -- thinks in. getAngularVelocity is radians about the world axes, and its y runs
 -- opposite to this yaw convention, which is the single easiest sign in the
 -- program to get backwards and the hardest to notice. It lives here rather than
 -- in the control loop because calibration measures the same number the
 -- controller flies by, and two readings of it would be two conventions.
+--
+-- **A reported zero is not the same claim as a hull at rest.** The figure is
+-- the last one the physics engine published, and a hull creeping round at half
+-- a degree a second is close enough to still for the engine to stop publishing
+-- it: the reading drops to exactly zero for a sample or two and comes back, on
+-- a ship that never stopped turning. Averaged into a calibration rung those
+-- zeroes read the ladder low, and one of them caught by the sides stage files a
+-- propeller as the main. So below yawAsleep the heading is asked instead. The
+-- pose never sleeps, and util.yawOf produced both numbers, so they are the same
+-- convention and the fallback cannot flip a sign.
 function ship.yawRate()
     if type(sublevel) ~= "table" or not sublevel.getAngularVelocity then return nil end
     local ok, raw = pcall(sublevel.getAngularVelocity)
     if not ok then return nil end
     local vec = util.toVec(raw)
     if not vec then return nil end
-    return -math.deg(vec.y)
+    local reported = -math.deg(vec.y)
+
+    local asleep = config and config.get("yawAsleep") or 0
+    if math.abs(reported) > asleep then return reported end
+
+    if not trailIsFresh() then ship.readState() end
+    local turned = yawRateFromTrail()
+    if turned and math.abs(turned) > asleep then return turned end
+    return reported
 end
 
 -- Extras that are nice on the panel and never load-bearing. Each one is

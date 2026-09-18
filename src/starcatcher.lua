@@ -71,7 +71,7 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     -- The real ship module, because what the turbine tests check is that a line
     -- on a radio lands in it the same way a line on a wire does. Nothing in
     -- ship.lua touches a peripheral until discover is called, and it is not.
-    local shipModule = loadModule("ship", util)
+    local shipModule = loadModule("ship", util, config)
     local turbineModule = loadModule("turbine", util, shipModule, config, stubLog, linkModule)
     local tests = loadModule("tests", util, config, calModule, fuelModule,
         turbineModule, shipModule, flightModule, preflightModule, popupModule, linkModule)
@@ -109,7 +109,7 @@ log.init(DATA, function() return config.get("logLevel") end)
 local telemetry = loadModule("telemetry", util, config)
 telemetry.init(DATA)
 
-local ship = loadModule("ship", util)
+local ship = loadModule("ship", util, config)
 local flight = loadModule("flight", util)
 -- The passcode both protocols carry. It is loaded before either link is opened,
 -- because a link that opened first would spend its first second obeying
