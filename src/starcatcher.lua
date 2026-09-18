@@ -62,14 +62,19 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     local popupModule = loadModule("popup", util)
     -- The fuel module never touches a peripheral until init is called, so it
     -- can be loaded and have its arithmetic checked on a computer with no modem.
-    local fuelModule = loadModule("fuel", util, stubShip, stubCal, stubControl, config, stubLog)
+    -- link is loaded without init, so it has no file and no passcode: exactly
+    -- the state an unpaired computer is in, which is the half of it worth
+    -- checking on a computer with no modem.
+    local linkModule = loadModule("link")
+    local fuelModule = loadModule("fuel", util, stubShip, stubCal, stubControl, config,
+        stubLog, linkModule)
     -- The real ship module, because what the turbine tests check is that a line
     -- on a radio lands in it the same way a line on a wire does. Nothing in
     -- ship.lua touches a peripheral until discover is called, and it is not.
     local shipModule = loadModule("ship", util)
-    local turbineModule = loadModule("turbine", util, shipModule, config, stubLog)
+    local turbineModule = loadModule("turbine", util, shipModule, config, stubLog, linkModule)
     local tests = loadModule("tests", util, config, calModule, fuelModule,
-        turbineModule, shipModule, flightModule, preflightModule, popupModule)
+        turbineModule, shipModule, flightModule, preflightModule, popupModule, linkModule)
     return tests.run() and 0 or 1
 end
 
@@ -106,23 +111,33 @@ telemetry.init(DATA)
 
 local ship = loadModule("ship", util)
 local flight = loadModule("flight", util)
+-- The passcode both protocols carry. It is loaded before either link is opened,
+-- because a link that opened first would spend its first second obeying
+-- anything on the air.
+local link = loadModule("link")
+link.init(DATA)
 -- turbine before cal and before control: the balloon is a relay, and both the
 -- wizard that measures it and the loop that drives it need the link to exist
 -- before they are built.
-local turbine = loadModule("turbine", util, ship, config, log)
+local turbine = loadModule("turbine", util, ship, config, log, link)
 local cal = loadModule("cal", util, ship, config, log, flight, turbine)
 local control = loadModule("control", util, ship, cal, config, log, flight, turbine,
     telemetry)
 local nav = loadModule("nav", util, control, log)
-local fuel = loadModule("fuel", util, ship, cal, control, config, log)
+local fuel = loadModule("fuel", util, ship, cal, control, config, log, link)
 local preflight = loadModule("preflight", util, flight)
 local popup = loadModule("popup", util)
 local ui = loadModule("ui", util, ship, cal, control, nav, fuel, turbine, config, log,
-    telemetry, flight, popup)
+    telemetry, flight, popup, link)
 local cmd = loadModule("cmd", util, ship, cal, control, nav, fuel, turbine, config, ui, log,
-    preflight, popup, telemetry)
+    preflight, popup, telemetry, link)
 
 log.info("=== starcatcher starting ===")
+if link.pass then
+    log.info("paired: every message this ship sends carries its passcode")
+else
+    log.warn("no passcode set. Any ship in range on this protocol is obeyed.")
+end
 telemetry.event("boot", "starcatcher starting", "computer " .. os.getComputerID())
 log.infof("computer %d, screen %dx%d", os.getComputerID(), ui.size())
 

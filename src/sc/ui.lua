@@ -8,7 +8,8 @@
 -- Everything the pilot can do has both a key and a command. Keys are for
 -- flying, commands are for saying exactly what you mean.
 
-local util, ship, cal, control, nav, fuel, turbine, config, log, telemetry, flight, popup = ...
+local util, ship, cal, control, nav, fuel, turbine, config, log, telemetry, flight, popup,
+    link = ...
 
 local ui = {}
 
@@ -595,7 +596,19 @@ local function drawProps(snap, reads)
     -- tab of its own.
     local turbines = reads.turbines
     if turbines.link ~= "nomodem" then
-        rule(y, "KINETIC NETWORK"); y = y + 1
+        -- The passcode belongs on the tab the relays are on, because the fault it
+    -- explains looks like a relay fault: a relay that is powered, wired and
+    -- broadcasting, and deaf to every order this computer sends.
+    local pass = link and link.status()
+    if pass and pass.refused > 0 then
+        line(y, string.format(" %d message(s) refused, last from #%s. Passcodes differ.",
+            pass.refused, tostring(pass.refusedFrom)), C("bad")); y = y + 1
+    elseif pass and not pass.paired then
+        line(y, " no passcode set. Anything in range on this protocol is obeyed.",
+            C("warn")); y = y + 1
+    end
+
+    rule(y, "KINETIC NETWORK"); y = y + 1
         if turbines.link == "waiting" then
             line(y, " turbine relay has not spoken yet", C("dim"))
         elseif turbines.link == "stale" then

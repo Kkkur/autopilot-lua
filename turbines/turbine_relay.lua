@@ -29,6 +29,7 @@
 --   turbine_relay --once     print one reading and exit, for checking the wiring
 --   turbine_relay --spin N   drive every line at N rpm for ten seconds, by hand
 --   turbine_relay --balloon N  hold the balloon at strength N for ten seconds
+--   turbine_relay --passcode W set the passcode this relay answers to
 --
 -- Everything it writes lives in turbinerelay/ next to this file.
 
@@ -79,6 +80,10 @@ local BALLOON_SIDE = "back"
 local BALLOON_FILE = "balloon.cfg"
 
 local log = loadModule("log")
+-- The passcode this relay answers to. An engine driven over a radio is the one
+-- thing on this ship where a stray message has a physical consequence, which is
+-- why both halves of both protocols carry it.
+local link = loadModule("link")
 
 -- == THE NETWORK =============================================
 
@@ -337,7 +342,7 @@ end
 local function broadcast()
     local message = buildMessage()
     writeTelemetry(message)
-    if modemSide then rednet.broadcast(message, PROTOCOL) end
+    if modemSide then rednet.broadcast(link.stamp(message), PROTOCOL) end
 end
 
 -- == SCREEN ==================================================
@@ -453,6 +458,12 @@ end
 
 if not fs.exists(DATA) then fs.makeDir(DATA) end
 log.init(DATA, function() return 2 end)
+link.init(DATA)
+if link.pass then
+    log.info("paired: every message carries the passcode and anything without it is dropped")
+else
+    log.warn("no passcode set, so this relay answers anything on its protocol")
+end
 log.info("=== turbine relay starting ===")
 
 for _, side in ipairs(MODEM_SIDES) do
@@ -512,6 +523,28 @@ end
 
 allStop()
 readStress()
+
+
+-- Pairing by hand, for a relay whose passcode has to change without running the
+-- installer over it again. Every computer on the ship needs the same word, and
+-- a relay paired to a different one looks exactly like a relay that is deaf.
+if ARGS[1] == "--passcode" then
+    if not ARGS[2] or ARGS[2]:lower() == "off" then
+        link.clear()
+        print("passcode cleared. This relay now answers anything on its protocol.")
+        log.close()
+        return
+    end
+    local ok, why = link.set(ARGS[2])
+    if not ok then
+        printError(why)
+        log.close()
+        return
+    end
+    print("passcode set. Set the same word on every other computer on this ship.")
+    log.close()
+    return
+end
 
 if ARGS[1] == "--once" then
     print(textutils.serialise(buildMessage()))
@@ -581,7 +614,14 @@ end
 local function commandLoop()
     while true do
         local id, message = rednet.receive(PROTOCOL)
-        if type(message) == "table" then
+        local allowed, why = link.check(id, message)
+        if not allowed then
+            -- Counted rather than repeated, and it does NOT touch lastCommand.
+            -- A refused message must not feed the deadman: a neighbour's ship
+            -- broadcasting at one a second would otherwise keep these turbines
+            -- alive on orders this relay never obeyed.
+            if link.refused == 1 then log.warn("refusing orders: " .. tostring(why)) end
+        elseif type(message) == "table" then
             if message.cmd == "set" then
                 lastCommand = os.clock()
                 local ok, err = applyCommand(message)
@@ -602,7 +642,7 @@ local function commandLoop()
                 -- says so with a balloon command.
                 log.infof("stop from %d", id)
             elseif message.cmd == "ping" then
-                rednet.send(id, buildMessage(), PROTOCOL)
+                rednet.send(id, link.stamp(buildMessage()), PROTOCOL)
             end
         end
     end

@@ -5,7 +5,7 @@
 -- same dispatcher can later be pointed at a modem without any of it changing.
 
 local util, ship, cal, control, nav, fuel, turbine, config, ui, log, preflight, popup,
-    telemetry = ...
+    telemetry, link = ...
 
 local cmd = {}
 
@@ -42,7 +42,7 @@ local function firstFailure(report)
 end
 
 local function gate(what, to, descriptor)
-    local report = preflight.check(ship, cal, fuel, turbine, config)
+    local report = preflight.check(ship, cal, fuel, turbine, config, link)
 
     if not report.ok then
         local item = firstFailure(report)
@@ -282,7 +282,7 @@ define("check", {
         -- The same checker the gate runs, asked rather than triggered. Nothing
         -- here acts on the answer: that is the gate's job, and a checker a pilot
         -- can consult without committing to anything is the point.
-        local report = preflight.check(ship, cal, fuel, turbine, config)
+        local report = preflight.check(ship, cal, fuel, turbine, config, link)
         ui.showPopup(popup.report(report))
         if report.ok then
             return string.format("ready, %d checks passed", #report.items), "good"
@@ -312,6 +312,37 @@ define("balloon", {
         control.setManual(0, 0, level)
         ui.tab = ui.TAB.MANUAL
         return string.format("balloon held at %d, and the leg is off", level), "warn"
+    end,
+})
+
+define("passcode", {
+    aliases = { "pair" },
+    usage = "passcode <word> | passcode off",
+    help = "Set the passcode this ship's messages carry. Every computer needs the same one.",
+    run = function(args)
+        local what = args[1]
+        if not what then
+            local status = link.status()
+            if not status.paired then
+                return "no passcode set, so anything on this protocol is obeyed", "warn"
+            end
+            if status.refused > 0 then
+                return string.format("paired, and %d message(s) refused, last from #%s",
+                    status.refused, tostring(status.refusedFrom)), "warn"
+            end
+            return "paired, and nothing has been refused", "good"
+        end
+        if what:lower() == "off" or what:lower() == "clear" then
+            link.clear()
+            log.warn("passcode cleared, this computer now obeys anything on its protocol")
+            return "passcode cleared. Clear it on the relays too, or they stop answering.", "warn"
+        end
+        local ok, why = link.set(what)
+        if not ok then return why, "bad" end
+        log.info("passcode set")
+        -- Said plainly, because a pilot who sets this on one computer and walks
+        -- away has just made three relays deaf and will read it as a fault.
+        return "passcode set. Set the same one on computers 1, 2 and 3.", "warn"
     end,
 })
 

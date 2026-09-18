@@ -14,8 +14,8 @@
 -- behind. Bump it whenever the set of files changes or the program does.
 
 return {
-    version = "0.6",
-    note = "stage 6: preflight, popups, the gate, the safe hold and telemetry",
+    version = "0.8",
+    note = "stage 8: the screen rebuilt, and a passcode on every message",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths
@@ -29,6 +29,7 @@ return {
                 { "src/sc/util.lua", "src/sc/util.lua" },
                 { "src/sc/config.lua", "src/sc/config.lua" },
                 { "src/sc/log.lua", "src/sc/log.lua" },
+                { "src/sc/link.lua", "src/sc/link.lua" },
                 { "src/sc/telemetry.lua", "src/sc/telemetry.lua" },
                 { "src/sc/ship.lua", "src/sc/ship.lua" },
                 { "src/sc/flight.lua", "src/sc/flight.lua" },
@@ -53,6 +54,7 @@ return {
                 { "relay/fuel_relay.lua", "fuel_relay.lua" },
                 { "relay/test.lua", "test.lua" },
                 { "relay/sc/log.lua", "sc/log.lua" },
+                { "relay/sc/link.lua", "sc/link.lua" },
             },
         },
 
@@ -68,6 +70,7 @@ return {
                 { "turbines/startup.lua", "startup.lua" },
                 { "turbines/turbine_relay.lua", "turbine_relay.lua" },
                 { "turbines/sc/log.lua", "sc/log.lua" },
+                { "turbines/sc/link.lua", "sc/link.lua" },
             },
         },
 
@@ -78,6 +81,7 @@ return {
                 { "turbines/startup.lua", "startup.lua" },
                 { "turbines/turbine_relay.lua", "turbine_relay.lua" },
                 { "turbines/sc/log.lua", "sc/log.lua" },
+                { "turbines/sc/link.lua", "sc/link.lua" },
             },
         },
     },

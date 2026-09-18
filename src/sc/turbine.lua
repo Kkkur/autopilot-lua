@@ -22,7 +22,7 @@
 -- is the right behaviour for an engine driven over a radio and the reason the
 -- orders have to keep going out even when the number has not changed.
 
-local util, ship, config, log = ...
+local util, ship, config, log, link = ...
 
 local turbine = {}
 
@@ -97,7 +97,7 @@ function turbine.close()
     -- reason to stop holding the ship up.
     if turbine.modem then
         for _, id in ipairs(turbine.order) do
-            pcall(rednet.send, id, { cmd = "stop" }, turbine.PROTOCOL)
+            pcall(rednet.send, id, link.stamp({ cmd = "stop" }), turbine.PROTOCOL)
         end
     end
     turbine.modem = nil
@@ -176,6 +176,13 @@ local function adoptLines(message, id)
 end
 
 function turbine.accept(id, message)
+    -- Before the shape, because a relay on another ship saying something well
+    -- formed is not this ship's relay saying something wrong.
+    local allowed, why = link.check(id, message)
+    if not allowed then
+        turbine.refusedWhy = why
+        return false, why
+    end
     if type(message) ~= "table" or message.v ~= 1 or type(message.lines) ~= "table" then
         return false
     end
@@ -247,10 +254,10 @@ function turbine.send(demands)
     end
 
     for id, rpm in pairs(byRelay) do
-        rednet.send(id, { cmd = "set", rpm = rpm }, turbine.PROTOCOL)
+        rednet.send(id, link.stamp({ cmd = "set", rpm = rpm }), turbine.PROTOCOL)
     end
     if loose then
-        rednet.broadcast({ cmd = "set", rpm = loose }, turbine.PROTOCOL)
+        rednet.broadcast(link.stamp({ cmd = "set", rpm = loose }), turbine.PROTOCOL)
     end
 
     -- A relay with nothing to do still has to hear from us, or its deadman reads
@@ -258,7 +265,7 @@ function turbine.send(demands)
     -- calibration run is in the middle of using.
     for _, id in ipairs(turbine.order) do
         if not byRelay[id] then
-            rednet.send(id, { cmd = "set", rpm = {} }, turbine.PROTOCOL)
+            rednet.send(id, link.stamp({ cmd = "set", rpm = {} }), turbine.PROTOCOL)
         end
     end
 
@@ -277,9 +284,9 @@ function turbine.setBalloon(level)
         if turbine.relays[id].hasBalloon then target = id end
     end
     if target then
-        rednet.send(target, { cmd = "balloon", level = level }, turbine.PROTOCOL)
+        rednet.send(target, link.stamp({ cmd = "balloon", level = level }), turbine.PROTOCOL)
     else
-        rednet.broadcast({ cmd = "balloon", level = level }, turbine.PROTOCOL)
+        rednet.broadcast(link.stamp({ cmd = "balloon", level = level }), turbine.PROTOCOL)
     end
     turbine.sentAt = os.clock()
     return true

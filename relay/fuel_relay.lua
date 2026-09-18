@@ -11,6 +11,7 @@
 --
 --   fuel_relay           run it
 --   fuel_relay --once    print one reading and exit, for checking the wiring
+--   fuel_relay --passcode W  set the passcode this relay answers to
 --
 -- Everything it writes lives in fuelrelay/ next to this file: logs/, and
 -- learned.cfg for the tank capacities it worked out by watching.
@@ -49,6 +50,10 @@ local ASSUMED_CAP = BLOCK_MB * TANK_BLOCKS   -- 504,000 mB, and 1,008,000 across
 local MODEM_SIDES = { "top", "bottom", "left", "right", "front", "back" }
 
 local log = loadModule("log")
+-- The passcode this relay answers to. Same file on all four computers, and the
+-- comment at the top of it says plainly what a plaintext passcode on a
+-- broadcast medium is and is not worth.
+local link = loadModule("link")
 
 -- == TANKS ===================================================
 
@@ -356,6 +361,12 @@ end
 
 if not fs.exists(DATA) then fs.makeDir(DATA) end
 log.init(DATA, function() return 2 end)
+link.init(DATA)
+if link.pass then
+    log.info("paired: every message carries the passcode and anything without it is dropped")
+else
+    log.warn("no passcode set, so this relay answers anything on its protocol")
+end
 log.info("=== fuel relay starting ===")
 
 learned = loadLearned()
@@ -408,6 +419,27 @@ end
 
 for _, entry in ipairs(tanks) do readTank(entry) end
 
+-- Pairing by hand, for a relay whose passcode has to change without running the
+-- installer over it again. Every computer on the ship needs the same word, and
+-- a relay paired to a different one looks exactly like a relay that is deaf.
+if ARGS[1] == "--passcode" then
+    if not ARGS[2] or ARGS[2]:lower() == "off" then
+        link.clear()
+        print("passcode cleared. This relay now answers anything on its protocol.")
+        log.close()
+        return
+    end
+    local ok, why = link.set(ARGS[2])
+    if not ok then
+        printError(why)
+        log.close()
+        return
+    end
+    print("passcode set. Set the same word on every other computer on this ship.")
+    log.close()
+    return
+end
+
 if ARGS[1] == "--once" then
     print(textutils.serialise(buildMessage()))
     log.close()
@@ -458,7 +490,7 @@ end
 
 local function sendLoop()
     while true do
-        rednet.broadcast(latest, PROTOCOL)
+        rednet.broadcast(link.stamp(latest), PROTOCOL)
         sent = sent + 1
         sleep(SEND_EVERY)
     end
@@ -469,8 +501,14 @@ end
 local function answerLoop()
     while true do
         local id, message = rednet.receive(PROTOCOL)
-        if type(message) == "table" and message.cmd == "ping" then
-            rednet.send(id, latest, PROTOCOL)
+        local allowed, why = link.check(id, message)
+        if not allowed then
+            -- Once, and then counted. A neighbour's autopilot broadcasting at
+            -- one a second would otherwise fill this relay's log with the same
+            -- sentence and bury the one that mattered.
+            if link.refused == 1 then log.warn("refusing messages: " .. tostring(why)) end
+        elseif type(message) == "table" and message.cmd == "ping" then
+            rednet.send(id, link.stamp(latest), PROTOCOL)
             log.debugf("ping from %d, answered", id)
         end
     end

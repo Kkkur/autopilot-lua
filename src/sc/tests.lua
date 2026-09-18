@@ -6,7 +6,7 @@
 -- No ship, no peripherals, no modem. If this passes on a bare computer, the
 -- maths that flies the ship is sound and anything still wrong is wiring.
 
-local util, config, cal, fuel, turbine, ship, flight, preflight, popup = ...
+local util, config, cal, fuel, turbine, ship, flight, preflight, popup, link = ...
 
 local tests = {}
 
@@ -1045,6 +1045,55 @@ function tests.run()
     cal.setMeasured("altHover", "7")
     check(cal.altHover == 7, "a hand edited measurement lands where the controller reads it")
     check(select(2, cal.setMeasured("altHover", "nonsense")) ~= nil, "and junk is refused")
+
+    -- == the passcode ==
+    --
+    -- The envelope, not the secrecy. There is no secrecy: the comment at the
+    -- top of link.lua says so, and what is checked here is that an unpaired
+    -- computer obeys everything, a paired one obeys only its own ship, and that
+    -- the two ways of failing get two different sentences.
+    link.pass, link.refused, link.refusedFrom = nil, 0, nil
+    check(link.check(7, { cmd = "set" }) == true, "an unpaired computer obeys anything")
+    check(link.stamp({ cmd = "set" }).pass == nil,
+        "and stamps nothing, so a paired relay refuses it as unstamped")
+    check(link.status().paired == false, "and says out loud that it is unpaired")
+
+    check(select(2, link.valid("ab")) ~= nil, "a passcode of two characters is refused")
+    check(select(2, link.valid("two words")) ~= nil, "and one with a space in it")
+    check(select(2, link.valid(string.rep("x", 25))) ~= nil, "and one nobody could retype")
+    check(link.valid("starcatcher-1") == true, "letters, digits and dashes are a passcode")
+
+    link.pass = "skyline"
+    check(link.stamp({ cmd = "set" }).pass == "skyline", "a paired computer stamps every message")
+    check(link.check(7, { cmd = "set", pass = "skyline" }) == true, "and obeys its own ship")
+
+    local ok, why = link.check(7, { cmd = "set" })
+    check(ok == false and why:find("no passcode at all") ~= nil,
+        "an unstamped message is refused as unstamped")
+    ok, why = link.check(9, { cmd = "set", pass = "other" })
+    check(ok == false and why:find("different passcode") ~= nil,
+        "and a wrong one as a different passcode, which is a different fix")
+    check(link.status().refused == 2, "refusals are counted")
+    check(link.status().refusedFrom == 9, "and the last sender is named")
+
+    -- The checker's two answers about pairing, which are not the same answer.
+    -- Unpaired is a ship that has not been round the installer yet. Refusing is
+    -- a relay that looks alive and will not take an order.
+    link.pass, link.refused, link.refusedFrom = nil, 0, nil
+    local unpaired = preflight.check(fakeShip(true), fakeCal(), fakeFuel("live", 0.5, 3600),
+        fakeTurbines(), fakeConfig, link)
+    check(unpaired.byId.passcode.ok == false, "an unpaired ship is told so")
+    check(unpaired.byId.passcode.kind == "warn", "and it is a warning, because the ship still flies")
+    check(unpaired.ok == true, "so the gate lets it fly")
+
+    link.pass = "skyline"
+    link.check(4, { cmd = "set", pass = "somebody else" })
+    local mismatched = preflight.check(fakeShip(true), fakeCal(), fakeFuel("live", 0.5, 3600),
+        fakeTurbines(), fakeConfig, link)
+    check(mismatched.byId.passcode.ok == false, "a refused message is a failing check")
+    check(mismatched.ok == false, "and this one does stop the gate")
+    check(mismatched.byId.passcode.text:find("#4") ~= nil, "naming the computer that sent it")
+    link.pass, link.refused, link.refusedFrom = nil, 0, nil
 
     print(string.format("%d passed, %d failed", passed, failed))
     return failed == 0

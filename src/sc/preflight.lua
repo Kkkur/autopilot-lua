@@ -53,7 +53,7 @@ end
 
 -- == THE SHIP ITSELF =========================================
 
-function preflight.check(ship, cal, fuel, turbine, config)
+function preflight.check(ship, cal, fuel, turbine, config, link)
     local report = newReport()
 
     local state, fault = ship.readState()
@@ -123,6 +123,24 @@ function preflight.check(ship, cal, fuel, turbine, config)
         differences[1] and differences[1].text or "the ship is the one that was measured",
         "the numbers the autopilot flies by were measured on a different ship")
     report.byId.inventory.detail = differences
+
+    -- The passcode, and only the half of it that has a physical consequence.
+    -- Being unpaired is a warning: the ship flies, and that is the state every
+    -- ship is in before the installer has been round all four computers. A
+    -- relay answering with a different passcode is a refusal, because it looks
+    -- exactly like a relay that is there and works and will not take an order.
+    local pass = link and link.status()
+    if pass and pass.refused > 0 then
+        add(report, "passcode", false, "bad",
+            string.format("%d message(s) refused, last from computer #%s",
+                pass.refused, tostring(pass.refusedFrom)),
+            "something on this protocol is not part of this ship, or a relay was paired to a different passcode")
+    elseif pass and not pass.paired then
+        add(report, "passcode", false, "warn", "no passcode set on this computer",
+            "any ship in range on this protocol can drive these propellers, and this one obeys it")
+    else
+        add(report, "passcode", true, "bad", "paired")
+    end
 
     local unmeasured = {}
     for _, row in ipairs(cal.summary()) do

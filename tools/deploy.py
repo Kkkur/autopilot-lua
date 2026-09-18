@@ -14,9 +14,10 @@ What each computer gets:
     2  turbines/              the turbine relay
     3  turbines/              the cruise relay, the same program
 
-Each relay folder carries its own copy of sc/log.lua and they are meant to be
-the same file. That is checked here rather than trusted, because a change to
-logging is a change to three files and forgetting one is silent.
+Each relay folder carries its own copy of sc/log.lua and sc/link.lua, and each
+of those is meant to be the same file in all three places. That is checked here
+rather than trusted, because a change to logging or to the passcode envelope is
+a change to three files and forgetting one is silent.
 
 What the computers write themselves is never copied back: starcatcher/,
 fuelrelay/, turbinerelay/ and the logs and telemetry under them.
@@ -44,8 +45,12 @@ PLAN = [
     (3, "cruise relay", [("turbines", ".")]),
 ]
 
-# The three that have to stay identical, checked before anything is copied.
-LOGS = ["src/sc/log.lua", "relay/sc/log.lua", "turbines/sc/log.lua"]
+# The files every role carries a copy of, which have to stay identical. Checked
+# before anything is copied, because forgetting one of the copies is silent.
+SHARED = [
+    ["src/sc/log.lua", "relay/sc/log.lua", "turbines/sc/log.lua"],
+    ["src/sc/link.lua", "relay/sc/link.lua", "turbines/sc/link.lua"],
+]
 
 
 # The three copies of log.lua differ on exactly one line and are meant to: each
@@ -81,12 +86,14 @@ def main():
         print("Set STARCATCHER_SAVE to the computercraft/computer folder.")
         return 1
 
-    first = body(os.path.join(HERE, LOGS[0].replace("/", os.sep)))
-    for other in LOGS[1:]:
-        path = os.path.join(HERE, other.replace("/", os.sep))
-        if body(path) != first:
-            print("%s has drifted from %s. They are meant to be the same file." % (other, LOGS[0]))
-            print()
+    for copies in SHARED:
+        first = body(os.path.join(HERE, copies[0].replace("/", os.sep)))
+        for other in copies[1:]:
+            path = os.path.join(HERE, other.replace("/", os.sep))
+            if body(path) != first:
+                print("%s has drifted from %s. They are meant to be the same file."
+                      % (other, copies[0]))
+                print()
 
     for cid, what, pairs in PLAN:
         target = os.path.join(SAVE, str(cid))

@@ -13,7 +13,7 @@
 -- with the peripherals. This end adds what only it knows: how fast the ship is
 -- moving and how far away the target is. Range is where those two meet.
 
-local util, ship, cal, control, config, log = ...
+local util, ship, cal, control, config, log, link = ...
 
 local fuel = {}
 
@@ -63,7 +63,15 @@ end
 
 -- Accepts a message and says whether it was one of ours. Split out from the
 -- loop so the same validation can be tested without a modem.
+--
+-- The passcode is checked first and before anything is read out of the message,
+-- because a message from another ship is not a malformed message from this one.
 function fuel.accept(id, message)
+    local allowed, why = link.check(id, message)
+    if not allowed then
+        fuel.refusedWhy = why
+        return false, why
+    end
     if type(message) ~= "table" or message.v ~= 1 or type(message.tanks) ~= "table" then
         return false
     end
@@ -101,7 +109,7 @@ end
 -- the `fuel` command so typing it feels immediate.
 function fuel.ping()
     if not fuel.modem then return false, "no modem on this computer" end
-    rednet.broadcast({ cmd = "ping" }, fuel.PROTOCOL)
+    rednet.broadcast(link.stamp({ cmd = "ping" }), fuel.PROTOCOL)
     return true
 end
 
