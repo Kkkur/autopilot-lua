@@ -1336,6 +1336,10 @@ local function turnTo(ctx, want, label)
     local tol = config.get("calAlignTol")
     local started = os.clock()
     local last = started
+    -- The turn is traced once a second rather than once a sample, because the
+    -- point is to read the numbers back afterwards and a pilot who leaves the
+    -- ship sitting on a point would otherwise fill the log with one heading.
+    local lastTrace = 0
     local err, pose = nil, nil
     local skipped = false
 
@@ -1358,6 +1362,25 @@ local function turnTo(ctx, want, label)
             local rate = ship.yawRate()
             local demand = flight.tankDemand(err, pid, cal, cfg(), dt, rate, swing)
             ship.flush(flight.mix(0, demand.diff, ship.order, cal, cfg()))
+
+            -- What the turn is actually doing, which is the only place the
+            -- three numbers that decide it are visible together. A ship sitting
+            -- on a heading with a large differential on it is one whose
+            -- deceleration is wrong, and the accel below says whether that
+            -- number was measured at all or is the assumed one being flown on.
+            if now - lastTrace >= 1 then
+                lastTrace = now
+                local conf = cfg()
+                local accel = cal.yawAccel or conf.yawAccelAssumed
+                local cap = flight.approachRate(err, accel, conf.yawBrakeSafety,
+                    conf.yawApproachMin)
+                log.infof(
+                    "cal: align turn off=%+.1f rate=%s rpm=%+.0f want=%+.1f cap=%s accel=%.3f%s",
+                    err, rate and string.format("%+.2f", rate) or "none",
+                    demand.diff, demand.rate,
+                    cap and string.format("%.2f", cap) or "none",
+                    accel, cal.yawAccel and "" or " (assumed)")
+            end
 
             ctx.panel({
                 rungLabel = label,
