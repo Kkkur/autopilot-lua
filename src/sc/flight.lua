@@ -471,4 +471,103 @@ function flight.phaseNext(phase, state, cfg, cal)
     return phase, "holding"
 end
 
+-- == WHAT A SETTING MEANS ON THIS SHIP =======================
+--
+-- The TUNE tab's preview. A number on its own is not a decision: 256 RPM is
+-- meaningless until it is the speed this hull was measured doing at 256 RPM.
+-- Everything here runs the value back through what calibration measured, and
+-- every one of them returns nil rather than a guess when the stage that would
+-- have measured it has not been run. An invented preview is worse than none,
+-- because a pilot would tune against it.
+--
+-- Pure, like the rest of this file, so the sentences are checkable without a
+-- ship: the wording is the part worth testing.
+
+-- The balloon ladder is a level against a climb rate and is walked rather than
+-- read through util's curve family, for the same reason levelForClimb is.
+function flight.climbAtLevel(curve, level)
+    if not curve or #curve == 0 then return nil end
+    if level <= curve[1].rpm then return curve[1].speed end
+    for index = 1, #curve - 1 do
+        local a, b = curve[index], curve[index + 1]
+        if level <= b.rpm then
+            local span = b.rpm - a.rpm
+            local t = math.abs(span) > 1e-9 and (level - a.rpm) / span or 0
+            return a.speed + (b.speed - a.speed) * t
+        end
+    end
+    return curve[#curve].speed
+end
+
+function flight.preview(key, value, cal, cfg)
+    cal = cal or {}
+    local fwd = cal.fwdCurve and cal.fwdCurve.pos
+    local yaw = cal.yawCurve and cal.yawCurve.pos
+
+    if key == "cruiseMaxRpm" then
+        local speed = util.curveSpeedAt(fwd, value)
+        return speed and string.format("this ship ran %.1f m/s at %d rpm", speed, value)
+    end
+
+    if key == "cruiseSpeed" then
+        local rpm = util.curveRpmFor(fwd, value)
+        local top = util.curveTopSpeed(fwd)
+        if top and value > top then
+            return string.format("more than the %.1f m/s it has ever been measured doing", top)
+        end
+        return rpm and string.format("about %d rpm on the measured ladder", util.round(rpm))
+    end
+
+    if key == "tankRpmMax" or key == "yawTrimRpm" then
+        local rate = util.curveSpeedAt(yaw, value)
+        return rate and string.format("this hull came round at %.1f deg/s on %d differential",
+            rate, value)
+    end
+
+    if key == "yawRateMax" then
+        local rpm = util.curveRpmFor(yaw, value)
+        local top = util.curveTopSpeed(yaw)
+        if top and value > top then
+            return string.format("faster than the %.1f deg/s it has ever turned", top)
+        end
+        return rpm and string.format("about %d differential rpm", util.round(rpm))
+    end
+
+    if key == "brakeRpmMax" then
+        local ladder = cal.brakeCurve and cal.brakeCurve.all
+        local decel = util.curveSpeedAt(ladder, value)
+        return decel and string.format("all five stopped at %.1f m/s/s on %d rpm reverse",
+            decel, value)
+    end
+
+    if key == "pitchLimit" then
+        local capped = flight.maxDecel(cal, { pitchLimit = value }, "all")
+        if not capped then return nil end
+        return string.format("leaves %.1f m/s/s of the measured braking usable", capped)
+    end
+
+    if key == "brakeMargin" then
+        local aMax = flight.maxDecel(cal, cfg, "all")
+        if not aMax or aMax <= 0 then return nil end
+        local v = cfg.cruiseSpeed
+        return string.format("a stop from %.0f m/s begins %.0f blocks out",
+            v, v * v * value / (2 * aMax))
+    end
+
+    if key == "balloonFloor" then
+        local climb = flight.climbAtLevel(cal.balloonCurve, value)
+        if not climb then return nil end
+        if climb < 0 then
+            return string.format("strength %d was measured sinking at %.2f m/s", value, -climb)
+        end
+        return string.format("strength %d was measured climbing at %.2f m/s", value, climb)
+    end
+
+    if key == "fuelReserve" or key == "fuelWarn" or key == "fuelCrit" then
+        return nil   -- these are percentages of a tank, and a tank is not measured here
+    end
+
+    return nil
+end
+
 return flight

@@ -83,10 +83,12 @@ if ARGS[1] == "--help" or ARGS[1] == "-h" then
     print("  fly x y z    fly to coordinates")
     print("  route a b c  fly a list of them in order")
     print("  stop         cut the propellers")
+    print("  check        ask whether the ship is fit to fly, and why not")
+    print("  manual       fly by hand, or press IJKL on the MANUAL tab")
     print("  set k v      change any tuning value")
     print("  help         the full command list, in the program")
     print("")
-    print("F1-F6 switch tabs. Type commands at the bottom at any time.")
+    print("F1-F8 switch tabs. Type commands at the bottom at any time.")
     return 0
 end
 
@@ -116,7 +118,7 @@ local fuel = loadModule("fuel", util, ship, cal, control, config, log)
 local preflight = loadModule("preflight", util, flight)
 local popup = loadModule("popup", util)
 local ui = loadModule("ui", util, ship, cal, control, nav, fuel, turbine, config, log,
-    telemetry)
+    telemetry, flight, popup)
 local cmd = loadModule("cmd", util, ship, cal, control, nav, fuel, turbine, config, ui, log,
     preflight, popup, telemetry)
 

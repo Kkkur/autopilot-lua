@@ -952,7 +952,8 @@ elseif options.script == "tabs" then
     typeLine("save home")
     typeLine("save dock 200 96 -140")
     typeLine("fly 120 95 60")
-    for _, key in ipairs({ keys.f2, keys.f3, keys.f4, keys.f5, keys.f6, keys.f7, keys.f1 }) do
+    for _, key in ipairs({ keys.f2, keys.f3, keys.f4, keys.f5, keys.f6, keys.f7, keys.f8,
+                           keys.f1 }) do
         queueEvent("key", key)
     end
 elseif options.script == "clicks" then
@@ -962,7 +963,7 @@ elseif options.script == "clicks" then
     -- The last column is in here on purpose: the bar used to stop short of the
     -- right hand edge and the columns past it did nothing at all.
     typeLine("save home")
-    for _, x in ipairs({ 12, 20, 27, 34, 41, 48, 51, 4 }) do
+    for _, x in ipairs({ 4, 11, 18, 25, 31, 37, 43, 49, 51 }) do
         queueEvent("mouse_click", 1, x, 1)
     end
 else

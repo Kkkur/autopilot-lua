@@ -100,9 +100,16 @@ define("save", {
             if not pos then return err, "bad" end
             x, y, z = pos.x, pos.y, pos.z
         elseif not z then
-            -- Two numbers is the old starcatcher shape: X and Z, any height.
-            z, y = tonumber(args[3]), nil
+            -- Two numbers is the old starcatcher shape, X and Z. This autopilot
+            -- owns the vertical axis, so the height is taken from the ship
+            -- rather than left empty: a waypoint is a point, not a pin on a map,
+            -- and "any height" was only ever honest on a hull that could not
+            -- choose one.
+            z = tonumber(args[3])
             if not z then return "usage: save <name> [x y z]", "warn" end
+            local pos, err = currentPos()
+            if not pos then return "no pose, so no height to save with it: " .. tostring(err), "bad" end
+            y = pos.y
         end
         local wp, replaced = nav.add(name, x, y, z)
         return (replaced and "updated " or "saved ") .. nav.describe(wp), "good"
@@ -135,7 +142,7 @@ define("list", {
     usage = "list",
     help = "Show the waypoint table on the NAV tab.",
     run = function()
-        ui.tab = 3
+        ui.tab = ui.TAB.NAV
         return string.format("%d waypoints", #nav.points), "hi"
     end,
 })
@@ -154,7 +161,7 @@ define("goto", {
         if not allowed then return refused, "bad" end
         local ok, err = nav.goTo(args[1], pos and pos.y or nil)
         if not ok then return tostring(err), "bad" end
-        ui.tab = 1
+        ui.tab = ui.TAB.FLIGHT
         return "flying to " .. args[1], "good"
     end,
 })
@@ -175,7 +182,7 @@ define("fly", {
         if not allowed then return refused, "bad" end
         local ok, err = nav.goToCoords(x, y, z)
         if not ok then return tostring(err), "bad" end
-        ui.tab = 1
+        ui.tab = ui.TAB.FLIGHT
         return string.format("flying to %d %d %d", util.round(x), util.round(y), util.round(z)), "good"
     end,
 })
@@ -196,7 +203,7 @@ define("route", {
         if not allowed then return refused, "bad" end
         local ok, err = nav.setRoute(args, pos and pos.y or nil)
         if not ok then return tostring(err), "bad" end
-        ui.tab = 1
+        ui.tab = ui.TAB.FLIGHT
         return "route: " .. table.concat(args, " > "), "good"
     end,
 })
@@ -240,9 +247,16 @@ define("resume", {
 
 define("manual", {
     aliases = { "man" },
-    usage = "manual <throttle> <yaw> [level]",
+    usage = "manual <throttle> <yaw> [level] | manual off",
     help = "Fly by hand. Throttle and yaw are -1 to 1, level is the balloon 0 to 15.",
     run = function(args)
+        -- `manual off` is its own word rather than three zeros, because handing
+        -- the ship back is a thing a pilot means rather than a value they set.
+        local first = (args[1] or ""):lower()
+        if first == "off" or first == "stop" then
+            control.setManual(0, 0, nil)
+            return "the autopilot has the ship back", "good"
+        end
         -- Fractions rather than m/s, so what you ask for means the same thing on
         -- a ship whose curves have been measured and one whose have not.
         local throttle = util.clamp(tonumber(args[1]) or 0, -1, 1)
@@ -254,9 +268,50 @@ define("manual", {
         end
         control.setManual(throttle, yaw, level)
         if not control.manual then return "manual off", "warn" end
-        ui.tab = 1
+        ui.tab = ui.TAB.MANUAL
         return string.format("manual throttle %+.2f yaw %+.2f%s", throttle, yaw,
             level and string.format(" level %d", level) or ""), "warn"
+    end,
+})
+
+define("check", {
+    aliases = { "preflight" },
+    usage = "check",
+    help = "Ask the preflight checker whether this ship is fit to be told to fly.",
+    run = function()
+        -- The same checker the gate runs, asked rather than triggered. Nothing
+        -- here acts on the answer: that is the gate's job, and a checker a pilot
+        -- can consult without committing to anything is the point.
+        local report = preflight.check(ship, cal, fuel, turbine, config)
+        ui.showPopup(popup.report(report))
+        if report.ok then
+            return string.format("ready, %d checks passed", #report.items), "good"
+        end
+        local item = firstFailure(report)
+        return item and item.text or "not ready to fly", "bad"
+    end,
+})
+
+define("balloon", {
+    usage = "balloon <0-15> | balloon auto",
+    help = "Hold the balloon at a strength by hand, or give the height back to the loop.",
+    run = function(args)
+        local what = (args[1] or ""):lower()
+        if what == "auto" or what == "off" then
+            control.setManual(0, 0, nil)
+            return "the altitude loop has the balloon back", "good"
+        end
+        local level = tonumber(args[1])
+        if not level then return "usage: balloon <0-15> or balloon auto", "warn" end
+        level = util.clamp(util.round(level), 0, 15)
+        -- Setting the level by hand is flying by hand with no thrust, which is
+        -- what it is, rather than a second path into the balloon that the
+        -- altitude loop would overwrite a tick later.
+        local allowed, refused = gate("hold the balloon by hand", nil, popup.manualOverride)
+        if not allowed then return refused, "bad" end
+        control.setManual(0, 0, level)
+        ui.tab = ui.TAB.MANUAL
+        return string.format("balloon held at %d, and the leg is off", level), "warn"
     end,
 })
 
@@ -281,7 +336,7 @@ define("cal", {
                 ctx.note("done. Press Enter to go back.", "good")
                 ctx.waitEnter()
             end)
-        ui.tab = 4
+        ui.tab = ui.TAB.CAL
         return "calibration finished", "good"
     end,
 })
@@ -290,7 +345,7 @@ define("curves", {
     usage = "curves",
     help = "Show what calibration measured, stage by stage.",
     run = function()
-        ui.tab = 4
+        ui.tab = ui.TAB.CAL
         local parts = {}
         for _, row in ipairs(cal.summary()) do
             parts[#parts + 1] = string.format("%s %s", row.title,

@@ -267,6 +267,72 @@ function cal.topYawRate()
     return best
 end
 
+-- == THE MEASURED VALUES, BY HAND ============================
+--
+-- What the wizard learned, in a shape the TUNE tab can show and edit. These are
+-- the single numbers rather than the ladders: a ladder is four readings and a
+-- picture, and it belongs on the CAL tab where it is drawn.
+--
+-- Hand editable on purpose. A pilot who knows the hull holds at strength 7
+-- should be able to say so without flying the balloon stage again, the way a
+-- hand edited cal.cfg has always been honored. The popup says plainly that the
+-- next run of that stage overwrites it, because the alternative is finding out
+-- by watching a good number disappear.
+
+cal.MEASURED = {
+    { id = "yawAuthLeft", title = "yaw left", unit = "deg/s per rpm", stage = "sides",
+      help = "How much yaw a rpm on the left side is worth.",
+      get = function() return cal.yawAuth and cal.yawAuth.left end,
+      set = function(v) cal.yawAuth = cal.yawAuth or {}; cal.yawAuth.left = v end },
+    { id = "yawAuthRight", title = "yaw right", unit = "deg/s per rpm", stage = "sides",
+      help = "The same for the right side. The two differ on a hull whose sides are not mirrored.",
+      get = function() return cal.yawAuth and cal.yawAuth.right end,
+      set = function(v) cal.yawAuth = cal.yawAuth or {}; cal.yawAuth.right = v end },
+    { id = "noseOffset", title = "nose offset", unit = "deg", stage = "sides",
+      help = "Degrees between where the hull points and where the main propeller pushes.",
+      get = function() return cal.noseOffset end,
+      set = function(v) cal.noseOffset = v end },
+    { id = "altHover", title = "hover level", unit = "strength 0 to 15", stage = "balloon",
+      help = "The redstone strength that came nearest to holding this ship's height.",
+      get = function() return cal.altHover end,
+      set = function(v) cal.altHover = v end },
+    { id = "stressAtTurn", title = "stress, turning", unit = "su", stage = "yaw",
+      help = "What the kinetic network was carrying at a full turn.",
+      get = function() return cal.stressAtTurn end,
+      set = function(v) cal.stressAtTurn = v end },
+    { id = "stressAtCruise", title = "stress, cruising", unit = "su", stage = "forward",
+      help = "What it was carrying at full cruise. The gate budgets against this.",
+      get = function() return cal.stressAtCruise end,
+      set = function(v) cal.stressAtCruise = v end },
+}
+
+function cal.measuredById(id)
+    for _, entry in ipairs(cal.MEASURED) do
+        if entry.id == id then return entry end
+    end
+    return nil
+end
+
+-- Returns the value, or nil with the stage that would have measured it, so the
+-- screen can say which stage to run rather than printing a dash.
+function cal.measured(id)
+    local entry = cal.measuredById(id)
+    if not entry then return nil, nil end
+    return entry.get(), entry.stage
+end
+
+function cal.setMeasured(id, raw)
+    local entry = cal.measuredById(id)
+    if not entry then return nil, "no such measurement: " .. tostring(id) end
+    local value = tonumber(raw)
+    if not value then return nil, entry.id .. " is a number" end
+    entry.set(value)
+    cal.meta[entry.id .. "ByHand"] = log.timestamp and log.timestamp() or true
+    cal.save()
+    log.infof("measured %s set by hand to %g", entry.id, value)
+    return value
+end
+
 -- == THE INVENTORY ===========================================
 --
 -- What the ship was made of when it was last measured. Comparing this against

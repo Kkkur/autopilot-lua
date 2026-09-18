@@ -217,6 +217,21 @@ local function driveBalloon(state, wantY)
     -- lost a part keeps the level it was already holding rather than being
     -- flown on a loop whose inputs may be the thing that went quiet.
     if control.safe then return control.lastBalloon end
+
+    -- By hand means by hand. A pilot who set the level with U, O or `balloon 9`
+    -- gets that level, not a loop's opinion of it, and until stage 7 this was
+    -- stored and never commanded, which made the keys that set it a lie.
+    if control.manual and control.manual.level then
+        local level = util.clamp(util.round(control.manual.level), 0, 15)
+        control.info.balloon = level
+        control.info.altErr = nil
+        if level ~= control.lastBalloon then
+            control.lastBalloon = level
+            pcall(turbine.setBalloon, level)
+        end
+        return level
+    end
+
     local haveY = state.position.y
     local altErr = (wantY or haveY) - haveY
     local vspeed = state.velocity and state.velocity.y or 0

@@ -55,6 +55,30 @@ function popup.preflight(report, what)
     }
 end
 
+-- The whole checklist, asked for rather than triggered. `check` is what a pilot
+-- types before untying, so it lists what passed as well as what did not: a
+-- popup that only ever shows failures cannot tell the difference between a ship
+-- that is ready and a checker that is not running.
+function popup.report(report)
+    local lines, cost = {}, {}
+    for _, item in ipairs((report and report.items) or {}) do
+        if item.ok then
+            say(lines, "good", "%s", item.id)
+        else
+            say(lines, item.kind, "%s", item.text)
+            if item.cost then say(cost, "dim", "%s", item.cost) end
+        end
+    end
+    if #lines == 0 then say(lines, "dim", "the checker returned nothing at all") end
+    return {
+        severity = report and report.ok and "info" or "warn",
+        title = report and report.ok and "READY TO FLY" or "NOT READY TO FLY",
+        lines = lines,
+        cost = cost,
+        choices = { { key = "enter", label = "close", action = "done" } },
+    }
+end
+
 -- The fuel gate is its own popup because the answer is a quantity rather than a
 -- list: how far short it runs, in the two units a pilot thinks in.
 function popup.fuelShortfall(shortSeconds, shortBlocks)
@@ -195,9 +219,16 @@ end
 
 -- == ONE SETTING =============================================
 
--- The TUNE tab's editor. Stage 7 builds the editing and the preview; what this
--- owes stage 6 is the shape, so nothing there has to invent a second one.
-function popup.setting(entry, value, preview)
+-- The TUNE tab's editor: what the setting does, what the ship is doing when you
+-- reach for it, and what the value means on this hull once it has been run back
+-- through the measured curves. The preview is the part that turns a number into
+-- a decision, and it is absent rather than invented when the stage that would
+-- have measured it has not been run.
+--
+-- `typed` is whatever the pilot has keyed in so far. It is shown rather than
+-- applied, because a value that took effect halfway through being typed would
+-- fly the ship at 2 on the way to 25.
+function popup.setting(entry, value, preview, typed)
     local lines, cost = {}, {}
     say(lines, "hi", "%s", entry.help or entry.key)
     if entry.symptom then say(lines, "dim", "reach for it when %s", entry.symptom) end
@@ -206,6 +237,7 @@ function popup.setting(entry, value, preview)
         say(cost, "dim", "between %g and %g", entry.min, entry.max)
     end
     if preview then say(cost, "accent", "%s", preview) end
+    if typed and typed ~= "" then say(cost, "warn", "typing: %s", typed) end
     return {
         severity = "info",
         title = string.upper(entry.key),
@@ -213,7 +245,37 @@ function popup.setting(entry, value, preview)
         cost = cost,
         choices = {
             { key = "enter", label = "done", action = "done" },
-            { key = "r", label = "reset to default", action = "reset" },
+            { key = "r", label = "default", action = "reset" },
+        },
+    }
+end
+
+-- The same editor for something calibration measured rather than something the
+-- pilot chose. Hand editing is allowed, and the one thing this has to say that
+-- the settings popup does not is that the next run of that stage overwrites it.
+-- A pilot who finds that out by watching a good number disappear learns the same
+-- fact at the worst possible moment.
+function popup.measured(entry, value, typed)
+    local lines, cost = {}, {}
+    say(lines, "hi", "%s", entry.help or entry.id)
+    if value == nil then
+        say(lines, "warn", "not measured yet. Run the %s stage, or type it in.", entry.stage)
+    else
+        say(lines, "dim", "measured by the %s stage", entry.stage)
+    end
+    say(cost, "dim", "now %s %s", value and string.format("%.4g", value) or "unmeasured",
+        entry.unit or "")
+    say(cost, "warn", "running the %s stage again overwrites whatever is typed here",
+        entry.stage)
+    if typed and typed ~= "" then say(cost, "warn", "typing: %s", typed) end
+    return {
+        severity = "info",
+        title = string.upper(entry.title or entry.id),
+        lines = lines,
+        cost = cost,
+        choices = {
+            { key = "enter", label = "done", action = "done" },
+            { key = "c", label = "cancel", action = "cancel" },
         },
     }
 end

@@ -48,6 +48,17 @@ PLAN = [
 LOGS = ["src/sc/log.lua", "relay/sc/log.lua", "turbines/sc/log.lua"]
 
 
+# The three copies of log.lua differ on exactly one line and are meant to: each
+# writes its own name in the crash banner, so a crash file says which computer
+# left it. Comparing the raw bytes reported that as drift on every single run,
+# and a warning that is wrong every time is a warning nobody reads the day it is
+# right. Everything but the banner is still compared byte for byte.
+def body(path):
+    with open(path, "rb") as handle:
+        lines = handle.read().splitlines()
+    return [line for line in lines if b"CRASH ===" not in line]
+
+
 def sources(src, dst):
     """Every file the pair covers, as (absolute source, relative destination)."""
     full = os.path.join(HERE, src.replace("/", os.sep))
@@ -70,10 +81,10 @@ def main():
         print("Set STARCATCHER_SAVE to the computercraft/computer folder.")
         return 1
 
-    first = os.path.join(HERE, LOGS[0].replace("/", os.sep))
+    first = body(os.path.join(HERE, LOGS[0].replace("/", os.sep)))
     for other in LOGS[1:]:
         path = os.path.join(HERE, other.replace("/", os.sep))
-        if not filecmp.cmp(first, path, shallow=False):
+        if body(path) != first:
             print("%s has drifted from %s. They are meant to be the same file." % (other, LOGS[0]))
             print()
 

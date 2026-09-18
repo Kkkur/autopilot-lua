@@ -945,6 +945,107 @@ function tests.run()
         check(built.title ~= nil and #built.title > 0, built.title .. " has a title")
     end
 
+    -- == the tuning surface ==
+    --
+    -- Stage 7 retired the flight envelope the omni hull flew by. These are the
+    -- keys, by name, because a key that comes back because something still reads
+    -- it would otherwise come back silently.
+    for _, gone in ipairs({ "climbSpeed", "holdAlt", "slowRadius", "posKp", "posKi",
+                            "posKd", "useCurves", "stationKeep", "velSteps" }) do
+        check(config.byKey[gone] == nil, gone .. " is retired and stays retired")
+    end
+    check(config.byKey.cruiseSpeed ~= nil and config.byKey.cruiseSpeed.group == "cruise",
+        "cruiseSpeed moved to the group that describes the run")
+    for _, group in ipairs(config.GROUPS) do
+        check(#config.keysIn(group.id) > 0, "the " .. group.id .. " group has settings in it")
+    end
+    local groupIds = {}
+    for _, group in ipairs(config.GROUPS) do groupIds[group.id] = true end
+    for _, entry in ipairs(config.SCHEMA) do
+        check(groupIds[entry.group] == true, entry.key .. " is in a group the TUNE tab draws")
+        check(type(entry.help) == "string" and #entry.help > 0, entry.key .. " says what it does")
+        check(type(entry.symptom) == "string" and #entry.symptom > 0,
+            entry.key .. " says what the ship is doing when you reach for it")
+    end
+
+    -- == what a setting means on this ship ==
+    --
+    -- The preview is the part of the TUNE tab that turns a number into a
+    -- decision, and the thing worth testing is that it refuses to invent one.
+    local previewCal = {
+        fwdCurve = { pos = { { rpm = 64, speed = 4 }, { rpm = 256, speed = 16 } } },
+        yawCurve = { pos = { { rpm = 64, speed = 5 }, { rpm = 256, speed = 20 } } },
+        brakeCurve = { all = { { rpm = 128, speed = 3, pitch = 4 },
+                               { rpm = 256, speed = 6, pitch = 20 } } },
+        balloonCurve = { { rpm = 0, speed = -2 }, { rpm = 8, speed = 0 },
+                         { rpm = 15, speed = 2 } },
+    }
+    local previewCfg = { cruiseSpeed = 12, pitchLimit = 12, brakeMargin = 3.0 }
+
+    check(flight.preview("cruiseMaxRpm", 256, previewCal, previewCfg):find("16.0 m/s") ~= nil,
+        "the top of the throttle is quoted as the speed it was measured doing")
+    check(flight.preview("cruiseMaxRpm", 256, {}, previewCfg) == nil,
+        "and says nothing at all on a ship that has never been measured")
+    check(flight.preview("tankRpmMax", 256, previewCal, previewCfg):find("20.0 deg/s") ~= nil,
+        "a differential is quoted as the turn it produced")
+    check(flight.preview("cruiseSpeed", 99, previewCal, previewCfg):find("more than") ~= nil,
+        "asking for more than the ship has done is answered in its own words")
+    check(flight.preview("cruiseSpeed", 99, previewCal, previewCfg):find("16.0") ~= nil,
+        "and that answer quotes what it has actually done")
+    check(flight.preview("pitchLimit", 12, previewCal, previewCfg):find("3.0") ~= nil,
+        "a tighter pitch limit leaves only the rungs that stayed inside it")
+    check(flight.preview("pitchLimit", 30, previewCal, previewCfg):find("6.0") ~= nil,
+        "and a looser one lets the harder rung back in")
+    check(flight.preview("balloonFloor", 0, previewCal, previewCfg):find("sinking") ~= nil,
+        "a floor of zero is quoted as the sink it was measured doing")
+    check(flight.preview("arriveDist", 1, previewCal, previewCfg) == nil,
+        "a setting with nothing measured behind it previews nothing")
+
+    near(flight.climbAtLevel(previewCal.balloonCurve, 4), -1.0, "the balloon ladder reads between rungs")
+    near(flight.climbAtLevel(previewCal.balloonCurve, 8), 0.0, "and exactly on one")
+    check(flight.climbAtLevel(nil, 8) == nil, "and refuses an unmeasured ladder")
+
+    -- == the setting popup ==
+    local entry = config.byKey.cruiseMaxRpm
+    modal = popup.setting(entry, "256", "this ship ran 16.0 m/s at 256 rpm", "12")
+    check(joined(modal.lines):find(entry.symptom, 1, true) ~= nil,
+        "the editor says what the ship is doing when you reach for the setting")
+    check(joined(modal.cost):find("16.0 m/s") ~= nil, "and what the value means on this hull")
+    check(joined(modal.cost):find("typing: 12") ~= nil,
+        "a half typed value is shown rather than applied")
+
+    modal = popup.measured({ id = "altHover", title = "hover level", stage = "balloon",
+        unit = "strength", help = "what holds this ship up" }, 7)
+    check(joined(modal.cost):find("overwrites") ~= nil,
+        "editing a measured value says the stage will overwrite it")
+    modal = popup.measured({ id = "altHover", title = "hover level", stage = "balloon",
+        unit = "strength", help = "what holds this ship up" }, nil)
+    check(joined(modal.lines):find("balloon stage") ~= nil,
+        "and an unmeasured one names the stage that would measure it")
+
+    modal = popup.report(whole())
+    check(modal.title:find("READY") ~= nil and modal.title:find("NOT") == nil,
+        "a ship that passes every check is told so plainly")
+    modal = popup.report(failing)
+    check(modal.title:find("NOT READY") ~= nil, "and one that does not is not")
+    check(#modal.choices > 0, "the checklist can be closed")
+
+    -- == the measured values, by hand ==
+    check(#cal.MEASURED > 0, "the measured values are listed somewhere the screen can read")
+    for _, measured in ipairs(cal.MEASURED) do
+        check(type(measured.stage) == "string" and cal.stageById(measured.stage) ~= nil,
+            measured.id .. " names the stage that measures it")
+        check(type(measured.help) == "string" and #measured.help > 0,
+            measured.id .. " says what it is")
+    end
+    cal.altHover = nil
+    check(cal.measured("altHover") == nil, "an unmeasured value reads as missing")
+    check(select(2, cal.measured("altHover")) == "balloon",
+        "and says which stage would have measured it")
+    cal.setMeasured("altHover", "7")
+    check(cal.altHover == 7, "a hand edited measurement lands where the controller reads it")
+    check(select(2, cal.setMeasured("altHover", "nonsense")) ~= nil, "and junk is refused")
+
     print(string.format("%d passed, %d failed", passed, failed))
     return failed == 0
 end

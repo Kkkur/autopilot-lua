@@ -1,6 +1,6 @@
 -- ui.lua -- the screen and the keyboard.
 --
--- One window, drawn off-screen and flipped, so nothing ever flickers. Seven
+-- One window, drawn off-screen and flipped, so nothing ever flickers. Eight
 -- tabs, because a flight computer that fits everything on one screen is either
 -- lying or unreadable, and a command line at the bottom that is always live:
 -- you can type `goto dock` while the CAL tab is up.
@@ -8,15 +8,22 @@
 -- Everything the pilot can do has both a key and a command. Keys are for
 -- flying, commands are for saying exactly what you mean.
 
-local util, ship, cal, control, nav, fuel, turbine, config, log, telemetry = ...
+local util, ship, cal, control, nav, fuel, turbine, config, log, telemetry, flight, popup = ...
 
 local ui = {}
 
 local W, H = term.getSize()
 local win = window.create(term.current(), 1, 1, W, H)
 
-ui.tab = 1
-ui.TABS = { "FLIGHT", "PROPS", "NAV", "CAL", "TUNE", "FUEL", "LOG" }
+ui.TABS = { "FLIGHT", "MANUAL", "PROPS", "NAV", "CAL", "TUNE", "FUEL", "LOG" }
+
+-- Named, because the tab a command wants to put up was a bare number in five
+-- files and inserting MANUAL in the middle would have moved every one of them
+-- silently. Anything that sets ui.tab says which tab it means.
+ui.TAB = {}
+for index, name in ipairs(ui.TABS) do ui.TAB[name] = index end
+
+ui.tab = ui.TAB.FLIGHT
 ui.sel = { nav = 1, tune = 1, props = 1 }
 ui.tuneGroup = 1
 ui.logScroll = 0
@@ -306,148 +313,275 @@ local function drawInput()
 end
 
 -- == TAB: FLIGHT =============================================
+--
+-- Rebuilt in stage 7 for the hull that is here. The tab it replaced drew three
+-- axis rows, one per world axis, which described a ship that could strafe. This
+-- one can do exactly two things: point itself, and push along the way it is
+-- pointing, with a balloon underneath holding it up. So the tab is those three
+-- questions in that order, each as want against have, and the phase ladder
+-- across the top says which of them the autopilot is working on right now.
+
+local PHASES = { { id = "tank", label = "TURN" }, { id = "cruise", label = "RUN" },
+                 { id = "brake", label = "STOP" }, { id = "arrived", label = "HOLD" } }
+
+-- The phase machine, drawn as the machine it is. A phase name on a status line
+-- tells a pilot what is happening; the ladder tells them what happens next,
+-- which is the thing worth knowing while watching a stop.
+local function drawPhases(y, phase)
+    local x = 2
+    for index, entry in ipairs(PHASES) do
+        local active = phase == entry.id
+        at(x, y, " " .. entry.label .. " ", active and C("ink") or C("dim"),
+            active and C("accent") or C("bg"))
+        x = x + #entry.label + 2
+        if index < #PHASES then
+            at(x, y, ">", C("panel"), C("bg"))
+            x = x + 1
+        end
+    end
+    if phase == "safe" then
+        at(x + 1, y, "SAFE HOLD", C("ink"), C("bad"))
+    elseif phase == "manual" then
+        at(x + 1, y, "BY HAND", C("ink"), C("warn"))
+    end
+end
+
+-- want against have, with the demand that is meant to close the gap drawn as a
+-- signed bar. Three rows of this is the whole ship: heading, speed, height.
+--
+-- The columns are fixed rather than formatted one after another, because the
+-- three rows only read as a table if want sits under want on all three of them.
+-- NOTE_AT is where the row's own extra number goes and is the last column the
+-- text may use: everything from BAR_AT right belongs to the bar.
+local WANT_AT, HAVE_AT, NOTE_AT, BAR_AT, BAR_WIDTH = 11, 19, 27, 38, 13
+
+local function wantHave(y, label, want, have, demand, demandMax, colour)
+    at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+    at(2, y, util.pad(label, WANT_AT - 3), C("dim"), C("bg"))
+    at(WANT_AT, y, string.format("%7s", want and string.format("%+.1f", want) or "--"),
+        colour or C("hi"), C("bg"))
+    at(HAVE_AT, y, string.format("%7s", have and string.format("%+.1f", have) or "--"),
+        colour or C("hi"), C("bg"))
+    if demand ~= nil then
+        biBar(BAR_AT, y, BAR_WIDTH, demand, demandMax)
+    end
+end
+
+-- The row's own number, in the one column left between the table and the bar.
+local function rowNote(y, text, colour)
+    at(NOTE_AT, y, util.pad(tostring(text):sub(1, BAR_AT - NOTE_AT - 1),
+        BAR_AT - NOTE_AT - 1), colour or C("dim"), C("bg"))
+end
 
 local function drawFlight(snap, reads)
     local y = 2
     local state = snap.state
-    local extras = reads.extras
+    local info = snap.info or {}
 
-    rule(y, "SHIP"); y = y + 1
     if state then
         local p = state.position
-        line(y, string.format(" X %8.1f   Y %7.1f   Z %8.1f", p.x, p.y, p.z), C("hi")); y = y + 1
-        line(y, string.format(" HDG %6.1f %-3s   SPD %5.2f m/s   V %+5.2f",
-            state.yaw, util.compass(state.yaw), state.speed, state.velocity.y), C("hi")); y = y + 1
+        line(y, string.format(" X %8.1f  Y %7.1f  Z %8.1f   %s", p.x, p.y, p.z,
+            util.compass(state.yaw)), C("hi")); y = y + 1
+        line(y, string.format(" HDG %5.1f  SPD %5.2f m/s  VS %+5.2f  PITCH %+5.1f",
+            state.yaw, state.speed, state.velocity.y, util.pitchOf(state.orientation)),
+            C("dim")); y = y + 1
     else
         line(y, " position unavailable: " .. tostring(snap.fault), C("bad")); y = y + 1
-        line(y, "", C("dim")); y = y + 1
+        line(y, " nothing below this line is being flown", C("dim")); y = y + 1
     end
 
-    -- Speed bar against whatever the ship has actually been measured doing.
-    local top = cal.topForward() or config.get("cruiseSpeed")
-    local frac = state and top and top > 0 and (state.speed / top) or 0
-    at(1, y, " SPD ", C("dim"), C("bg"))
-    bar(6, y, math.max(4, W - 18), frac, frac > 0.98 and C("warn") or C("bar"))
-    at(W - 11, y, string.format("%5.1f/%-4.0f", state and state.speed or 0, top or 0), C("dim"), C("bg"))
-    y = y + 1
+    drawPhases(y, snap.phase); y = y + 1
 
-    rule(y, "TARGET"); y = y + 1
+    -- The leg. Distance and ETA belong next to the name of the thing they are
+    -- distance and ETA to.
     if snap.target then
         local t = snap.target
-        line(y, string.format(" %-10s X %d  Y %d  Z %d",
-            snap.targetName or "[coords]", util.round(t.x), util.round(t.y), util.round(t.z)),
-            C("hi")); y = y + 1
-        local eta = snap.eta and util.fmtETA(snap.eta) or "---"
-        line(y, string.format(" DIST %7.1f blk   ETA %-10s %s",
-            snap.dist or 0, eta, snap.phase:upper()), C("warn")); y = y + 1
+        line(y, string.format(" %-10s %5d %4d %6d   %6.1f blk   %s",
+            snap.targetName or "[coords]", util.round(t.x), util.round(t.y), util.round(t.z),
+            snap.dist or 0, snap.eta and util.fmtETA(snap.eta) or "--"), C("warn"))
+        y = y + 1
         if #nav.route > 0 then
-            line(y, " THEN " .. table.concat(nav.route, " > "), C("dim")); y = y + 1
+            line(y, " then " .. table.concat(nav.route, " > "), C("dim")); y = y + 1
         end
     else
         line(y, " no target. `goto <name>` or `fly <x> <y> <z>`", C("dim")); y = y + 1
-        line(y, "", C("bg")); y = y + 1
     end
 
-    -- This ship has one axis it can push along and one it can turn about, so
-    -- three axis rows describe a vessel that is not here. What matters is the
-    -- heading it is trying to hold, the speed it is trying to make, and the
-    -- balloon, which is the only thing keeping it up.
-    --
-    -- The full rebuild of this tab is stage 7. This is the honest short version.
-    local info = snap.info or {}
-    rule(y, "STEERING  want / have"); y = y + 1
+    rule(y)
+    at(WANT_AT + 3, y, " WANT ", C("dim"), C("bg"))
+    at(HAVE_AT + 3, y, " HAVE ", C("dim"), C("bg"))
+    y = y + 1
 
-    if info.err then
-        line(y, string.format(" HDG    %+6.1f deg off   %+5.1f deg/s",
-            info.err, info.yawRate or 0), C("hi"))
-        biBar(W - 14, y, 13, info.differential or 0, config.get("tankRpmMax"))
+    -- Heading: the error is what the turn is working on, so that is what is
+    -- drawn rather than two absolute bearings a pilot has to subtract.
+    local lined = math.abs(info.err or 0) <= config.get("tankPadding")
+    if info.bearing then
+        wantHave(y, "HDG deg", info.bearing, state and state.yaw,
+            info.differential or 0, config.get("tankRpmMax"),
+            lined and C("good") or C("hi"))
+        rowNote(y, string.format("%+.1f off", info.err or 0),
+            lined and C("good") or C("warn"))
     else
-        line(y, " HDG    no leg running", C("dim"))
+        wantHave(y, "HDG deg", nil, state and state.yaw, 0, config.get("tankRpmMax"), C("dim"))
     end
     y = y + 1
 
-    line(y, string.format(" SPD    %+6.2f %+6.2f m/s", info.want or 0, info.have or 0), C("hi"))
-    biBar(W - 14, y, 13, info.common or 0, config.get("cruiseMaxRpm"))
+    wantHave(y, "SPD m/s", info.want, info.have, info.common or 0,
+        config.get("cruiseMaxRpm"))
+    local top = cal.topForward()
+    rowNote(y, top and string.format("top %.1f", top) or "unmeasured")
     y = y + 1
 
+    -- Lift is the one row that is not a propeller demand, so its bar is the
+    -- strength itself: zero to fifteen, the whole range the balloon has.
     if info.balloon then
-        line(y, string.format(" LIFT   strength %2d of 15   %+5.1f blk",
-            info.balloon, info.altErr or 0),
-            info.balloon <= config.get("balloonFloor") and C("warn") or C("hi"))
+        local onFloor = info.balloon <= config.get("balloonFloor")
+        at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+        at(2, y, util.pad("LIFT blk", WANT_AT - 3), C("dim"), C("bg"))
+        at(WANT_AT, y, string.format("%7s",
+            info.altErr and string.format("%+.1f", info.altErr) or "by hand"),
+            onFloor and C("warn") or C("hi"), C("bg"))
+        at(HAVE_AT, y, string.format("%7s", string.format("%d/15", info.balloon)),
+            onFloor and C("warn") or C("hi"), C("bg"))
+        rowNote(y, onFloor and "on the floor" or "")
+        bar(BAR_AT, y, BAR_WIDTH, info.balloon / 15, onFloor and C("warn") or C("bar"))
     else
-        line(y, " LIFT   no relay is holding the balloon", C("bad"))
+        line(y, " LIFT  no relay is holding the balloon", C("bad"))
     end
     y = y + 1
 
-    if snap.reason then
+    if snap.reason and y <= H - 2 then
         line(y, " " .. tostring(snap.reason), C("dim")); y = y + 1
     end
 
-    if y < H - 2 then
-        rule(y, "SHIP SYSTEMS"); y = y + 1
+    -- Fuel and stress, one line each, on the tab the pilot actually watches. A
+    -- level that only appears when you go looking for it is a level nobody sees
+    -- until it is a problem.
+    if y <= H - 2 then
+        local status = reads.fuel
+        if status.link == "live" or status.link == "stale" then
+            local text = string.format(" FUEL %3d%%  %s mB",
+                math.floor(status.fraction * 100 + 0.5), comma(status.total))
+            if status.burn > 0 then
+                text = text .. "   " .. util.fmtETA(status.endurance) .. " to reserve"
+            elseif status.filling then
+                text = text .. "   filling"
+            end
+            if status.link == "stale" then text = text .. "   LINK LOST" end
+            line(y, text, status.link == "stale" and C("bad") or fuelColour(status.fraction))
+            y = y + 1
+        end
+    end
+
+    if y <= H - 2 then
+        local turbines = reads.turbines
+        if turbines.overstressed then
+            line(y, " OVERSTRESSED. The kinetic network has stopped turning.", C("bad")); y = y + 1
+        elseif turbines.link == "stale" then
+            line(y, " A TURBINE RELAY HAS STOPPED ANSWERING", C("bad")); y = y + 1
+        elseif turbines.fraction then
+            line(y, string.format(" STRESS %3d%%  %.0f su spare   %d lines on %d relays",
+                math.floor(turbines.fraction * 100 + 0.5), turbines.headroom or 0,
+                #ship.order, #(turbines.relays or {})), stressColour(turbines.fraction))
+            y = y + 1
+        end
+    end
+
+    local extras = reads.extras
+    if y <= H - 2 and (extras.altitude or extras.mass) then
         local bits = {}
         if extras.altitude then bits[#bits + 1] = string.format("ALT %.0fm", extras.altitude) end
         if extras.pressure then bits[#bits + 1] = string.format("PRESS %.0f%%", extras.pressure * 100) end
-        if extras.vspeed then bits[#bits + 1] = string.format("VS %+.2f", extras.vspeed) end
         if extras.mass then bits[#bits + 1] = string.format("MASS %.0f", extras.mass) end
-        if #bits == 0 then bits[1] = "no altimeter fitted" end
         line(y, " " .. table.concat(bits, "   "), C("dim")); y = y + 1
-
-        -- Fuel gets a line of its own on the tab the pilot actually watches. A
-        -- level that only appears when you go looking for it is a level nobody
-        -- sees until it is a problem.
-        if y <= H - 2 then
-            local status = reads.fuel
-            if status.link == "live" or status.link == "stale" then
-                local text = string.format(" FUEL %3d%%  %s mB",
-                    math.floor(status.fraction * 100 + 0.5), comma(status.total))
-                if status.burn > 0 then
-                    text = text .. "   " .. util.fmtETA(status.endurance) .. " to reserve"
-                elseif status.filling then
-                    text = text .. "   filling"
-                end
-                if status.link == "stale" then text = text .. "   LINK LOST" end
-                line(y, text, status.link == "stale" and C("bad") or fuelColour(status.fraction))
-                y = y + 1
-            end
-        end
-
-        -- And stress, on the same terms: the number that decides whether asking
-        -- for more RPM will get you any.
-        if y <= H - 2 then
-            local turbines = reads.turbines
-            if turbines.overstressed then
-                line(y, " OVERSTRESSED", C("bad")); y = y + 1
-            elseif turbines.link == "stale" then
-                line(y, " TURBINE RELAY LOST", C("bad")); y = y + 1
-            elseif turbines.fraction then
-                line(y, string.format(" STRESS %3d%%  %.0f su spare",
-                    math.floor(turbines.fraction * 100 + 0.5), turbines.headroom or 0),
-                    stressColour(turbines.fraction))
-                y = y + 1
-            end
-        end
     end
 
-    -- Whatever room is left goes to the propellers themselves, two to a row,
-    -- so the flight tab alone is enough to see a line that has stopped
-    -- answering without switching to PROPS.
-    if y < H - 2 and #ship.order > 0 then
-        rule(y, "LINES"); y = y + 1
-        local perRow = math.max(1, math.floor(W / 17))
-        local column = 0
-        for _, name in ipairs(ship.order) do
-            if y > H - 2 then break end
-            local entry = cal.sideOf(name)
-            local rpm = snap.demands and snap.demands[name] or 0
-            local text = string.format("%s%-3s %-5s %4d", ship.lines[name].main and "*" or " ",
-                util.shortName(name), entry and entry.side or "?", rpm)
-            at(1 + column * 17, y, text, entry and (rpm ~= 0 and C("good") or C("hi")) or C("warn"), C("bg"))
-            column = column + 1
-            if column >= perRow then column = 0; y = y + 1 end
-        end
-        if column > 0 then y = y + 1 end
+    while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
+end
+
+-- == TAB: MANUAL =============================================
+--
+-- Flying by hand gets a tab of its own, because the mode is then visible at a
+-- glance: it is literally which tab you are on. The alternative, a mode flag on
+-- the flight tab, is how a pilot ends up surprised by their own ship.
+--
+-- IJKL and UO, which leaves the arrow keys meaning what they mean everywhere
+-- else in this program. The letters are read only while the command line is
+-- empty, so `inventory` typed on this tab is a command and not six throttle
+-- nudges.
+
+ui.MANUAL_STEP = 0.1        -- one press of I or K, as a fraction of full
+
+-- The same fixed columns the flight tab uses, for the same reason: the keys
+-- that move a demand belong beside the demand they move, and a legend that runs
+-- under the number it explains is two readouts fighting for one column.
+local MANUAL_KEYS_AT, MANUAL_VALUE_AT = 12, 25
+
+local function manualRow(y, label, value, span, keys_, colour)
+    at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+    at(2, y, util.pad(label, MANUAL_KEYS_AT - 3), C("dim"), C("bg"))
+    at(MANUAL_KEYS_AT, y, util.pad(keys_, MANUAL_VALUE_AT - MANUAL_KEYS_AT - 1),
+        C("dim"), C("bg"))
+    at(MANUAL_VALUE_AT, y, string.format("%+6.2f", value or 0), colour or C("hi"), C("bg"))
+    biBar(W - 16, y, 15, value or 0, span)
+end
+
+local function drawManual(snap)
+    local y = 2
+    local hand = control.manual
+    local state = snap.state
+
+    rule(y, "BY HAND"); y = y + 1
+    if hand then
+        line(y, " the propellers are taking orders from this tab", C("warn"))
+    else
+        line(y, " not by hand. Any key below takes control.", C("dim"))
     end
+    y = y + 1
+
+    manualRow(y, "THROTTLE", hand and hand.throttle or 0, 1, "I up  K down",
+        hand and C("warn") or C("dim")); y = y + 1
+    manualRow(y, "YAW", hand and hand.yaw or 0, 1, "J left  L rt",
+        hand and C("warn") or C("dim")); y = y + 1
+
+    -- The balloon is not a fraction of anything, it is a strength from nothing
+    -- to fifteen, so it gets a plain bar and its own number.
+    local level = (hand and hand.level) or (snap.info and snap.info.balloon)
+    at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+    at(2, y, util.pad("BALLOON", MANUAL_KEYS_AT - 3), C("dim"), C("bg"))
+    at(MANUAL_KEYS_AT, y, util.pad("U up  O down", MANUAL_VALUE_AT - MANUAL_KEYS_AT - 1),
+        C("dim"), C("bg"))
+    at(MANUAL_VALUE_AT, y, level and string.format(" %2d/15", level) or "    --",
+        level and C("hi") or C("dim"), C("bg"))
+    if level then bar(W - 16, y, 15, level / 15, C("bar")) end
+    y = y + 1
+
+    rule(y, "WHAT THE SHIP IS DOING"); y = y + 1
+    if state then
+        line(y, string.format(" SPD %5.2f m/s  YAW %+5.1f deg/s  PITCH %+5.1f",
+            state.speed, ship.yawRate() or 0, util.pitchOf(state.orientation)), C("hi"))
+        y = y + 1
+        line(y, string.format(" X %7.1f  Y %6.1f  Z %7.1f  HDG %5.1f %s",
+            state.position.x, state.position.y, state.position.z,
+            state.yaw, util.compass(state.yaw)), C("dim"))
+        y = y + 1
+    else
+        line(y, " position unavailable: " .. tostring(snap.fault), C("bad")); y = y + 1
+        line(y, " by hand still flies with no pose. Nothing else does.", C("dim")); y = y + 1
+    end
+
+    -- The thing a pilot flying by hand most needs to know is that nothing is
+    -- watching the height for them except the loop that always runs.
+    if y <= H - 2 then
+        rule(y, "STILL AUTOMATIC"); y = y + 1
+        line(y, " the balloon holds its level. Nothing else is.",
+            C("dim")); y = y + 1
+    end
+
+    if y <= H - 2 then
+        line(y, " space, or `manual off`, hands the ship back", C("accent")); y = y + 1
+    end
+
     while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
 end
 
@@ -481,42 +615,78 @@ local function drawProps(snap, reads)
         y = y + 1
     end
 
-    rule(y, "PROPELLER LINES"); y = y + 1
+    -- Grouped by the computer that owns them, because that is the unit a
+    -- propeller goes missing in. Five lines in one list say nothing about which
+    -- relay to walk out to; the same five under two headings say it at a glance.
+    local byRelay, order = {}, {}
+    for _, name in ipairs(ship.order) do
+        local remote = ship.remoteLines[name]
+        local owner = remote and remote.relay or "wired"
+        if not byRelay[owner] then
+            byRelay[owner] = {}
+            order[#order + 1] = owner
+        end
+        local group = byRelay[owner]
+        group[#group + 1] = name
+    end
+    table.sort(order, function(a, b)
+        if a == "wired" then return true end
+        if b == "wired" then return false end
+        return a < b
+    end)
+
     if #ship.order == 0 then
+        rule(y, "PROPELLER LINES"); y = y + 1
         line(y, " nothing on the network that takes a target speed", C("bad"))
         y = y + 1
     end
+
     local maxRpm = config.get("maxRpm")
-    for index, name in ipairs(ship.order) do
+    local linkOf = {}
+    for _, one in ipairs(turbines.relays or {}) do linkOf[one.relayId] = one end
+
+    for _, owner in ipairs(order) do
         if y > H - 4 then break end
-        local line_ = ship.lines[name]
-        local entry = cal.sideOf(name)
-        local label = entry and entry.side or "unfiled"
-        local rpm = snap.demands and snap.demands[name] or 0
-        local tag = line_.main and "*" or " "
-        local colour = entry and C("hi") or C("warn")
-        at(1, y, string.rep(" ", W), C("hi"), C("bg"))
-        -- A line driven over the radio is marked, because when it stops doing
-        -- what it is told the place to look is a different computer.
-        at(1, y, string.format("%s%-4s %-6s %-3s %5d", line_.remote and "~" or tag,
-            util.shortName(name), label,
-            entry and entry.reverse and "rev" or "", rpm), colour)
-        biBar(24, y, math.max(6, W - 38), rpm, maxRpm,
-            entry and C("bar") or C("warn"))
-        local tele = ship.readLineTelemetry(name)
-        if tele then
-            local note = ""
-            if tele.overstressed then
-                note = "STRESSED"
-                at(W - 9, y, util.padLeft(note, 9), C("bad"), C("bg"))
-            elseif tele.thrust then
-                at(W - 9, y, util.padLeft(string.format("%.0fpN", tele.thrust), 9), C("dim"), C("bg"))
-            elseif tele.speed then
-                at(W - 9, y, util.padLeft(string.format("%.0frpm", tele.speed), 9), C("dim"), C("bg"))
+        if owner == "wired" then
+            rule(y, "ON THIS COMPUTER")
+        else
+            local one = linkOf[owner]
+            local note = one and one.link or "waiting"
+            if one and one.hasBalloon then note = note .. ", holds the balloon" end
+            rule(y, string.format("RELAY #%d  %s", owner, note))
+            if one and one.link == "stale" then
+                at(W - 12, y, " NOT ANSWERING", C("ink"), C("bad"))
             end
         end
         y = y + 1
-        local _ = index
+
+        for _, name in ipairs(byRelay[owner]) do
+            if y > H - 4 then break end
+            local line_ = ship.lines[name]
+            local entry = cal.sideOf(name)
+            local label = entry and entry.side or "unfiled"
+            local rpm = snap.demands and snap.demands[name] or 0
+            local colour = entry and C("hi") or C("warn")
+            at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+            -- Five columns for the name, not four: a relay id of ten or more
+            -- reads as #10.3 and the fourth column was where it overflowed.
+            at(1, y, string.format("%s%-5s %-6s %-3s %5d", line_.main and "*" or " ",
+                util.shortName(name), label,
+                entry and entry.reverse and "rev" or "", rpm), colour)
+            biBar(26, y, math.max(6, W - 40), rpm, maxRpm,
+                entry and C("bar") or C("warn"))
+            local tele = ship.readLineTelemetry(name)
+            if tele then
+                if tele.overstressed then
+                    at(W - 9, y, util.padLeft("STRESSED", 9), C("bad"), C("bg"))
+                elseif tele.thrust then
+                    at(W - 9, y, util.padLeft(string.format("%.0fpN", tele.thrust), 9), C("dim"), C("bg"))
+                elseif tele.speed then
+                    at(W - 9, y, util.padLeft(string.format("%.0frpm", tele.speed), 9), C("dim"), C("bg"))
+                end
+            end
+            y = y + 1
+        end
     end
 
     rule(y, "PROPELLER BEARINGS"); y = y + 1
@@ -604,13 +774,13 @@ local function drawCal(snap)
     for _, row in ipairs(cal.summary()) do
         if y > H - 4 then break end
         at(1, y, string.rep(" ", W), C("hi"), C("bg"))
-        -- The detail is cut to whatever the timestamp leaves, because a line
-        -- that runs under the date reads as a different sentence than it is.
-        local room = W - 13 - (row.at and (#row.at + 3) or 0)
-        at(1, y, string.format(" %d %-8s %s", row.index, row.title,
-            (row.detail or ""):sub(1, math.max(0, room))),
-            row.done and C("good") or C("warn"), C("bg"))
-        if row.at then
+        -- What the stage measured is the sentence worth reading, so it gets the
+        -- room and the timestamp gets whatever is left. It was the other way
+        -- round until stage 7, which cut the detail mid word on a 51 column
+        -- screen: the date a stage was run is the less useful of the two.
+        local text = string.format(" %d %-8s %s", row.index, row.title, row.detail or "")
+        at(1, y, text:sub(1, W - 1), row.done and C("good") or C("warn"), C("bg"))
+        if row.at and #text + #row.at + 2 <= W then
             at(W - #row.at - 1, y, row.at, C("dim"), C("bg"))
         end
         y = y + 1
@@ -650,51 +820,145 @@ local function drawCal(snap)
     end
 
     while y <= H - 3 do line(y, "", C("bg")); y = y + 1 end
-    line(H - 2, " `cal` all five stages   `cal yaw` one of them   `forget <stage>`", C("dim"))
+    line(H - 2, " `cal` all five   `cal yaw` one   `forget <stage>`", C("dim"))
     local _ = snap
 end
 
 -- == TAB: TUNE ===============================================
+--
+-- Two panels: the groups down the left, the selected group's settings filling
+-- the rest. A single row of group names worked while there were six of them and
+-- was already unreadable at fifteen, and a name in a list is a click target in a
+-- way a name in a run of words is not.
+--
+-- The last group is MEASURED, and it is not a config group. It is what
+-- calibration learned, shown here because a pilot looking for the number that
+-- decides how the ship behaves should not have to know which file it lives in.
+-- Editing one is allowed and says out loud that the next run of that stage
+-- overwrites it.
+
+local GROUP_WIDTH = 13
+
+-- The group list the tab shows, which is the config groups plus the measured
+-- one. Built here rather than added to config.GROUPS, because config holds the
+-- numbers a pilot chooses and cal holds the ones the ship was measured doing,
+-- and merging them in the model to save a line in the view would blur that.
+function ui.tuneGroups()
+    local out = {}
+    for _, group in ipairs(config.GROUPS) do out[#out + 1] = group end
+    out[#out + 1] = { id = "measured", title = "MEASURED", measured = true }
+    return out
+end
+
+-- What is in the selected group, as rows the drawing and the editing agree on.
+-- Two functions deciding separately what row three is would be the tab bar bug
+-- again, one panel down.
+function ui.tuneRows()
+    local groups = ui.tuneGroups()
+    ui.tuneGroup = util.clamp(ui.tuneGroup, 1, #groups)
+    local group = groups[ui.tuneGroup]
+    local rows = {}
+    if group.measured then
+        for _, entry in ipairs(cal.MEASURED) do
+            local value = entry.get()
+            rows[#rows + 1] = {
+                measured = true, id = entry.id, label = entry.title, entry = entry,
+                value = value,
+                text = value and string.format("%.3g", value) or "--",
+                help = entry.help,
+                note = value and ("measured by the " .. entry.stage .. " stage")
+                    or ("the " .. entry.stage .. " stage would measure this"),
+            }
+        end
+    else
+        for _, key in ipairs(config.keysIn(group.id)) do
+            local entry = config.byKey[key]
+            rows[#rows + 1] = {
+                key = key, label = key, entry = entry,
+                value = config.values[key], text = config.format(key),
+                help = entry.help, note = entry.symptom and ("when " .. entry.symptom) or nil,
+            }
+        end
+    end
+    ui.sel.tune = util.clamp(ui.sel.tune, 1, math.max(1, #rows))
+    return rows, group
+end
 
 local function drawTune()
-    local y = 2
-    local group = config.GROUPS[ui.tuneGroup]
-    local names = {}
-    for index, entry in ipairs(config.GROUPS) do
-        names[#names + 1] = (index == ui.tuneGroup and "[" .. entry.id .. "]" or entry.id)
-    end
-    line(y, " " .. table.concat(names, " "), C("dim")); y = y + 1
-    rule(y, group.title); y = y + 1
+    local rows, group = ui.tuneRows()
+    local groups = ui.tuneGroups()
 
-    local keys = config.keysIn(group.id)
-    ui.sel.tune = util.clamp(ui.sel.tune, 1, math.max(1, #keys))
-    for index, key in ipairs(keys) do
-        if y > H - 4 then break end
-        local selected = index == ui.sel.tune
-        local entry = config.byKey[key]
-        -- A boolean gets its word in colour at the bar column instead, so it
-        -- does not read as "holdAlt on on".
-        local text = string.format(" %-14s %10s", key,
-            entry.kind == "bool" and "" or config.format(key))
-        line(y, text, selected and C("ink") or C("hi"), selected and C("accent") or C("bg"))
-        if entry.kind ~= "bool" and entry.max then
-            local frac = (config.values[key] - entry.min) / math.max(1e-9, entry.max - entry.min)
-            bar(28, y, math.max(4, W - 30), frac,
-                selected and C("accent") or C("bar"), C("barBg"))
-        elseif entry.kind == "bool" then
-            at(28, y, config.values[key] and "on" or "off",
-                config.values[key] and C("good") or C("dim"),
+    -- The left panel. It scrolls with the selection rather than being cut off,
+    -- because a group you cannot see is a group you cannot click.
+    local room = H - 6
+    local first = util.clamp(ui.tuneGroup - math.floor(room / 2), 1,
+        math.max(1, #groups - room + 1))
+    ui.tuneFirstGroup = first
+    for row = 0, room - 1 do
+        local index = first + row
+        local y = 2 + row
+        local entry = groups[index]
+        if not entry then
+            at(1, y, string.rep(" ", GROUP_WIDTH), C("hi"), C("bg"))
+        else
+            local selected = index == ui.tuneGroup
+            at(1, y, util.pad(" " .. entry.title, GROUP_WIDTH),
+                selected and C("ink") or (entry.measured and C("accent") or C("dim")),
                 selected and C("accent") or C("bg"))
+        end
+    end
+
+    local x = GROUP_WIDTH + 2
+    local width = W - x + 1
+    local y = 2
+    at(x - 1, y, "|", C("panel"), C("bg"))
+    at(x, y, util.pad(group.title, width), C("ink"), C("panel")); y = y + 1
+
+    local listRoom = H - 6 - y + 1
+    local firstRow = util.clamp(ui.sel.tune - math.floor(listRoom / 2), 1,
+        math.max(1, #rows - listRoom + 1))
+    ui.tuneFirstRow = firstRow
+    ui.tuneTop = y
+    for offset = 0, listRoom - 1 do
+        local index = firstRow + offset
+        local row = rows[index]
+        if not row then
+            at(x - 1, y, "|" .. string.rep(" ", width), C("panel"), C("bg"))
+        else
+            local selected = index == ui.sel.tune
+            at(x - 1, y, "|", C("panel"), C("bg"))
+            at(x, y, util.pad(string.format(" %-16s %8s", row.label, row.text), width),
+                selected and C("ink") or (row.value == nil and C("dim") or C("hi")),
+                selected and C("accent") or C("bg"))
+            -- A bar only where there is a range to draw it against. A measured
+            -- value has no range: it is whatever the ship did.
+            local entry = row.entry
+            if not row.measured and entry.kind ~= "bool" and entry.max then
+                local frac = (row.value - entry.min) / math.max(1e-9, entry.max - entry.min)
+                bar(x + 27, y, math.max(4, W - x - 27), frac,
+                    selected and C("accent") or C("bar"), C("barBg"))
+            elseif not row.measured and entry.kind == "bool" then
+                at(x + 27, y, row.value and "on" or "off",
+                    row.value and C("good") or C("dim"),
+                    selected and C("accent") or C("bg"))
+            end
         end
         y = y + 1
     end
 
-    while y < H - 3 do line(y, "", C("bg")); y = y + 1 end
-    local key = keys[ui.sel.tune]
-    local entry = key and config.byKey[key]
-    rule(H - 3)
-    line(H - 2, entry and (" " .. entry.help) or " left/right change   [ ] group   `set <key> <v>`",
-        C("dim"))
+    -- The last three lines are the reason the tab exists. A setting's own
+    -- sentence is longer than fifty columns, so it wraps rather than being cut:
+    -- the half that runs off the edge is usually the half that said what to do.
+    -- The full description and the preview are one Enter away, in the popup.
+    local row = rows[ui.sel.tune]
+    rule(H - 5)
+    local note = row and (row.note or row.help)
+        or "up/down pick   left/right nudge   enter opens it   [ ] group"
+    local wrapped = wrapText(note, W - 2)
+    for offset = 0, 2 do
+        line(H - 4 + offset, wrapped[offset + 1] and (" " .. wrapped[offset + 1]) or "",
+            C("dim"))
+    end
 end
 
 -- == TAB: FUEL ===============================================
@@ -930,12 +1194,13 @@ local function paint(snap, reads)
     win.setVisible(false)
     clear()
     drawTabs()
-    if ui.tab == 1 then drawFlight(snap, reads)
-    elseif ui.tab == 2 then drawProps(snap, reads)
-    elseif ui.tab == 3 then drawNav(snap)
-    elseif ui.tab == 4 then drawCal(snap)
-    elseif ui.tab == 5 then drawTune()
-    elseif ui.tab == 6 then drawFuel(snap, reads)
+    if ui.tab == ui.TAB.FLIGHT then drawFlight(snap, reads)
+    elseif ui.tab == ui.TAB.MANUAL then drawManual(snap)
+    elseif ui.tab == ui.TAB.PROPS then drawProps(snap, reads)
+    elseif ui.tab == ui.TAB.NAV then drawNav(snap)
+    elseif ui.tab == ui.TAB.CAL then drawCal(snap)
+    elseif ui.tab == ui.TAB.TUNE then drawTune()
+    elseif ui.tab == ui.TAB.FUEL then drawFuel(snap, reads)
     else drawLog() end
     drawStatusBar(snap)
     drawInput()
@@ -1026,14 +1291,53 @@ local function historyStep(dir)
 end
 
 local function listStep(dir)
-    if ui.tab == 3 then
+    if ui.tab == ui.TAB.NAV then
         ui.sel.nav = util.clamp(ui.sel.nav + dir, 1, math.max(1, #nav.points))
-    elseif ui.tab == 5 then
-        local keys = config.keysIn(config.GROUPS[ui.tuneGroup].id)
-        ui.sel.tune = util.clamp(ui.sel.tune + dir, 1, math.max(1, #keys))
-    elseif ui.tab == 7 then
+    elseif ui.tab == ui.TAB.TUNE then
+        local rows = ui.tuneRows()
+        ui.sel.tune = util.clamp(ui.sel.tune + dir, 1, math.max(1, #rows))
+    elseif ui.tab == ui.TAB.LOG then
         ui.logScroll = math.max(0, ui.logScroll - dir)
     end
+end
+
+-- == FLYING BY HAND ==========================================
+--
+-- IJKL and UO, read only on the MANUAL tab and only while the command line is
+-- empty, so a command typed there is a command. Each press moves the demand by
+-- a step and hands the whole thing to control.setManual, which is the same call
+-- `manual 0.4 0 8` makes: one way into flying by hand, whether it was typed or
+-- pressed.
+local MANUAL_KEYS = {
+    i = { throttle = 1 }, k = { throttle = -1 },
+    l = { yaw = 1 }, j = { yaw = -1 },
+    u = { level = 1 }, o = { level = -1 },
+}
+
+-- Returns true when the key was a manual control and has been acted on.
+--
+-- It goes out through the command line rather than straight at control, for the
+-- same reason the NAV tab's Enter does: `manual` is gated by the preflight
+-- checker, and the moment there are two ways to take control one of them is
+-- ungated.
+function ui.handleManualKey(ch)
+    local move = MANUAL_KEYS[tostring(ch):lower()]
+    if not move then return false end
+    local hand = control.manual or { throttle = 0, yaw = 0, level = nil }
+    local step = ui.MANUAL_STEP
+    local throttle = util.clamp(hand.throttle + (move.throttle or 0) * step, -1, 1)
+    local yaw = util.clamp(hand.yaw + (move.yaw or 0) * step, -1, 1)
+    local level = hand.level
+    if move.level then
+        -- The balloon starts from whatever it is holding right now, so the first
+        -- press nudges the ship rather than jumping it to a level off a table.
+        local current = level or control.info.balloon or cal.altHover or config.get("balloonFloor")
+        level = util.clamp(util.round(current + move.level), 0, 15)
+    end
+    ui.input = string.format("manual %.2f %.2f%s", throttle, yaw,
+        level and string.format(" %d", level) or "")
+    submit()
+    return true
 end
 
 -- Which choice an event picks, or nil. Letters are matched on the char event
@@ -1094,6 +1398,87 @@ function ui.showPopup(descriptor)
     return nil
 end
 
+-- The TUNE editor. Its own loop rather than ui.showPopup's, because this modal
+-- takes keys that are not choices: arrows nudge, digits type a value exactly,
+-- and the box redraws after each so the pilot is reading the number they are
+-- about to commit to. Like every other popup it leaves ui.busy alone, so the
+-- balloon is still being flown while somebody edits altKp.
+function ui.editSetting(row)
+    if not row then return nil end
+    local typed = ""
+
+    local function describe()
+        if row.measured then
+            return popup.measured(row.entry, row.entry.get(), typed)
+        end
+        return popup.setting(row.entry, config.format(row.key),
+            flight.preview(row.key, config.values[row.key], cal, config.values), typed)
+    end
+
+    local function commit()
+        if typed == "" then return nil end
+        local ok, err
+        if row.measured then
+            ok, err = cal.setMeasured(row.id, typed)
+        else
+            ok, err = config.set(row.key, typed)
+        end
+        typed = ""
+        if not ok then
+            ui.say(tostring(err), "bad")
+            return false
+        end
+        ui.say(row.label .. " = " .. (row.measured and tostring(ok) or config.format(row.key)),
+            "good")
+        return true
+    end
+
+    ui.popup = describe()
+    pcall(ui.repaint)
+    local result = "done"
+    while true do
+        local event, p1 = os.pullEvent()
+        local finished = false
+        if event == "key" then
+            if p1 == keys.enter then
+                -- Enter with something typed commits it and stays open, so a
+                -- value can be tried against the preview before leaving.
+                if typed ~= "" then commit() else finished = true end
+            elseif p1 == keys.escape then
+                typed = ""
+                result = "cancel"
+                finished = true
+            elseif p1 == keys.backspace then
+                typed = typed:sub(1, -2)
+            elseif p1 == keys.left or p1 == keys.right then
+                if not row.measured then
+                    config.nudge(row.key, p1 == keys.right and 1 or -1)
+                end
+            end
+        elseif event == "char" then
+            local ch = tostring(p1)
+            if ch:match("[%d%.%-]") then
+                typed = typed .. ch
+            elseif typed == "" and ch:lower() == "r" and not row.measured then
+                config.reset(row.key)
+                ui.say(row.key .. " reset to " .. config.format(row.key), "good")
+            elseif typed == "" and ch:lower() == "c" then
+                result = "cancel"
+                finished = true
+            end
+        elseif event == "term_resize" or event == "monitor_resize" then
+            ui.resize()
+        end
+        if finished then break end
+        ui.popup = describe()
+        pcall(ui.repaint)
+    end
+
+    ui.popup = nil
+    pcall(ui.repaint)
+    return result
+end
+
 function ui.handleKey(key)
     if ui.popup then
         local action = popupChoice(ui.popup, "key", key)
@@ -1106,11 +1491,14 @@ function ui.handleKey(key)
         return
     end
     if key == keys.enter then
-        if ui.input == "" and ui.tab == 3 and nav.points[ui.sel.nav] then
+        if ui.input == "" and ui.tab == ui.TAB.NAV and nav.points[ui.sel.nav] then
             -- Through the command line rather than straight at nav, so a
             -- waypoint flown from the list passes the same gate one typed does.
             ui.input = "goto " .. nav.points[ui.sel.nav].name
             submit()
+        elseif ui.input == "" and ui.tab == ui.TAB.TUNE then
+            local rows = ui.tuneRows()
+            ui.editSetting(rows[ui.sel.tune])
         else
             submit()
         end
@@ -1130,12 +1518,16 @@ function ui.handleKey(key)
     end
     if key == keys.left or key == keys.right then
         local dir = key == keys.right and 1 or -1
-        if ui.tab == 5 then
-            local keys_ = config.keysIn(config.GROUPS[ui.tuneGroup].id)
-            local name = keys_[ui.sel.tune]
-            if name then
-                config.nudge(name, dir)
-                ui.say(name .. " = " .. config.format(name), "good")
+        if ui.tab == ui.TAB.TUNE then
+            local rows = ui.tuneRows()
+            local row = rows[ui.sel.tune]
+            -- A measured value has no step to nudge by: it is whatever the ship
+            -- was doing. Editing one is typing a number, which the popup does.
+            if row and not row.measured then
+                config.nudge(row.key, dir)
+                ui.say(row.key .. " = " .. config.format(row.key), "good")
+            elseif row then
+                ui.say("open it with Enter to type a measured value", "dim")
             end
         else
             ui.tab = ((ui.tab - 1 + dir) % #ui.TABS) + 1
@@ -1144,13 +1536,13 @@ function ui.handleKey(key)
     end
     if key == keys.leftBracket or key == keys.rightBracket then
         local dir = key == keys.rightBracket and 1 or -1
-        ui.tuneGroup = ((ui.tuneGroup - 1 + dir) % #config.GROUPS) + 1
+        ui.tuneGroup = ((ui.tuneGroup - 1 + dir) % #ui.tuneGroups()) + 1
         ui.sel.tune = 1
         return
     end
     if key == keys.pageUp then ui.logScroll = ui.logScroll + 5; return end
     if key == keys.pageDown then ui.logScroll = math.max(0, ui.logScroll - 5); return end
-    if key == keys.delete and ui.tab == 3 then
+    if key == keys.delete and ui.tab == ui.TAB.NAV then
         local wp = nav.points[ui.sel.nav]
         if wp then
             nav.remove(wp.name)
@@ -1158,7 +1550,7 @@ function ui.handleKey(key)
         end
         return
     end
-    -- F1..F7 pick a tab outright, which is faster than cycling when you know
+    -- F1 to F8 pick a tab outright, which is faster than cycling when you know
     -- where you are going.
     for index = 1, #ui.TABS do
         if key == keys["f" .. index] then ui.tab = index; return end
@@ -1170,6 +1562,16 @@ function ui.handleChar(ch)
         local action = popupChoice(ui.popup, "char", ch)
         if action then closePopup(ui.popup, action) end
         return
+    end
+    -- On the MANUAL tab the letters fly the ship, but only with nothing typed:
+    -- `inventory` has to still be a command there and not six throttle nudges.
+    if ui.tab == ui.TAB.MANUAL and ui.input == "" then
+        if ch == " " then
+            ui.input = "manual off"
+            submit()
+            return
+        end
+        if ui.handleManualKey(ch) then return end
     end
     ui.input = ui.input .. ch
     ui.historyAt = nil
@@ -1185,7 +1587,31 @@ function ui.handleClick(x, y)
         end
         return
     end
-    if ui.tab == 3 then
+    if ui.tab == ui.TAB.TUNE then
+        -- Two panels, two click targets. The left picks a group, the right picks
+        -- a setting, and clicking the selected setting opens its popup. The
+        -- layout comes from the same GROUP_WIDTH the drawing used, so a click
+        -- cannot land one column away from what the pilot pressed.
+        if x <= GROUP_WIDTH then
+            local index = (ui.tuneFirstGroup or 1) + (y - 2)
+            if ui.tuneGroups()[index] then
+                ui.tuneGroup = index
+                ui.sel.tune = 1
+            end
+            return
+        end
+        local index = (ui.tuneFirstRow or 1) + (y - (ui.tuneTop or 3))
+        local rows = ui.tuneRows()
+        if rows[index] then
+            if ui.sel.tune == index then
+                ui.editSetting(rows[index])
+            else
+                ui.sel.tune = index
+            end
+        end
+        return
+    end
+    if ui.tab == ui.TAB.NAV then
         -- Clicking a waypoint selects it; clicking the selected one flies there.
         local index = (ui.navFirst or 1) + (y - (ui.navTop or 3))
         if nav.points[index] then
