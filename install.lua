@@ -200,9 +200,24 @@ local function askPasscode(link)
     print("")
     print("The passcode goes on all four computers and has to be the same word")
     print("on each. It travels in the clear, so it is a name tag, not a lock.")
+    -- Blank means two different things, and which one it means depends on
+    -- whether this computer is already paired. Reinstalling is the ordinary way
+    -- a fix reaches a relay, and a reinstall that quietly unpaired the ship
+    -- because the pilot pressed Enter would be a wizard that breaks what it was
+    -- run to repair. Forgetting a passcode stays possible, by typing a new one
+    -- here or by `--passcode` on the relay itself.
+    local already = link.pass
+    local prompt = already
+        and "passcode (blank to keep the one already set): "
+        or "passcode (blank to leave this computer unpaired): "
     while true do
-        write("passcode (blank to leave this computer unpaired): ")
+        write(prompt)
         local word = read()
+        if word == "" and already then
+            print("")
+            print("Keeping the passcode this computer already had.")
+            return already
+        end
         if word == "" then
             link.clear()
             print("")

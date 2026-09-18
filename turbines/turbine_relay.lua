@@ -54,7 +54,14 @@ end
 -- == SETTINGS ================================================
 
 local PROTOCOL    = "starcatcher-turbine"  -- must match the flight computer
-local HOSTNAME    = "turbines"
+
+-- Two computers run this program, so the hostname cannot be a constant. CC's
+-- rednet.host looks the name up on the network first and errors with "Hostname
+-- in use" when somebody already answers to it, which killed whichever of the
+-- two relays booted second, at its modem, for a reason that had nothing to do
+-- with turbines. It is qualified by computer id instead, the way every line
+-- name on this ship is.
+local HOSTNAME    = "turbines" .. tostring(os.getComputerID())
 local SEND_EVERY  = 1.0     -- seconds between stress broadcasts
 local MAX_RPM     = 256     -- what a speed controller will take, either way
 local MODEM_SIDES = { "top", "bottom", "left", "right", "front", "back" }
@@ -476,8 +483,16 @@ end
 
 if modemSide then
     rednet.open(modemSide)
-    rednet.host(PROTOCOL, HOSTNAME)
-    log.infof("rednet open on %s, id %d, protocol %s", modemSide, os.getComputerID(), PROTOCOL)
+    -- Hosting is a courtesy: nothing on this ship looks a relay up by name,
+    -- every order arrives addressed or broadcast. So a refusal is reported and
+    -- the relay carries on, rather than a nicety taking the turbines down.
+    local hosted, why = pcall(rednet.host, PROTOCOL, HOSTNAME)
+    if not hosted then
+        log.warnf("rednet.host refused the name %s: %s. Orders are addressed, so this costs nothing.",
+            HOSTNAME, tostring(why))
+    end
+    log.infof("rednet open on %s, id %d, protocol %s, hostname %s",
+        modemSide, os.getComputerID(), PROTOCOL, HOSTNAME)
 else
     log.error("no modem on any side. nothing can command these turbines.")
 end

@@ -19,8 +19,8 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.9",
-    note = "stage 9: the installer pairs the ship as well as delivering it",
+    version = "0.9.1",
+    note = "stage 9: the installer pairs, and two relays no longer fight over one rednet hostname",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths
