@@ -401,6 +401,32 @@ function tests.run()
     check(status.hasBalloon == true and status.balloon == 7,
         "and says who is holding the balloon and at what")
 
+    -- What the vents report is the balloon as it is rather than as it was
+    -- asked for, and a ship with two of them fails at one of them.
+    turbine.accept(3, relayLines(3, { "Create_RotationSpeedController_0" }, {
+        hasBalloon = true, balloon = 7,
+        balloonInfo = { lift = 900, filled = 600, target = 640, change = -2.5,
+                        height = 6, capacity = 1200 },
+        vents = {
+            { name = "3:Create_SteamVent_0", short = "#3 vent 0", gas = "steam",
+              output = 0.8, signal = 7, efficiency = 1.0, active = true, hasBalloon = true },
+            { name = "3:Create_SteamVent_1", short = "#3 vent 1", gas = "steam",
+              output = 0, signal = 7, efficiency = 0.4, active = true, hasBalloon = true },
+        },
+    }))
+    local vented = turbine.status()
+    check(vented.balloonInfo and vented.balloonInfo.lift == 900,
+        "the balloon's own lift reaches the flight computer")
+    check(vented.vents and #vented.vents == 2, "both vents arrive, separately")
+
+    local coldBoiler, losing = false, false
+    for _, item in ipairs(turbine.advice(vented)) do
+        if item.text:find("vent 1") and item.text:find("40") then coldBoiler = true end
+        if item.text:find("losing") then losing = true end
+    end
+    check(coldBoiler, "a vent at 40 percent boiler heat is named, and named on its own")
+    check(losing, "a balloon losing volume is said before the altitude says it")
+
     local warned = false
     for _, item in ipairs(turbine.advice(status)) do
         if item.kind == "warn" or item.kind == "bad" then warned = true end

@@ -544,7 +544,12 @@ local function drawFlight(snap, reads)
                 onFloor and C("warn") or C("hi"), C("bg"))
             at(HAVE_AT, y, string.format("%7s", string.format("%d/15", info.balloon)),
                 onFloor and C("warn") or C("hi"), C("bg"))
-            rowNote(y, onFloor and "on the floor" or "")
+            -- The strength is what was asked for. The lift is what the vents
+            -- are actually making of it, and on the tab the pilot watches it
+            -- is worth the one column there is room for.
+            local lifted = reads.turbines.balloonInfo
+            rowNote(y, onFloor and "on the floor"
+                or (lifted and lifted.lift and string.format("lift %.0f", lifted.lift) or ""))
             bar(BAR_AT, y, BAR_WIDTH, info.balloon / 15, onFloor and C("warn") or C("bar"))
         else
             line(y, " LIFT  no relay is holding the balloon", C("bad"))
@@ -800,6 +805,52 @@ local function drawProps(snap, reads)
                         at(W - 9, y, util.padLeft(string.format("%.0frpm", tele.speed), 9), C("dim"), C("bg"))
                     end
                 end
+            end)
+        end
+    end
+
+    -- The balloon, as the vents see it rather than as the wire was set. A
+    -- strength of 15 written to a redstone relay says what was asked for; lift
+    -- and filled volume say what the ship got, and until the vents could be
+    -- read there was no way at all to tell those two apart from up here.
+    local info = turbines.balloonInfo
+    local ventList = turbines.vents or {}
+    if info or #ventList > 0 then
+        p:gap()
+        p:rule("BALLOON")
+        if info then
+            p:row(function(y)
+                at(1, y, string.format(" lift %.0f   %.0f of %.0f m3",
+                    info.lift or 0, info.filled or 0, info.capacity or 0), C("hi"), C("bg"))
+                if (info.capacity or 0) > 0 then
+                    bar(W - 10, y, 10, (info.filled or 0) / info.capacity, C("bar"), C("barBg"))
+                end
+            end)
+            p:text(string.format(" wants %.0f m3   %+.2f m3/tick   %.1f blk tall",
+                info.target or 0, info.change or 0, info.height or 0),
+                (info.change or 0) < 0 and C("warn") or C("dim"))
+        end
+        for index, vent in ipairs(ventList) do
+            if p:left() <= 2 then
+                local left = #ventList - index + 1
+                p:text(string.format(" %d more vent%s than there is room for",
+                    left, left == 1 and "" or "s"), C("dim"))
+                break
+            end
+            p:row(function(y)
+                local state, colour
+                if vent.hasBalloon == false then
+                    state, colour = "not on the balloon", C("bad")
+                elseif vent.active == false then
+                    state, colour = "no gas", C("bad")
+                else
+                    state, colour = string.format("%s %.2f/t", vent.gas or "gas",
+                        vent.output or 0), C("hi")
+                end
+                at(1, y, string.format(" %-9s %-15s boiler %3d%% sig %2d",
+                    vent.short or util.shortName(vent.name), state,
+                    math.floor((vent.efficiency or 0) * 100 + 0.5), vent.signal or 0),
+                    colour, C("bg"))
             end)
         end
     end

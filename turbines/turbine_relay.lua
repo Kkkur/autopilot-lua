@@ -7,8 +7,17 @@
 --
 -- One program, more than one computer. The ship has two of these: the turbine
 -- relay holding the four turbines and the stressometer, and the cruise relay
--- holding the main propeller and a redstone relay driving the balloon. They run
--- the same file, because two programs for one job drift apart.
+-- holding the main propeller, the redstone relay that drives the balloon and
+-- the two steam vents that fill it. They run the same file, because two
+-- programs for one job drift apart, and which of the two a computer is comes
+-- from what it finds on its own network rather than from anything typed.
+--
+-- The balloon is two vents and the strength goes to both. The redstone relay
+-- is written on every side for that reason: which sides the vents are wired to
+-- is a fact about how the ship was built, and this file is not allowed to know
+-- those. It reports what the vents say about themselves as well, because until
+-- they could be read the only thing known about the balloon up on the flight
+-- computer was the number this relay had written to a wire.
 --
 -- Two computers means two things this program has to get right that a single
 -- relay never had to:
@@ -80,10 +89,16 @@ local MODEM_SIDES = { "top", "bottom", "left", "right", "front", "back" }
 local DEADMAN     = 3.0     -- seconds without a command before thrust goes to 0
 local BALLOON_HOLDS_ON_SILENCE = true
 
--- Which side of the redstone relay the balloon is wired to. Only the cruise
--- relay has one of these; the turbine relay finds no redstone relay and every
--- balloon command it hears is not addressed to it anyway.
-local BALLOON_SIDE = "back"
+-- Every side of the redstone relay, together, because this ship has two steam
+-- vents and they are not on the same side of it. One side was the whole of the
+-- bug: the vent that was wired to it lifted and the other one sat cold, so the
+-- balloon answered a strength of 15 with half the gas it should have.
+--
+-- Every side rather than the two that happen to be used, since which sides
+-- they are is a fact about how the ship was built and this file is not allowed
+-- to know those. A side with nothing on it costs a redstone update nobody
+-- reads.
+local BALLOON_SIDES = { "top", "bottom", "left", "right", "front", "back" }
 local BALLOON_FILE = "balloon.cfg"
 
 local log = loadModule("log")
@@ -98,6 +113,7 @@ local lines = {}        -- name -> wrapped controller
 local order = {}        -- names, sorted, so line 1 is always line 1
 local stressometer = nil
 local balloonRelay = nil
+local vents = {}        -- every steam vent, separately, in peripheral name order
 local modemSide = nil
 
 local ID = os.getComputerID()
@@ -120,7 +136,7 @@ end
 -- autopilot did, keeps this working for peripherals that report more than one
 -- type and for whatever Avionics renames next.
 local function findPeripherals()
-    lines, order, stressometer, balloonRelay = {}, {}, nil, nil
+    lines, order, stressometer, balloonRelay, vents = {}, {}, nil, nil, {}
     for _, name in ipairs(peripheral.getNames()) do
         local p = peripheral.wrap(name)
         if p and p.setTargetSpeed and p.getTargetSpeed then
@@ -130,9 +146,16 @@ local function findPeripherals()
             stressometer = { name = name, p = p }
         elseif p and p.setAnalogOutput and not balloonRelay then
             balloonRelay = { name = name, p = p }
+        elseif p and p.getBalloonLift and p.getGasOutput then
+            -- Every vent, kept apart rather than summed. Two vents on one
+            -- balloon fail one at a time: a boiler that went cold under one of
+            -- them is a ship that still flies and is quietly half as strong,
+            -- and a total would hide exactly that.
+            vents[#vents + 1] = { name = name, p = p }
         end
     end
     table.sort(order)
+    table.sort(vents, function(a, b) return a.name < b.name end)
     return #order
 end
 
@@ -202,8 +225,18 @@ end
 local function driveBalloon(level)
     if not balloonRelay then return false, "no redstone relay on this computer" end
     balloonLevel = clampLevel(level)
-    local ok, err = pcall(balloonRelay.p.setAnalogOutput, BALLOON_SIDE, balloonLevel)
-    if not ok then return false, tostring(err) end
+    -- Each side is its own call and each call yields a server tick, so they go
+    -- out together. Six one after another is six ticks of the balloon at two
+    -- different strengths, which is the ship leaning while it climbs.
+    local calls, failed = {}, nil
+    for _, side in ipairs(BALLOON_SIDES) do
+        calls[#calls + 1] = function()
+            local ok, err = pcall(balloonRelay.p.setAnalogOutput, side, balloonLevel)
+            if not ok then failed = side .. ": " .. tostring(err) end
+        end
+    end
+    parallel.waitForAll(table.unpack(calls))
+    if failed then return false, failed end
     saveBalloon()
     return true
 end
@@ -287,6 +320,71 @@ local function readStress()
     stress.fraction = (stress.capacity or 0) > 0 and (stress.value / stress.capacity) or 0
 end
 
+-- == THE VENTS ===============================================
+--
+-- What the balloon is actually doing, as opposed to what strength it was told
+-- to hold. Until these peripherals existed the only thing anybody knew about
+-- the balloon was the number this relay had written to a redstone wire, and a
+-- vent whose boiler had gone cold looked exactly like one that was working.
+--
+-- Two kinds of number come off a vent and they are not the same kind. The gas
+-- figures are that vent's own: its output, its signal, its boiler. The balloon
+-- figures are the whole balloon's, reported identically by every vent attached
+-- to it, so they are read once rather than summed. Summing them would report
+-- twice the lift on a ship with two vents.
+--
+-- None of these yield, unlike setTargetAmount, so reading them every broadcast
+-- costs no server tick.
+local function ask(vent, method, ...)
+    local fn = vent.p[method]
+    if not fn then return nil end
+    local ok, value = pcall(fn, ...)
+    if not ok then return nil end
+    return value
+end
+
+-- "#3 vent 0", not "#3.0", which is what shortName would make of a peripheral
+-- called Create_SteamVent_0 and is already the name of the propeller line on
+-- that relay. Two different things on one screen under one name is the sort of
+-- confusion that gets read as a fault in the wrong part of the ship.
+local function ventName(name, index)
+    return "#" .. ID .. " vent " .. (name:match("_(%d+)$") or tostring(index - 1))
+end
+
+local function readVents()
+    local list, balloon = {}, nil
+    for index, vent in ipairs(vents) do
+        local attached = ask(vent, "hasBalloon") == true
+        list[index] = {
+            name = qualify(vent.name),
+            short = ventName(vent.name, index),
+            gas = ask(vent, "getGasType"),
+            output = ask(vent, "getGasOutput"),
+            signal = ask(vent, "getSignalStrength"),
+            target = ask(vent, "getTargetAmount"),
+            efficiency = ask(vent, "getBoilerEfficiency"),
+            active = ask(vent, "isActive"),
+            hasBalloon = attached,
+        }
+        if attached and not balloon then
+            local mix = {}
+            for _, entry in ipairs(ask(vent, "getBalloonGasMix") or {}) do
+                mix[#mix + 1] = { type = entry.type, amount = entry.amount }
+            end
+            balloon = {
+                lift = ask(vent, "getBalloonLift"),
+                filled = ask(vent, "getBalloonFilledVolume"),
+                target = ask(vent, "getBalloonTargetVolume"),
+                change = ask(vent, "getBalloonVolumeChange"),
+                height = ask(vent, "getBalloonHeight"),
+                capacity = ask(vent, "getBalloonCapacity"),
+                mix = #mix > 0 and mix or nil,
+            }
+        end
+    end
+    return list, balloon
+end
+
 -- == THE MESSAGE =============================================
 
 local function buildMessage()
@@ -302,12 +400,15 @@ local function buildMessage()
             actual = actual,
         }
     end
+    local ventList, balloonInfo = readVents()
     return {
         v = 1,
         id = ID,
         label = os.getComputerLabel(),
         balloon = balloonRelay and balloonLevel or nil,
         hasBalloon = balloonRelay ~= nil,
+        vents = #ventList > 0 and ventList or nil,
+        balloonInfo = balloonInfo,
         clock = os.clock(),
         lines = list,
         maxRpm = MAX_RPM,
@@ -431,8 +532,25 @@ local function draw()
     if balloonRelay then
         term.setTextColour(balloonLevel > 0 and colours.lightBlue or colours.orange)
         term.setCursorPos(2, y)
-        term.write(string.format("balloon %2d / 15 on %s", balloonLevel, BALLOON_SIDE))
+        term.write(string.format("balloon %2d / 15 on every side", balloonLevel))
         drawBar(math.min(W - 18, 18), y, 17, balloonLevel / 15, colours.lightBlue)
+        y = y + 1
+    end
+
+    -- One row per vent, on the computer they are wired to. A cold boiler is
+    -- read off this screen by whoever walked out here to look at it, which is
+    -- the whole reason this relay has a screen at all.
+    for index, vent in ipairs(vents) do
+        if y + 1 > H - 3 then break end
+        local efficiency = ask(vent, "getBoilerEfficiency") or 0
+        local attached = ask(vent, "hasBalloon") == true
+        local active = ask(vent, "isActive") == true
+        term.setTextColour((attached and active and efficiency > 0.9) and colours.white
+            or colours.orange)
+        term.setCursorPos(2, y)
+        term.write(string.format("%-9s %s boiler %d%%", ventName(vent.name, index),
+            attached and (active and "gas" or "off") or "no balloon",
+            math.floor(efficiency * 100 + 0.5)))
         y = y + 1
     end
 

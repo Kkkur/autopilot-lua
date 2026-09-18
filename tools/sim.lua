@@ -620,6 +620,42 @@ sim.props = {
     { line = three.lines[1], power = TANK_MAIN_POWER,  lever = 0,                side = "main" },
 }
 
+-- Two steam vents on the cruise relay, because that is what the ship has, and
+-- because one vent would never catch the arithmetic that goes wrong when the
+-- balloon figures are reported once per vent and summed by mistake.
+--
+-- The gas figures are each vent's own. The balloon figures are the balloon's,
+-- and both vents report the same ones, exactly as the mod does.
+local function ventReports(unit)
+    if not unit.balloon then return nil, nil end
+    local strength = sim.balloon
+    local capacity = 1200
+    local filled = capacity * (strength / 15)
+    local list = {}
+    for index = 1, 2 do
+        list[index] = {
+            name = unit.id .. ":Create_SteamVent_" .. (index - 1),
+            short = "#" .. unit.id .. " vent " .. (index - 1),
+            gas = "steam",
+            output = 0.8 * (strength / 15),
+            signal = strength,
+            target = 12,
+            efficiency = 1.0,
+            active = strength > 0,
+            hasBalloon = true,
+        }
+    end
+    return list, {
+        lift = filled * 1.8,
+        filled = filled,
+        target = filled,
+        change = 0,
+        height = 6.0,
+        capacity = capacity,
+        mix = { { type = "steam", amount = filled } },
+    }
+end
+
 local function turbineMessage(unit)
     local list, drawn = {}, 0
     for index, entry in ipairs(unit.lines) do
@@ -629,11 +665,14 @@ local function turbineMessage(unit)
         list[index] = { name = entry.name, short = entry.short,
                         demand = entry.demand, actual = entry.actual }
     end
+    local ventList, balloonInfo = ventReports(unit)
     return {
         v = 1, id = unit.id, label = unit.label, clock = clock,
         lines = list, maxRpm = 256,
         hasBalloon = unit.balloon == true,
         balloon = unit.balloon and sim.balloon or nil,
+        vents = ventList,
+        balloonInfo = balloonInfo,
         stress = 900 + drawn, stressCapacity = unit.capacity,
         stressFraction = (900 + drawn) / unit.capacity,
         overstressed = unit.overstressed,

@@ -369,6 +369,11 @@ function turbine.relayStatus(id)
     out.stressError = snap.stressError
     out.hasBalloon = snap.hasBalloon == true
     out.balloon = snap.balloon
+    -- What the vents say, passed through as they came. The relay reads them,
+    -- this file carries them, and the screen reads them: none of the three is
+    -- allowed to decide what a cold boiler means on the way past.
+    out.vents = snap.vents
+    out.balloonInfo = snap.balloonInfo
     -- Headroom is the number that decides whether another propeller can be
     -- asked for more, which is the question stress actually gets asked.
     if out.stress and out.capacity then
@@ -415,6 +420,8 @@ function turbine.status()
             out.hasBalloon = true
             out.balloon = one.balloon
             out.balloonRelay = id
+            out.vents = one.vents
+            out.balloonInfo = one.balloonInfo
         end
     end
 
@@ -467,6 +474,31 @@ function turbine.advice(status)
     -- redstone relay answering has no lift and nothing else says so.
     if not status.hasBalloon then
         say("bad", "no relay is holding the balloon. Nothing here controls lift.")
+    end
+
+    -- A vent at a time, because they fail at a time. Two vents on one balloon
+    -- and one cold boiler is a ship that still flies and is quietly half as
+    -- strong, which is the sort of thing that is only noticed on the climb out
+    -- of somewhere there was no room to be weak in.
+    for _, vent in ipairs(status.vents or {}) do
+        local short = vent.short or util.shortName(vent.name)
+        if vent.hasBalloon == false then
+            say("bad", "vent %s is not attached to the balloon, so it lifts nothing.", short)
+        elseif vent.active == false then
+            say("warn", "vent %s is putting out no gas. Its boiler or its signal is off.", short)
+        elseif (vent.efficiency or 1) < 0.9 then
+            say("warn", "vent %s is at %d%% boiler heat, so it lifts that much less.",
+                short, math.floor((vent.efficiency or 0) * 100 + 0.5))
+        end
+    end
+
+    -- Volume falling while the vents are being asked for lift is the balloon
+    -- leaking or the gas condensing faster than it is made, and it is the one
+    -- number that says so before the altitude does.
+    local info = status.balloonInfo
+    if info and info.change and info.change < 0 and (status.balloon or 0) > 0 then
+        say("warn", "the balloon is losing %.1f m3 a tick at strength %d.",
+            math.abs(info.change), status.balloon or 0)
     end
 
     return out
