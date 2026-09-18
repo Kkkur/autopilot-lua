@@ -661,11 +661,13 @@ local function drawManual(snap)
     p:gap(2)
     p:rule("WHAT THE SHIP IS DOING")
     if state then
-        p:text(string.format(" SPD %5.2f m/s  YAW %+5.1f deg/s  PITCH %+5.1f",
-            state.speed, ship.yawRate() or 0, util.pitchOf(state.orientation)), C("hi"))
-        p:text(string.format(" X %7.1f  Y %6.1f  Z %7.1f  HDG %5.1f %s",
-            state.position.x, state.position.y, state.position.z,
-            state.yaw, util.compass(state.yaw)), C("dim"))
+        p:text(string.format(" SPD %5.2f m/s   YAW RATE %+6.2f deg/s",
+            state.speed, ship.yawRate() or 0), C("hi"))
+        p:text(string.format(" PITCH %+6.2f   ROLL %+6.2f   HDG %6.2f %s",
+            util.pitchOf(state.orientation), util.rollOf(state.orientation),
+            state.yaw, util.compass(state.yaw)), C("hi"))
+        p:text(string.format(" X %7.1f  Y %6.1f  Z %7.1f",
+            state.position.x, state.position.y, state.position.z), C("dim"))
     else
         p:text(" position unavailable: " .. tostring(snap.fault), C("bad"))
         p:text(" by hand still flies with no pose. Nothing else does.", C("dim"))
@@ -1413,9 +1415,21 @@ local lastReads = nil
 -- them may happen inside paint: a yield between the clear and the flip hands
 -- the screen to another loop mid-frame. Both statuses are read once here
 -- rather than once per tab, which also drops a duplicate pose read per frame.
+-- The altimeter and the mass are mainThread calls and cost a server tick each,
+-- and neither of them is a number that moves between one frame and the next.
+-- So they are read on their own slow clock while everything else on the screen
+-- stays as fresh as the loop that produced it. This is what lets the screen
+-- redraw ten times a second without the screen being what slows the ship down.
+local lastExtras, lastExtrasAt = nil, nil
+
 local function readInstruments()
+    local now = os.clock()
+    if not lastExtras or (now - (lastExtrasAt or 0)) >= config.get("uiExtrasTick") then
+        lastExtras = ship.readExtras()
+        lastExtrasAt = now
+    end
     return {
-        extras = ship.readExtras(),
+        extras = lastExtras or {},
         fuel = fuel.status(),
         turbines = turbine.status(),
     }
@@ -1910,8 +1924,14 @@ function ui.makeWizard(title)
         -- on, whether the reading has stopped moving and whether the ship is
         -- moving at all, and how long they have been watching it.
         if fields.value then
-            line(y, string.format(" %-6s %+7.2f %-5s  trend %+6.3f",
-                fields.valueLabel or "value", fields.value, fields.unit or "",
+            -- Three decimals under one unit and two above it. The bottom rung
+            -- of a yaw ladder on a heavy hull is a fraction of a degree a
+            -- second, and rounded to two places it reads as nothing at all.
+            local shown = math.abs(fields.value) < 1
+                and string.format("%+7.3f", fields.value)
+                or string.format("%+7.2f", fields.value)
+            line(y, string.format(" %-6s %s %-5s  trend %+6.3f",
+                fields.valueLabel or "value", shown, fields.unit or "",
                 fields.slope or 0),
                 fields.phase == "cooldown" and C("warn") or C("hi")); y = y + 1
 

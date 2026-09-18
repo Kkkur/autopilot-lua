@@ -182,9 +182,9 @@ config.SCHEMA = {
       symptom = "a long slow leg ends with the throttle wound up to nothing useful" },
 
     -- == THE LOOP ============================================
-    { key = "tick",          group = "loop",   kind = "number", def = 0.2,  min = 0.05, max = 2.0, step = 0.05,
-      help = "Control loop period, seconds. 0.05 is one server tick.",
-      symptom = "the server is struggling, or the ship reacts a beat late" },
+    { key = "tick",          group = "loop",   kind = "number", def = 0.1,  min = 0.05, max = 2.0, step = 0.05,
+      help = "Control loop period, seconds. 0.05 is one server tick. Every number on the screen is as fresh as this, because the pose the screen draws is the one this loop read.",
+      symptom = "the server is struggling, or the readouts lag behind the ship" },
 
     -- == CALIBRATION =========================================
     -- The five stage wizard measures the ship with these. They are the only
@@ -192,15 +192,18 @@ config.SCHEMA = {
     { key = "calRpm",        group = "cal",    kind = "int",    def = 128,  min = 16,  max = 256, step = 16,
       help = "RPM one line spins at while the wizard reads which side it is on.",
       symptom = "the sides stage cannot tell which way a line pushes" },
-    { key = "calSample",     group = "cal",    kind = "number", def = 0.3,  min = 0.05, max = 2, step = 0.05,
+    { key = "calSample",     group = "cal",    kind = "number", def = 0.15, min = 0.05, max = 2, step = 0.05,
       help = "Seconds between live readings while the wizard watches the ship. Also how long a reading is averaged over before it is kept.",
       symptom = "the wizard's live row moves too fast or too slowly to read" },
     { key = "calMinDrift",   group = "cal",    kind = "number", def = 0.15, min = 0.01, max = 5, step = 0.05,
       help = "Speed below this reads as noise rather than as thrust.",
       symptom = "a line that does nothing is filed as though it pushed" },
     { key = "calMinYaw",     group = "cal",    kind = "number", def = 1.0,  min = 0.05, max = 30, step = 0.25,
-      help = "Yaw below this reads as a line on neither side, which is the main.",
+      help = "Yaw below this reads as a line on neither side, which is the main. It is the sides stage's question and nothing else's.",
       symptom = "the main is filed as a side, or a side as the main" },
+    { key = "calYawFloor",   group = "cal",    kind = "number", def = 0.01, min = 0.001, max = 5, step = 0.01,
+      help = "Yaw rate the ladder counts as the hull not turning at all, deg/s. Far under calMinYaw on purpose: the bottom rung of a heavy ship turns it slowly, and slowly is the reading, not a failure.",
+      symptom = "the low rungs of the yaw ladder are thrown away as no reading" },
     { key = "calSteps",      group = "cal",    kind = "int",    def = 4,    min = 2,   max = 16,  step = 1,
       help = "Rungs in the yaw and forward ladders.",
       symptom = "the curves are too coarse to follow the ship's real shape" },
@@ -284,9 +287,12 @@ config.SCHEMA = {
       symptom = "the computer is out of space, and nothing can be installed on it" },
 
     -- == SCREEN ==============================================
-    { key = "uiTick",        group = "ui",     kind = "number", def = 0.25, min = 0.05, max = 2, step = 0.05,
-      help = "Screen refresh period, seconds.",
-      symptom = "the screen feels sluggish, or the server is struggling" },
+    { key = "uiTick",        group = "ui",     kind = "number", def = 0.1,  min = 0.05, max = 2, step = 0.05,
+      help = "Screen refresh period, seconds. Redrawing costs no server tick, so this can sit under the control loop without loading anything.",
+      symptom = "the screen feels sluggish, or this computer is using too much CPU" },
+    { key = "uiExtrasTick",  group = "ui",     kind = "number", def = 1.0,  min = 0.1, max = 30, step = 0.1,
+      help = "Seconds between reads of the altimeter and the mass. These are mainThread calls and they cost a server tick each, so they are read on their own slow clock rather than once a frame.",
+      symptom = "altitude and mass are stale, or the screen is costing server ticks" },
     { key = "logLevel",      group = "ui",     kind = "int",    def = 2,    min = 0,   max = 3,   step = 1,
       help = "0 errors, 1 warnings, 2 info, 3 everything.",
       symptom = "the log is noise, or it is missing the thing you are chasing" },

@@ -545,6 +545,17 @@ local function pitchNow()
     return state and util.pitchOf(state.orientation) or nil
 end
 
+-- A number written at the precision it was measured to. The top of a yaw
+-- ladder is tens of degrees a second and the bottom of one on a heavy hull is
+-- hundredths, and one format cannot say both: %.1f turns the bottom rung into
+-- "0.0 deg/s", which reads as a rung that did nothing.
+local function fine(value)
+    local size = math.abs(value or 0)
+    if size < 1 then return string.format("%.3f", value or 0) end
+    if size < 10 then return string.format("%.2f", value or 0) end
+    return string.format("%.1f", value or 0)
+end
+
 local function stressNow()
     if not turbine or not turbine.status then return nil end
     local ok, status = pcall(turbine.status)
@@ -909,7 +920,7 @@ local function stageBalloon(ctx)
         table.sort(samples, function(a, b) return a.rpm < b.rpm end)
         cal.balloonCurve = samples
         cal.save()
-        ctx.note(string.format("strength %2d -> %+.2f m/s%s", level, climb,
+        ctx.note(string.format("strength %2d -> %s m/s%s", level, fine(climb),
             reason and (" (" .. reason .. ")") or ""), reason and "warn" or "good")
         log.infof("cal: balloon level=%d climb=%.3f %s", level, climb, reason or "settled")
         return climb
@@ -1003,7 +1014,11 @@ local function stageYaw(ctx)
                 read = ship.yawRate,
                 stable = config.get("calYawStable"),
                 wantSign = sign,
-                floor = config.get("calMinYaw"),
+                -- Not calMinYaw. That number answers the sides stage's
+                -- question, whether a line swings the nose enough to be on a
+                -- side at all, and at one degree a second it would throw away
+                -- the bottom half of a heavy ship's ladder as no reading.
+                floor = config.get("calYawFloor"),
                 live = function(live)
                     live.rungIndex = index
                     live.rungTotal = total
@@ -1021,7 +1036,8 @@ local function stageYaw(ctx)
             -- mixer will later ask the ship for and not get.
             if rate and not reason then
                 samples[#samples + 1] = { rpm = diff, speed = math.abs(rate) }
-                ctx.note(string.format("%+4d rpm -> %.1f deg/s", diff * sign, math.abs(rate)), "good")
+                ctx.note(string.format("%+4d rpm -> %s deg/s", diff * sign,
+                    fine(math.abs(rate))), "good")
                 log.infof("cal: yaw way=%s rpm=%d rate=%.2f %s", way, diff, rate, reason or "settled")
                 -- The stress of a full turn is read at the top rung, while the
                 -- ship is actually doing it. Read after the stop and it is the
@@ -1095,7 +1111,8 @@ local function stageForward(ctx)
             if ctx.aborted() then break end
             if speed and not reason then
                 samples[#samples + 1] = { rpm = rpm, speed = math.abs(speed) }
-                ctx.note(string.format("%+4d rpm -> %.2f m/s", rpm * sign, math.abs(speed)), "good")
+                ctx.note(string.format("%+4d rpm -> %s m/s", rpm * sign,
+                    fine(math.abs(speed))), "good")
                 log.infof("cal: forward way=%s rpm=%d speed=%.3f %s", way, rpm, speed,
                     reason or "settled")
                 if rpm == ladder[#ladder] then

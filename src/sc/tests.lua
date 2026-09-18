@@ -335,6 +335,12 @@ function tests.run()
         return message
     end
 
+    -- Roll is read off the body +X axis, so a hull rolled a quarter turn about
+    -- its own forward axis puts that axis straight down.
+    local rollQ = { x = 0, y = 0, z = math.sqrt(0.5), w = math.sqrt(0.5) }
+    near(math.abs(util.rollOf(rollQ)), 90, "a quarter turn about forward is 90 degrees of roll", 1e-3)
+    near(util.rollOf({ x = 0, y = 0, z = 0, w = 1 }), 0, "and level is no roll")
+
     check(util.shortName("2:Create_RotationSpeedController_3") == "#2.3",
         "a relay line reads as its relay and its number")
     check(util.shortName("Create_RotationSpeedController_3") == "#3",

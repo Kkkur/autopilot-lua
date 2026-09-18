@@ -115,6 +115,19 @@ function util.pitchOf(q)
     return math.deg(math.asin(util.clamp(fy, -1, 1)))
 end
 
+-- Roll, read off the body +X axis the same way the other two are read off +Z,
+-- in degrees. Positive means that side of the hull is down.
+--
+-- Which side of the ship +X is depends on how it was built, so this is signed
+-- information and not an instruction: it is here because a hull that is
+-- leaning says so here before it says so by sliding, and nothing in the
+-- control loop reads it. Naming the side rather than saying "right" is the
+-- honest version, since this file has no way to know which is which.
+function util.rollOf(q)
+    local _, ry, _ = util.bodyToWorld(q, 1, 0, 0)
+    return math.deg(math.asin(util.clamp(-ry, -1, 1)))
+end
+
 -- For the screen when a peripheral shape is not understood, so the keys can be
 -- read off rather than guessed at.
 function util.keyList(t)

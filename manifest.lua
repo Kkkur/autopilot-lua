@@ -19,8 +19,8 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.9.9",
-    note = "stage 9: nothing is calibrated on the ground",
+    version = "0.10.0",
+    note = "stage 9: the readouts keep up, and a slow turn is still a turn",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths
