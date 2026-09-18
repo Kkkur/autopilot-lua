@@ -12,10 +12,15 @@
 --
 -- The version is recorded by the installer so a computer can say when it is
 -- behind. Bump it whenever the set of files changes or the program does.
+--
+-- Each role also names where its copy of `sc/link.lua` landed. The installer
+-- pairs the ship through the module it has just installed rather than carrying
+-- a second copy of the `link.cfg` format, and the path is not the same on a
+-- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.8",
-    note = "stage 8: the screen rebuilt, and a passcode on every message",
+    version = "0.9",
+    note = "stage 9: the installer pairs the ship as well as delivering it",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths
@@ -23,6 +28,7 @@ return {
         command = {
             title = "flight computer",
             data = "starcatcher",
+            link = "src/sc/link.lua",
             files = {
                 { "startup.lua", "startup.lua" },
                 { "src/starcatcher.lua", "src/starcatcher.lua" },
@@ -49,6 +55,7 @@ return {
         fuel = {
             title = "fuel relay",
             data = "fuelrelay",
+            link = "sc/link.lua",
             files = {
                 { "relay/startup.lua", "startup.lua" },
                 { "relay/fuel_relay.lua", "fuel_relay.lua" },
@@ -66,6 +73,7 @@ return {
         turbine = {
             title = "turbine relay",
             data = "turbinerelay",
+            link = "sc/link.lua",
             files = {
                 { "turbines/startup.lua", "startup.lua" },
                 { "turbines/turbine_relay.lua", "turbine_relay.lua" },
@@ -77,6 +85,7 @@ return {
         cruise = {
             title = "cruise relay",
             data = "turbinerelay",
+            link = "sc/link.lua",
             files = {
                 { "turbines/startup.lua", "startup.lua" },
                 { "turbines/turbine_relay.lua", "turbine_relay.lua" },
