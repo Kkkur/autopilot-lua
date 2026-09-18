@@ -105,10 +105,10 @@ end
 
 -- == WHICH COMPUTER IS THIS ==================================
 --
--- Each computer picks its own role, out of what it can see. A relay is self
--- describing and the flight computer is the one holding the instrument that
--- reads the ship's pose, so none of this has to be remembered by whoever is
--- standing at the keyboard.
+-- Each computer picks its own role, out of what is bolted to it. A relay is
+-- self describing: the tanks, the speed controllers and the redstone relay each
+-- say what that computer is for, so none of it has to be remembered by whoever
+-- is standing at the keyboard.
 local function look()
     local found = { controllers = 0 }
     for _, name in ipairs(peripheral.getNames()) do
@@ -130,20 +130,32 @@ local function look()
     return found
 end
 
+-- Asked hardest question first, and the flight computer last, because it is the
+-- only role with no positive test. It is defined by what it does not have: it
+-- owns nothing that spins.
+--
+-- The first version asked about CC: Sable third and got this wrong on every
+-- ship. `sublevel` is a global API and not a peripheral, so it is on every
+-- computer the mod is loaded on, and the turbine relay was told it was the
+-- flight computer while its own screen listed the speed controllers that prove
+-- it is not.
 local function guess(found)
     -- The redstone relay first, because that is the same test the relay program
     -- itself uses to decide it is the one holding the balloon. Two answers to
     -- one question is how they end up disagreeing.
     if found.redstone then return "cruise" end
     if found.tanks then return "fuel" end
-    if found.sublevel then return "command" end
     if found.controllers > 0 then return "turbine" end
+    if found.modem or found.sublevel then return "command" end
     return nil
 end
 
 local function describe(found)
     local parts = {}
-    if found.sublevel then parts[#parts + 1] = "CC: Sable" end
+    -- Said because its absence is worth knowing, not because it tells the
+    -- roles apart. It is a global API and every computer on a ship with the mod
+    -- loaded has it.
+    if found.sublevel then parts[#parts + 1] = "the CC: Sable API" end
     if found.controllers > 0 then
         parts[#parts + 1] = found.controllers .. " speed controller(s)"
     end
