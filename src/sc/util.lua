@@ -75,6 +75,63 @@ function util.wrapAngle(a)
     return a - 180
 end
 
+-- The average of a set of headings, which is not the average of a set of
+-- numbers. Two readings either side of north, 179 and -179, are two degrees
+-- apart and average to zero, which is due south. So they are averaged as
+-- directions and read back as an angle.
+--
+-- Returns nil for an empty set, and for a set that cancels out entirely, which
+-- is a genuine answer: four readings 90 degrees apart have no mean heading and
+-- saying zero would be a lie.
+function util.meanAngle(list)
+    local sx, sz, count = 0, 0, 0
+    for _, a in ipairs(list or {}) do
+        if type(a) == "number" then
+            local r = math.rad(a)
+            sx, sz = sx + math.sin(r), sz + math.cos(r)
+            count = count + 1
+        end
+    end
+    if count == 0 then return nil end
+    if math.abs(sx) < 1e-9 and math.abs(sz) < 1e-9 then return nil end
+    return util.wrapAngle(math.deg(math.atan2(sx, sz)))
+end
+
+-- How far the widest of those readings sits from their mean. A small spread is
+-- a set of readings that agree; a large one is a set whose mean is arithmetic
+-- rather than meaningful, and the wizard says so rather than writing it down.
+function util.angleSpread(list, mean)
+    mean = mean or util.meanAngle(list)
+    if not mean then return nil end
+    local worst = 0
+    for _, a in ipairs(list or {}) do
+        if type(a) == "number" then
+            local off = math.abs(util.wrapAngle(a - mean))
+            if off > worst then worst = off end
+        end
+    end
+    return worst
+end
+
+-- A heading the pilot typed, in the convention the F3 screen uses: -180 to 180,
+-- south is zero. 270 is accepted and wrapped, because a pilot who types what a
+-- compass mod told them should not have their reading thrown away.
+--
+-- Returns nil and a reason, in the words of what was typed, rather than a
+-- silent zero. A heading of zero is due south and is a perfectly ordinary
+-- answer, so it cannot double as the failure.
+function util.parseHeading(text)
+    if type(text) ~= "string" then return nil, "nothing was typed" end
+    local trimmed = text:match("^%s*(.-)%s*$")
+    if trimmed == "" then return nil, "nothing was typed" end
+    local value = tonumber(trimmed)
+    if not value then return nil, string.format("%q is not a number of degrees", trimmed) end
+    if value < -360 or value > 360 then
+        return nil, string.format("%s is not a heading. F3 reads between -180 and 180.", trimmed)
+    end
+    return util.wrapAngle(value)
+end
+
 function util.clamp(v, lo, hi)
     if v < lo then return lo end
     if v > hi then return hi end

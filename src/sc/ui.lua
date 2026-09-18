@@ -463,6 +463,21 @@ local function rowNote(y, text, colour)
         BAR_AT - NOTE_AT - 1), colour or C("dim"), C("bg"))
 end
 
+-- The heading a pilot can check against the sky. The pose answers for the
+-- hull's own +Z axis, and on a ship built by hand that axis is not the end the
+-- crew calls the front: the align stage measures the difference and this is
+-- where it is spent.
+--
+-- Every error in the program is still worked out in the pose's frame. That is
+-- why the hull heading stays on the screen beside this one, and why the row
+-- the controller draws its want and have in is labelled for the hull rather
+-- than for the front. Two frames on one screen is fine. Two frames in one row,
+-- labelled the same, is the bug this whole stage exists to catch.
+local function frontHeading(yaw)
+    if yaw == nil then return nil end
+    return util.wrapAngle(yaw + (cal.frontOffset or 0))
+end
+
 local function drawFlight(snap, reads)
     local p = pane()
     local state = snap.state
@@ -473,10 +488,14 @@ local function drawFlight(snap, reads)
     if state then
         local pos = state.position
         p:text(string.format(" X %8.1f  Y %7.1f  Z %8.1f   %s", pos.x, pos.y, pos.z,
-            util.compass(state.yaw)), C("hi"))
+            util.compass(frontHeading(state.yaw))), C("hi"))
         p:text(string.format(" HDG %5.1f  SPD %5.2f m/s  VS %+5.2f  PITCH %+5.1f",
-            state.yaw, state.speed, state.velocity.y, util.pitchOf(state.orientation)),
-            C("dim"))
+            frontHeading(state.yaw), state.speed, state.velocity.y,
+            util.pitchOf(state.orientation)), C("dim"))
+        if cal.frontOffset and math.abs(cal.frontOffset) >= 0.05 then
+            p:text(string.format(" front sits %+.1f off the hull, which points %5.1f",
+                cal.frontOffset, state.yaw), C("dim"))
+        end
     else
         p:text(" position unavailable: " .. tostring(snap.fault), C("bad"))
         p:text(" nothing below this line is being flown", C("dim"))
@@ -514,13 +533,13 @@ local function drawFlight(snap, reads)
     local lined = math.abs(info.err or 0) <= config.get("tankPadding")
     p:row(function(y)
         if info.bearing then
-            wantHave(y, "HDG deg", info.bearing, state and state.yaw,
+            wantHave(y, "HULL deg", info.bearing, state and state.yaw,
                 info.differential or 0, config.get("tankRpmMax"),
                 lined and C("good") or C("hi"))
             rowNote(y, string.format("%+.1f off", info.err or 0),
                 lined and C("good") or C("warn"))
         else
-            wantHave(y, "HDG deg", nil, state and state.yaw, 0,
+            wantHave(y, "HULL deg", nil, state and state.yaw, 0,
                 config.get("tankRpmMax"), C("dim"))
         end
     end)
@@ -665,7 +684,10 @@ local function drawManual(snap)
             state.speed, ship.yawRate() or 0), C("hi"))
         p:text(string.format(" PITCH %+6.2f   ROLL %+6.2f   HDG %6.2f %s",
             util.pitchOf(state.orientation), util.rollOf(state.orientation),
-            state.yaw, util.compass(state.yaw)), C("hi"))
+            frontHeading(state.yaw), util.compass(frontHeading(state.yaw))), C("hi"))
+        if cal.frontOffset and math.abs(cal.frontOffset) >= 0.05 then
+            p:text(string.format(" the hull itself points %6.2f", state.yaw), C("dim"))
+        end
         p:text(string.format(" X %7.1f  Y %6.1f  Z %7.1f",
             state.position.x, state.position.y, state.position.z), C("dim"))
     else
@@ -1002,7 +1024,7 @@ local function drawCal(snap)
     end
 
     p:place()
-    line(H - 2, " `cal` all five   `cal yaw` one   `forget <stage>`", C("dim"))
+    line(H - 2, " `cal` all seven   `cal yaw` one   `forget <stage>`", C("dim"))
     local _ = snap
 end
 
@@ -1961,6 +1983,18 @@ function ui.makeWizard(title)
                 fields.guess and ("   looks like the " .. fields.guess) or ""),
                 C("accent")); y = y + 1
         end
+        -- The align stage holds a heading rather than a rung, so what it draws
+        -- is where the ship was sent and where it actually is.
+        if fields.wanted then
+            line(y, string.format(" wanted %+7.1f deg   hull %+7.1f   %s",
+                fields.wanted, fields.pose or 0, util.compass(fields.pose or 0)),
+                C("accent")); y = y + 1
+        end
+        if fields.course then
+            line(y, string.format(" course %+7.1f deg   hull %+7.1f   %s",
+                fields.course, fields.pose or 0, util.compass(fields.course)),
+                C("accent")); y = y + 1
+        end
         if fields.drift then
             local d = fields.drift
             line(y, string.format(" drift  %+6.2f %+6.2f %+6.2f", d[1], d[2], d[3]),
@@ -2022,6 +2056,11 @@ function ui.makeWizard(title)
 
     ctx.aborted = function() return abort end
 
+    -- A stage that reads its own keys, because it is holding a turn while it
+    -- waits, still has to be able to stop the whole run the way every other
+    -- stage's q does.
+    ctx.stop = function() abort = true end
+
     -- Blocks until Enter. Enter is the stop key on purpose: a letter would
     -- leave its char event queued and type itself into the answer that follows.
     ctx.waitEnter = function()
@@ -2058,6 +2097,49 @@ function ui.makeWizard(title)
         if answer:lower() == "q" then abort = true end
         if answer == "" and opts.default then return opts.default end
         return answer
+    end
+
+    -- The wizard asks with the same popups the rest of the program uses. The
+    -- descriptor comes from sc/popup.lua and the box is the same one drawn over
+    -- the tabs. What is not reused is ui.showPopup's loop: that repaints the
+    -- tab screen underneath, which would take the wizard's own screen away from
+    -- it mid question.
+    --
+    -- There is no rule broken by a modal here. The control loop is parked for
+    -- the whole wizard already, which is the one place in the program where
+    -- that is true, and it is parked because the wizard has its hands on the
+    -- propellers rather than because a box is on the screen.
+    ctx.choose = function(descriptor)
+        local function paintOver()
+            render()
+            win.setVisible(false)
+            drawPopup(descriptor)
+            win.setVisible(true)
+        end
+        paintOver()
+        telemetry.event("popup", "the wizard asked: " .. descriptor.title,
+            descriptor.severity)
+        while true do
+            local event, p1 = os.pullEvent()
+            if event == "term_resize" or event == "monitor_resize" then
+                ui.resize()
+                paintOver()
+            else
+                local action = popupChoice(descriptor, event, p1)
+                if action then
+                    telemetry.event("popup", "answered: " .. descriptor.title, action)
+                    render()
+                    return action
+                end
+                -- q stops the wizard from inside a question as well, because a
+                -- pilot who wants out should not have to answer first.
+                if event == "key" and p1 == keys.q then
+                    abort = true
+                    render()
+                    return nil
+                end
+            end
+        end
     end
 
     ctx.yesno = function(question, default)

@@ -1,4 +1,4 @@
--- cal.lua -- the five stage wizard, and the file it writes.
+-- cal.lua -- the seven stage wizard, and the file it writes.
 --
 -- Calibration is how the program learns the ship. Nothing about this vessel is
 -- written into the code: which propeller is on which side, how fast a
@@ -7,7 +7,7 @@
 -- sc/flight.lua. The shape of what gets written down is described at the top of
 -- that file, because that is the file that has to understand it.
 --
--- Five stages, in a fixed order, each confirmed before it runs and each
+-- Seven stages, in a fixed order, each confirmed before it runs and each
 -- skippable, so redoing the brake ladder does not throw away the rest. The
 -- order is not a preference. The movement stages need a held altitude to
 -- measure against, so the balloon is learned before anything that moves
@@ -18,7 +18,12 @@
 --            yaw each side is worth, and where the nose actually points
 --   balloon  redstone strength against climb rate, and the strength that holds
 --   yaw      differential RPM against yaw rate, and what a full turn costs
+--   align    turns to each point of the compass and asks the pilot which way
+--            the ship is really pointing, which is the one thing here that no
+--            sensor on the network can answer
 --   forward  common RPM against settled speed, and what full cruise costs
+--   cruise   flies a leg and measures the course it made against the heading
+--            it held, which is the nose offset measured properly
 --   brake    reverse RPM against deceleration and worst pitch, main then all
 --
 -- A finished run also records the inventory it saw: which relays answered and
@@ -39,7 +44,7 @@
 -- pilot is standing there watching the ship, and is the only thing in the
 -- room that can tell a settled reading from one that has not started.
 
-local util, ship, config, log, flight, turbine = ...
+local util, ship, config, log, flight, turbine, popup = ...
 
 local cal = {}
 
@@ -47,6 +52,10 @@ cal.FILE = nil
 
 cal.sides = {}        -- line name -> { side = "left"|"right"|"main"|"none", reverse }
 cal.noseOffset = nil  -- degrees between the hull's +Z and where the main pushes
+cal.frontOffset = nil -- degrees between the hull's +Z and the end the crew calls the front
+cal.alignSpread = nil -- how far the worst of the rose's readings sat from their mean
+cal.alignPoints = nil -- { { want, pose, seen }, ... }, the rose as the pilot read it
+cal.frontConfirmed = nil -- the pilot has looked at the ship and said the front is the front
 cal.yawAuth = {}      -- { left, right }, deg/s per RPM
 cal.yawCurve = nil    -- { pos, neg }, differential RPM against yaw rate
 cal.fwdCurve = nil    -- { pos, neg }, common RPM against settled speed
@@ -77,9 +86,21 @@ cal.STAGES = {
         room = "Off the ground, with room to spin on the spot both ways.",
     },
     {
+        id = "align", title = "ALIGN", meta = "alignAt",
+        what = "Turns to each of the eight points of the compass and asks you what the ship is really pointing at.",
+        room = "Off the ground, with room to spin on the spot, and a view of the sky. You will be reading degrees off F3.",
+    },
+    {
         id = "forward", title = "FORWARD", meta = "forwardAt",
         what = "Runs the ship up at each throttle step and writes down the speed it settles at.",
         room = "Off the ground, with a long run ahead and behind. This is the stage that covers ground.",
+    },
+    {
+        -- The title is the width of the CAL tab's column and no wider. What
+        -- the stage does is the sentence under it.
+        id = "cruise", title = "CRUISE", meta = "cruiseAt",
+        what = "Flies a leg north and measures the course it actually made against the heading it held.",
+        room = "Off the ground, with a long clear run to the north. The longer the leg the better the reading.",
     },
     {
         id = "brake", title = "BRAKING", meta = "brakeAt",
@@ -121,6 +142,26 @@ function cal.parseSides(data)
         end
     end
     return sides
+end
+
+-- The rose as the pilot read it. Kept whole rather than reduced to its mean,
+-- because the eight numbers are the evidence for the one: a pilot looking at
+-- the CAL tab and wondering why the front offset is what it is can see which
+-- point disagreed with the rest.
+function cal.parsePoints(data)
+    if type(data) ~= "table" then return nil end
+    local out = {}
+    for _, entry in ipairs(data) do
+        if type(entry) == "table" and tonumber(entry.pose) and tonumber(entry.seen) then
+            out[#out + 1] = {
+                want = tonumber(entry.want),
+                pose = tonumber(entry.pose),
+                seen = tonumber(entry.seen),
+            }
+        end
+    end
+    if #out == 0 then return nil end
+    return out
 end
 
 -- A pair of ladders, the shape util's curve family reads.
@@ -180,6 +221,8 @@ function cal.load()
     cal.noseOffset, cal.yawCurve, cal.fwdCurve, cal.brakeCurve = nil, nil, nil, nil
     cal.balloonCurve, cal.altHover, cal.inventory = nil, nil, nil
     cal.stressAtTurn, cal.stressAtCruise = nil, nil
+    cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
+    cal.frontConfirmed = nil
 
     if not cal.FILE or not fs.exists(cal.FILE) then return false end
     local handle = fs.open(cal.FILE, "r")
@@ -190,6 +233,10 @@ function cal.load()
 
     cal.sides = cal.parseSides(data.sides)
     cal.noseOffset = tonumber(data.noseOffset)
+    cal.frontOffset = tonumber(data.frontOffset)
+    cal.alignSpread = tonumber(data.alignSpread)
+    cal.alignPoints = cal.parsePoints(data.alignPoints)
+    cal.frontConfirmed = data.frontConfirmed == true
     if type(data.yawAuth) == "table" then
         cal.yawAuth = { left = tonumber(data.yawAuth.left),
                         right = tonumber(data.yawAuth.right) }
@@ -217,6 +264,8 @@ function cal.save()
     end
     handle.write(textutils.serialize({
         sides = cal.sides, noseOffset = cal.noseOffset, yawAuth = cal.yawAuth,
+        frontOffset = cal.frontOffset, alignSpread = cal.alignSpread,
+        alignPoints = cal.alignPoints, frontConfirmed = cal.frontConfirmed,
         yawCurve = cal.yawCurve, fwdCurve = cal.fwdCurve,
         brakeCurve = cal.brakeCurve, balloonCurve = cal.balloonCurve,
         altHover = cal.altHover, inventory = cal.inventory,
@@ -361,6 +410,10 @@ cal.MEASURED = {
       help = "Degrees between where the hull points and where the main propeller pushes.",
       get = function() return cal.noseOffset end,
       set = function(v) cal.noseOffset = v end },
+    { id = "frontOffset", title = "front offset", unit = "deg", stage = "align",
+      help = "Degrees between where the hull points and the end of it the crew calls the front. The screens read in this; the maths does not.",
+      get = function() return cal.frontOffset end,
+      set = function(v) cal.frontOffset = v end },
     { id = "altHover", title = "hover level", unit = "strength 0 to 15", stage = "balloon",
       help = "The redstone strength that came nearest to holding this ship's height.",
       get = function() return cal.altHover end,
@@ -534,6 +587,19 @@ function cal.summary()
             if row.done then
                 row.detail = string.format("top %.2f m/s%s", cal.topForward() or 0,
                     cal.stressAtCruise and string.format(", %.0f su", cal.stressAtCruise) or "")
+            end
+        elseif stage.id == "align" then
+            row.done = cal.frontOffset ~= nil
+            if row.done then
+                row.detail = string.format("front %+.1f deg%s%s", cal.frontOffset,
+                    cal.alignSpread and string.format(", spread %.0f", cal.alignSpread) or "",
+                    cal.frontConfirmed and ", confirmed" or "")
+            end
+        elseif stage.id == "cruise" then
+            row.done = cal.meta.cruiseAt ~= nil
+            if row.done then
+                row.detail = string.format("nose %+.1f, front %s", cal.noseOffset or 0,
+                    cal.frontConfirmed and "confirmed" or "unconfirmed")
             end
         elseif stage.id == "brake" then
             row.done = cal.brakeCurve ~= nil
@@ -1189,6 +1255,396 @@ local function stageYaw(ctx)
     return true
 end
 
+-- == STAGE: ALIGN ============================================
+--
+-- The one thing in this program that cannot be measured off the ship: which
+-- end of it is the front.
+--
+-- Everything else here reads a sensor. The pose says which way the hull's own
+-- +Z axis points, the drift says which way a propeller pushed, the yaw rate
+-- says which way the hull came round. None of them say which end a player
+-- standing on the deck would call the front, and nothing on the network ever
+-- will. So the ship is turned to a heading the pilot can check against the sky
+-- and the pilot is asked.
+--
+-- The rose is walked rather than one point taken, because eight readings say
+-- something one cannot: a turn that lands short at every point by a growing
+-- amount is a yaw ladder that is off, and a set of readings that disagree with
+-- each other is a hull that was still swinging when it was read.
+
+local ROSE = {
+    { name = "north", from = 0 },   { name = "north east", from = 45 },
+    { name = "east", from = 90 },   { name = "south east", from = 135 },
+    { name = "south", from = 180 }, { name = "south west", from = 225 },
+    { name = "west", from = 270 },  { name = "north west", from = 315 },
+}
+
+-- Command a turn to a heading and hold it until the pilot says it has arrived.
+--
+-- The same code the leg flies with, PID and measured ladder included, because a
+-- turn measured through some other arithmetic would be measuring the other
+-- arithmetic. With no ladder `flight.tankDemand` falls back to plain
+-- proportional and the caller says so once.
+--
+-- Nothing here ends on a clock or on an arrival. A hull that has not begun to
+-- turn yet sits exactly on the heading it started from, and a wizard that took
+-- that for an arrival would file the ship as pointing wherever it was parked.
+local function turnTo(ctx, want, label)
+    if ctx.aborted() then return nil, "stopped" end
+    local pid = util.newPID(config.get("yawKp"), config.get("yawKi"),
+        config.get("yawKd"), -1e6, 1e6, 50)
+    local tol = config.get("calAlignTol")
+    local started = os.clock()
+    local last = started
+    local err, pose = nil, nil
+    local skipped = false
+
+    local function drive()
+        while true do
+            local state = ship.readState()
+            if not state then
+                ctx.note("lost the pose mid turn", "bad")
+                return
+            end
+            local now = os.clock()
+            local dt = now - last
+            if dt <= 0 then dt = config.get("calSample") end
+            last = now
+
+            pose = state.yaw
+            err = util.wrapAngle(want - pose)
+            local demand = flight.tankDemand(err, pid, cal, cfg(), dt)
+            ship.flush(flight.mix(0, demand.diff, ship.order, cal, cfg()))
+
+            ctx.panel({
+                rungLabel = label,
+                value = err, valueLabel = "off", unit = "deg",
+                slope = ship.yawRate() or 0,
+                elapsed = now - started,
+                steady = math.abs(err) <= tol,
+                moving = true,
+                wanted = want, pose = pose,
+                keepPrompt = "[Enter] when it has stopped swinging   s skips this point   q stops",
+            })
+            sleep(config.get("calSample"))
+        end
+    end
+
+    local function waitKey()
+        while true do
+            local event, p1 = os.pullEvent()
+            if event == "key" then
+                if p1 == keys.enter then return end
+                if p1 == keys.s then skipped = true; return end
+                if p1 == keys.q then ctx.stop(); return end
+            end
+        end
+    end
+
+    parallel.waitForAny(drive, waitKey)
+    ship.allStop()
+    ctx.panel({ keepPrompt = false, wanted = false, pose = false })
+    if ctx.aborted() then return nil, "stopped" end
+    if skipped then return nil, "skipped" end
+    if not pose then return nil, "no pose" end
+    return pose, nil, err
+end
+
+local function stageAlign(ctx)
+    if #cal.linesOfSide("left") == 0 or #cal.linesOfSide("right") == 0 then
+        ctx.note("no line on one of the two sides, so the ship cannot be turned. Run sides first.", "bad")
+        return false
+    end
+    if not cal.yawCurve then
+        ctx.note("no yaw ladder yet, so the turns run on plain proportional and land roughly", "warn")
+    end
+
+    local north, why = ship.magneticNorth()
+    if not north then
+        ctx.note("north: " .. tostring(why), "bad")
+        if not ctx.yesno("Use 180, which is north in an ordinary world?", true) then
+            return false
+        end
+        north = 180
+    else
+        ctx.note(string.format("north is %+.1f, off the dimension itself", north), "good")
+    end
+
+    flyClear(ctx, "turning to each point of the compass")
+
+    local points, offsets, misses = {}, {}, {}
+    for index, point in ipairs(ROSE) do
+        if ctx.aborted() then break end
+        local want = util.wrapAngle(north + point.from)
+        local label = string.format("point %d of %d, %s, heading %+.1f",
+            index, #ROSE, point.name, want)
+        ctx.panel({ rungIndex = index, rungTotal = #ROSE })
+
+        local pose, reason, missed = turnTo(ctx, want, label)
+        if ctx.aborted() then break end
+        if not pose then
+            ctx.note(string.format("%s: %s", point.name, tostring(reason)), "warn")
+        else
+            -- How close the controller got, which needs no pilot at all and is
+            -- the only evidence in the stage about the turn rather than about
+            -- the hull.
+            misses[#misses + 1] = missed or util.wrapAngle(want - pose)
+
+            local typed = ctx.ask(
+                "Facing the way the ship's front faces, what does F3 say?",
+                { hint = "degrees, -180 to 180" })
+            if ctx.aborted() then break end
+            local seen, bad = util.parseHeading(typed)
+            if not seen then
+                ctx.note(string.format("%s: %s", point.name, tostring(bad)), "bad")
+            else
+                local offset = util.wrapAngle(seen - pose)
+                points[#points + 1] = { want = want, pose = pose, seen = seen }
+                offsets[#offsets + 1] = offset
+                ctx.note(string.format("%s: you read %+.1f, the hull reads %+.1f, front %+.1f off",
+                    point.name, seen, pose, offset), "good")
+                log.infof("cal: align %s want=%.1f pose=%.1f seen=%.1f offset=%.1f",
+                    point.name, want, pose, seen, offset)
+            end
+        end
+    end
+
+    ship.allStop()
+    settleBack(ctx)
+
+    if #offsets == 0 then
+        ctx.note("nothing was read, so nothing is written down", "bad")
+        return false
+    end
+
+    local mean = util.meanAngle(offsets)
+    if not mean then
+        ctx.note("the readings point every way at once and have no average", "bad")
+        return false
+    end
+    local spread = util.angleSpread(offsets, mean) or 0
+
+    -- The readings disagreeing with each other is its own finding, and it is
+    -- worth more than the average of them.
+    if spread > config.get("calAlignSpread") then
+        local action = ctx.choose(popup.calSpread(spread, config.get("calAlignSpread"),
+            mean, #offsets))
+        if action ~= "keep" then
+            ctx.note("the rose was thrown away. Nothing was written down.", "warn")
+            return false
+        end
+    end
+
+    cal.frontOffset = mean
+    cal.alignSpread = spread
+    cal.alignPoints = points
+    cal.meta.alignAt = stamp()
+    cal.save()
+    ctx.note(string.format("the front sits %+.1f deg off the hull, worst reading %.0f off that",
+        mean, spread), "good")
+
+    -- What the turn itself did, which is the handedness question. A controller
+    -- that cannot get near the heading it was given is not a controller that
+    -- needs tuning, it is one steering the wrong way.
+    local wide, oneWay = 0, 0
+    for _, miss in ipairs(misses) do
+        if math.abs(miss) > config.get("calAlignTol") then wide = wide + 1 end
+        oneWay = oneWay + util.sign(miss)
+    end
+    if #misses >= 3 and wide >= #misses - 1 and math.abs(oneWay) >= #misses - 1 then
+        local action = ctx.choose(popup.calHandedness(
+            string.format("%d of %d turns finished wide, and every one of them on the same side",
+                wide, #misses),
+            { "left and right are filed the wrong way round",
+              "the turn is being driven away from the heading it was given" }))
+        if action == "swap" then
+            local moved = cal.swapSides()
+            cal.save()
+            ctx.note(string.format("%d lines swapped over. Run this stage again to check it.", moved), "good")
+        end
+    end
+
+    -- Thrust and the front pointing opposite ways. Either number on its own
+    -- looks reasonable; it is the pair that says the ship is filed backwards.
+    if cal.noseOffset then
+        local apart = math.abs(util.wrapAngle(mean - cal.noseOffset))
+        if apart >= 180 - config.get("calFlipTol") then
+            local action = ctx.choose(popup.calBackwards(
+                string.format("the front is %+.1f off the hull and the thrust is %+.1f, which is %.0f apart",
+                    mean, cal.noseOffset, apart),
+                { "the main propeller pushes out of the stern",
+                  "this ship flies away from every target it is given" }))
+            if action == "flip" then
+                local flipped = cal.flipThrust()
+                cal.save()
+                ctx.note(string.format("%d lines turned round, nose offset now %+.1f",
+                    flipped, cal.noseOffset or 0), "good")
+            end
+        end
+    end
+
+    -- The confirmation preflight looks for. It is asked here rather than
+    -- assumed from the arithmetic, because the arithmetic is what is being
+    -- checked.
+    local confirm = ctx.choose(popup.calFront(
+        points[#points].seen, points[#points].pose, mean))
+    cal.frontConfirmed = confirm == "confirm"
+    if not cal.frontConfirmed then
+        ctx.note("the front is written down but not confirmed. Run the stage again when you can see it.", "warn")
+    end
+    cal.save()
+    return true
+end
+
+-- == STAGE: CRUISE ALIGN =====================================
+--
+-- Where the ship actually goes when it is told to go straight.
+--
+-- The sides stage takes the nose offset off one drift reading of one propeller,
+-- taken in the second the pilot pressed a key. This takes it off a whole leg at
+-- speed, which is the thing the number is for: the autopilot turns until thrust
+-- points at the target and then trusts it to fly there.
+local function stageCruise(ctx)
+    if #ship.order == 0 then
+        ctx.note("no propeller lines on the network, wired or on a relay", "bad")
+        return false
+    end
+    if not cal.fwdCurve then
+        ctx.note("no forward ladder yet, so the leg runs at the configured cruise rpm", "warn")
+    end
+
+    local north, why = ship.magneticNorth()
+    if not north then
+        ctx.note("north: " .. tostring(why), "warn")
+        north = nil
+    end
+
+    flyClear(ctx, "the cruise leg")
+
+    if north then
+        local pose = turnTo(ctx, north, string.format("lining up on north, %+.1f", north))
+        if ctx.aborted() then return false end
+        if pose then
+            ctx.note(string.format("lined up, the hull reads %+.1f", pose))
+        end
+    end
+
+    local start = ship.readState()
+    if not start then
+        ctx.note("no pose, so there is nothing to measure a course against", "bad")
+        return false
+    end
+
+    local rpm = config.get("cruiseMaxRpm")
+    ctx.note(string.format("running at %d rpm. Let it go as far as you have room for.", rpm), "warn")
+
+    local headings = {}
+    local last = nil
+    local floor = config.get("calCourseMin")
+
+    local function fly()
+        ship.flush(flight.mix(rpm, 0, ship.order, cal, cfg()))
+        while true do
+            local state = ship.readState()
+            if not state then
+                ctx.note("lost the pose mid leg", "bad")
+                return
+            end
+            last = state
+            headings[#headings + 1] = state.yaw
+            local dx = state.position.x - start.position.x
+            local dz = state.position.z - start.position.z
+            local gone = util.len3(dx, 0, dz)
+            ctx.panel({
+                rungLabel = string.format("flown %.1f m of the %.0f this reading needs",
+                    gone, floor),
+                value = state.speed, valueLabel = "speed", unit = "m/s",
+                slope = 0, elapsed = 0,
+                steady = gone >= floor, moving = gone >= floor, floor = floor,
+                course = gone >= 1 and flight.bearingTo(start.position.x, start.position.z,
+                    state.position.x, state.position.z) or nil,
+                pose = state.yaw,
+                keepPrompt = "[Enter] ends the leg and takes the course   q stops",
+            })
+            sleep(config.get("calSample"))
+        end
+    end
+
+    parallel.waitForAny(fly, ctx.waitEnter)
+    ship.allStop()
+    ctx.panel({ keepPrompt = false, course = false, pose = false })
+    settleBack(ctx)
+    if ctx.aborted() then return false end
+    if not last then
+        ctx.note("the leg was never read", "bad")
+        return false
+    end
+
+    local dx = last.position.x - start.position.x
+    local dz = last.position.z - start.position.z
+    local gone = util.len3(dx, 0, dz)
+    -- A course measured over four blocks is the noise in the pose rather than a
+    -- heading, the same way a rung that never moved is not a slow rung.
+    if gone < floor then
+        ctx.note(string.format("the leg was %.1f m, under the %.0f this reading needs. Nothing kept.",
+            gone, floor), "bad")
+        return false
+    end
+
+    local course = flight.bearingTo(start.position.x, start.position.z,
+        last.position.x, last.position.z)
+    -- The heading over the whole leg, not the one it finished on. A hull that
+    -- wandered a degree or two did not fly the heading it happened to end at.
+    local held = util.meanAngle(headings) or last.yaw
+    local offset = util.wrapAngle(course - held)
+    ctx.note(string.format("%.1f m on a heading of %+.1f made a course of %+.1f",
+        gone, held, course), "good")
+    log.infof("cal: cruise gone=%.1f held=%.1f course=%.1f offset=%.1f",
+        gone, held, course, offset)
+
+    local apart = math.abs(offset)
+    if apart >= 180 - config.get("calFlipTol") then
+        -- An offset of half a circle is not an offset. It is a ship that has
+        -- been told to fly in reverse for ever, and writing it down as a number
+        -- would hide that behind arithmetic that works.
+        local action = ctx.choose(popup.calBackwards(
+            string.format("it flew %.0f degrees away from where it was pointing", apart),
+            { string.format("over %.0f m at %d rpm", gone, rpm),
+              "the propellers are filed the wrong way round" }))
+        if action == "flip" then
+            local flipped = cal.flipThrust()
+            cal.save()
+            ctx.note(string.format("%d lines turned round. Run this stage again to check it.",
+                flipped), "good")
+        end
+    else
+        local action = ctx.choose(popup.calReplace("NOSE OFFSET",
+            "where the ship goes when it is told to go straight",
+            cal.noseOffset, offset, "deg",
+            string.format("measured over %.0f m at %d rpm", gone, rpm)))
+        if action == "take" then
+            cal.noseOffset = offset
+            ctx.note(string.format("nose offset is %+.1f deg", offset), "good")
+        else
+            ctx.note(string.format("kept the %s it had",
+                cal.noseOffset and string.format("%+.1f", cal.noseOffset) or "nothing"), "warn")
+        end
+    end
+
+    -- And the question the pair of stages exists for, asked while the pilot is
+    -- still stood there looking at a ship that has just flown somewhere.
+    local confirm = ctx.choose(popup.calFront(
+        util.wrapAngle(held + (cal.frontOffset or 0)), held, cal.frontOffset or 0))
+    cal.frontConfirmed = confirm == "confirm"
+    if not cal.frontConfirmed then
+        ctx.note("the front is still unconfirmed. Preflight will say so.", "warn")
+    end
+
+    cal.meta.cruiseAt = stamp()
+    cal.save()
+    return true
+end
+
 -- == STAGE: FORWARD ==========================================
 
 local function stageForward(ctx)
@@ -1446,7 +1902,9 @@ local RUNNERS = {
     sides = stageSides,
     balloon = stageBalloon,
     yaw = stageYaw,
+    align = stageAlign,
     forward = stageForward,
+    cruise = stageCruise,
     brake = stageBrake,
 }
 
@@ -1461,7 +1919,7 @@ function cal.runWizard(ctx, only)
         if not only or only == stage.id then stages[#stages + 1] = stage end
     end
     if #stages == 0 then
-        ctx.note("no such stage. They are sides, balloon, yaw, forward and brake.", "bad")
+        ctx.note("no such stage. They are sides, balloon, yaw, align, forward, cruise and brake.", "bad")
         return false
     end
 

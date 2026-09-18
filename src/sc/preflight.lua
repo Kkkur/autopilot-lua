@@ -115,6 +115,30 @@ function preflight.check(ship, cal, fuel, turbine, config, link)
             "the leg is flown without knowing how much is left to fly it with")
     end
 
+    -- Which end is the front, which is the one thing about this ship no sensor
+    -- can answer and so the one thing a pilot has to have confirmed by hand.
+    --
+    -- Two failures, and they are not the same failure. Never having been asked
+    -- is a warning: the ship flies, it just flies on a front offset of nothing
+    -- and a screen that may disagree with the sky. Thrust and the front
+    -- pointing opposite ways is a refusal, because that ship runs away from
+    -- every target it is given and does it at cruise speed.
+    if cal.frontOffset and cal.noseOffset then
+        local apart = math.abs(util.wrapAngle(cal.frontOffset - cal.noseOffset))
+        local backwards = apart >= 180 - config.get("calFlipTol")
+        add(report, "front", not backwards, "bad",
+            backwards
+                and string.format("the front and the thrust are %.0f degrees apart", apart)
+                or string.format("the front sits %+.1f degrees off the hull", cal.frontOffset),
+            "the propellers are filed the wrong way round, so the ship flies away from the target")
+    elseif not cal.frontOffset then
+        add(report, "front", false, "warn", "nobody has confirmed which end is the front",
+            "every heading on the screen is the hull's own axis, which is not always the way the ship faces")
+    else
+        add(report, "front", true, "warn",
+            string.format("the front sits %+.1f degrees off the hull", cal.frontOffset))
+    end
+
     -- What was measured against what is here now. cal answers this one fully,
     -- each difference already in its own words, so the first of them is the
     -- text and the rest go on the CAL tab.
@@ -147,7 +171,7 @@ function preflight.check(ship, cal, fuel, turbine, config, link)
         if not row.done then unmeasured[#unmeasured + 1] = row.title:lower() end
     end
     add(report, "curves", #unmeasured == 0, "bad",
-        #unmeasured == 0 and "all five stages measured"
+        #unmeasured == 0 and "every stage measured"
             or ("never measured: " .. table.concat(unmeasured, ", ")),
         "the ship would be flown on the defaults, which describe no vessel in particular")
 

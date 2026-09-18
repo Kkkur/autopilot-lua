@@ -394,7 +394,14 @@ sim.position = { x = 0, y = START_Y, z = 0 }
 sim.balloon = 8      -- roughly hovering, which is where a ship is found
 
 -- Create: Avionics puts gravity on the flight computer.
-aero = { getGravity = function() return TANK_GRAVITY end }
+-- Magnetic north as CC: Sable reports it: a world vector, per dimension, which
+-- in an ordinary world points along -Z. The align stage reads this rather than
+-- assuming 180, so the stub has to answer it or the stage stops on the first
+-- line.
+aero = {
+    getGravity = function() return TANK_GRAVITY end,
+    getMagneticNorth = function() return { x = 0, y = 0, z = -1 } end,
+}
 
 sublevel = {
     getLogicalPose = function()
@@ -441,6 +448,13 @@ files["starcatcher/cal.cfg"] = [[{
     ["3:Create_RotationSpeedController_0"] = { side = "main",  reverse = false },
   },
   noseOffset = 0,
+  -- The simulated hull's front is its +Z axis and a pilot has said so, which is
+  -- what the align stage writes. Without these the gate stops every launch to
+  -- say nobody has confirmed which end is the front, which is the right thing
+  -- to say about a ship nobody has walked round and the wrong thing to say
+  -- about the one the harness flies.
+  frontOffset = 0,
+  frontConfirmed = true,
   yawAuth = { left = 0.0594, right = 0.0655 },
   yawCurve = {
     pos = { { rpm = 64, speed = 8.0 }, { rpm = 128, speed = 16.0 },
@@ -472,7 +486,8 @@ files["starcatcher/cal.cfg"] = [[{
     relays = { { id = 2, lines = 4 }, { id = 3, lines = 1 } },
   },
   meta = { sidesAt = "seeded", yawAt = "seeded", forwardAt = "seeded",
-           brakeAt = "seeded", balloonAt = "seeded" },
+           brakeAt = "seeded", balloonAt = "seeded", alignAt = "seeded",
+           cruiseAt = "seeded" },
 }]]
 
 -- The wizard, driven headless, measures a ship that is not really there in real
@@ -486,7 +501,7 @@ if options.script == "cal" then
     }]]
     -- and it starts from a ship nobody has ever measured, because a run that
     -- began from the seeded answers would be testing the file rather than the
-    -- five stages that write it.
+    -- stages that write it.
     files["starcatcher/cal.cfg"] = nil
 end
 
@@ -954,8 +969,8 @@ local function typeLine(text)
 end
 
 if options.script == "cal" then
-    -- Walk the five stage wizard with a pilot who agrees with everything and
-    -- who waits before agreeing.
+    -- Walk the wizard with a pilot who agrees with everything and who waits
+    -- before agreeing.
     --
     -- Nothing in the wizard ends a rung by itself any more: every reading is
     -- kept when the pilot presses Enter. So the script cannot count seconds of
@@ -975,7 +990,14 @@ if options.script == "cal" then
     queueWait(60)
     typeLine("cal")
 
-    for _ = 1, 70 do
+    -- **The align stage is not answered here and cannot be.** Its question is
+    -- the degrees a pilot reads off F3, and this keyboard is queued up before
+    -- the wizard starts rather than reacting to what is on the screen, so it
+    -- has nothing to type. The stage ends having read nothing, says so, and
+    -- the run carries on to the next one. What it would have computed from
+    -- those readings is checked under `--test` instead, where the readings can
+    -- be handed in directly.
+    for _ = 1, 110 do
         queueWait(285)
         queueEvent("key", keys.enter)
     end

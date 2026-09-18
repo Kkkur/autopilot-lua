@@ -54,12 +54,15 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     -- cal is loaded with a stub ship and no relay: the parsing it is being
     -- tested on never touches the network, and nothing here writes to disk.
     local stubTurbine = { hasBalloon = function() return false end }
-    local calModule = loadModule("cal", util, stubShip, config, stubLog,
-        flightModule, stubTurbine)
     -- preflight and popup are pure in the same way flight is, so both load with
-    -- nothing attached and both are checked against stub tables.
+    -- nothing attached and both are checked against stub tables. popup comes
+    -- before cal because the wizard asks its questions with it.
     local preflightModule = loadModule("preflight", util, flightModule)
     local popupModule = loadModule("popup", util)
+    -- cal is loaded with a stub ship and no relay: the parsing it is being
+    -- tested on never touches the network, and nothing here writes to disk.
+    local calModule = loadModule("cal", util, stubShip, config, stubLog,
+        flightModule, stubTurbine, popupModule)
     -- The fuel module never touches a peripheral until init is called, so it
     -- can be loaded and have its arithmetic checked on a computer with no modem.
     -- link is loaded without init, so it has no file and no passcode: exactly
@@ -81,7 +84,7 @@ end
 if ARGS[1] == "--help" or ARGS[1] == "-h" then
     print("starcatcher -- Create: Avionics autopilot")
     print("")
-    print("  cal          measure the ship: sides, balloon, yaw, forward, brake")
+    print("  cal          measure the ship: sides, balloon, yaw, align, forward, cruise, brake")
     print("  cal yaw      run one stage of it again")
     print("  save <name>  pin a waypoint where you are")
     print("  goto <name>  fly there")
@@ -120,13 +123,13 @@ link.init(DATA)
 -- wizard that measures it and the loop that drives it need the link to exist
 -- before they are built.
 local turbine = loadModule("turbine", util, ship, config, log, link)
-local cal = loadModule("cal", util, ship, config, log, flight, turbine)
+local popup = loadModule("popup", util)
+local cal = loadModule("cal", util, ship, config, log, flight, turbine, popup)
 local control = loadModule("control", util, ship, cal, config, log, flight, turbine,
     telemetry)
 local nav = loadModule("nav", util, control, log)
 local fuel = loadModule("fuel", util, ship, cal, control, config, log, link)
 local preflight = loadModule("preflight", util, flight)
-local popup = loadModule("popup", util)
 local ui = loadModule("ui", util, ship, cal, control, nav, fuel, turbine, config, log,
     telemetry, flight, popup, link)
 local cmd = loadModule("cmd", util, ship, cal, control, nav, fuel, turbine, config, ui, log,

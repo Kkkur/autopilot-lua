@@ -426,7 +426,7 @@ define("cal", {
     run = function(args)
         local only = args[1] and args[1]:lower() or nil
         if only and not cal.stageById(only) then
-            return "the stages are sides, balloon, yaw, forward and brake", "warn"
+            return "the stages are sides, balloon, yaw, align, forward, cruise and brake", "warn"
         end
         -- Calibration is the one thing the gate never blocks. It is how a ship
         -- gets into a state the checker would pass in the first place.
@@ -474,7 +474,7 @@ define("inventory", {
 })
 
 define("forget", {
-    usage = "forget sides|balloon|yaw|forward|brake|all",
+    usage = "forget sides|balloon|yaw|align|forward|cruise|brake|all",
     help = "Throw away one stage of calibration so it can be measured again.",
     run = function(args)
         local what = (args[1] or ""):lower()
@@ -490,6 +490,16 @@ define("forget", {
         elseif what == "forward" then
             cal.fwdCurve, cal.stressAtCruise = nil, nil
             cal.meta.forwardAt = nil
+        elseif what == "align" then
+            cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
+            cal.frontConfirmed = nil
+            cal.meta.alignAt = nil
+        elseif what == "cruise" then
+            -- The nose offset is left where it is. The cruise stage refines a
+            -- number the sides stage measured rather than owning it, and
+            -- throwing it away here would leave the ship steering by nothing.
+            cal.frontConfirmed = nil
+            cal.meta.cruiseAt = nil
         elseif what == "brake" then
             cal.brakeCurve = nil
             cal.meta.brakeAt = nil
@@ -498,8 +508,10 @@ define("forget", {
             cal.noseOffset, cal.yawCurve, cal.fwdCurve = nil, nil, nil
             cal.brakeCurve, cal.balloonCurve, cal.altHover = nil, nil, nil
             cal.stressAtTurn, cal.stressAtCruise, cal.inventory = nil, nil, nil
+            cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
+            cal.frontConfirmed = nil
         else
-            return "forget sides, balloon, yaw, forward, brake or all", "warn"
+            return "forget sides, balloon, yaw, align, forward, cruise, brake or all", "warn"
         end
         cal.save()
         return "forgotten: " .. what, "warn"

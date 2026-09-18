@@ -42,7 +42,7 @@
 --
 -- == The shape of `cal` ==
 --
--- What the five stage wizard leaves behind. Written down here because this is
+-- What the calibration wizard leaves behind. Written down here because this is
 -- the file that reads it.
 --
 --   sides        line key -> { side = "left"|"right"|"main"|"none", reverse }

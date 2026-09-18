@@ -210,6 +210,69 @@ function tests.run()
     check(named, "and the relay that is missing is named")
     cal.inventory = nil
 
+    -- == headings a pilot typed, and headings averaged ==
+    -- The align stage lives on both of these. An average of headings is not an
+    -- average of numbers, and a heading of zero is due south rather than a
+    -- failure to read one.
+    near(util.meanAngle({ 10, 20, 30 }), 20, "three headings average the obvious way")
+    near(util.meanAngle({ 179, -179 }), 180, "two either side of north average to north")
+    near(util.meanAngle({ -1, 1 }), 0, "and two either side of south average to south")
+    check(util.meanAngle({}) == nil, "no readings have no average")
+    check(util.meanAngle({ 0, 90, 180, -90 }) == nil,
+        "four readings pointing every way have no average either")
+    near(util.angleSpread({ 10, 20, 30 }, 20), 10, "the spread is the worst of them")
+    near(util.angleSpread({ 179, -179 }, 180), 1, "and it wraps past north like everything else")
+
+    local heading, badHeading = util.parseHeading("  -90 ")
+    near(heading, -90, "a heading typed with spaces round it reads")
+    check(badHeading == nil, "and comes back with no complaint")
+    near(util.parseHeading("0"), 0, "zero is due south, which is a heading like any other")
+    near(util.parseHeading("270"), -90, "a heading past 180 is wrapped rather than refused")
+    check(util.parseHeading("north") == nil, "a compass point is not a number of degrees")
+    check(select(2, util.parseHeading("north")):find("not a number") ~= nil,
+        "and says so in the words of what was typed")
+    check(util.parseHeading("") == nil, "and nothing typed is nothing read")
+    check(util.parseHeading("900") == nil, "a heading nobody could read off F3 is refused")
+
+    -- == what the wizard asks with ==
+    -- The popups are descriptors, so what they say is checkable without a
+    -- screen. What matters is that each one offers the fix and the refusal both,
+    -- because a popup with one key is a popup that decides for the pilot.
+    local ask = popup.calBackwards("the front and the thrust are 174 degrees apart",
+        { "the main propeller pushes out of the stern" })
+    check(ask.severity == "alarm", "a ship filed backwards is an alarm")
+    check(#ask.choices == 2 and ask.choices[1].action == "flip"
+        and ask.choices[2].action == "leave", "and the pilot can turn it round or leave it")
+
+    ask = popup.calHandedness("6 of 8 turns finished wide", {})
+    check(ask.choices[1].action == "swap" and ask.choices[2].action == "leave",
+        "a turn going the wrong way offers the swap and the refusal")
+
+    ask = popup.calReplace("NOSE OFFSET", "where the ship goes", nil, 12.5, "deg", "over 60 m")
+    check(ask.choices[1].action == "take" and ask.choices[2].action == "keep",
+        "a better reading is offered rather than taken")
+    local saidNever = false
+    for _, entry in ipairs(ask.lines) do
+        if entry.text:find("never measured") then saidNever = true end
+    end
+    check(saidNever, "and a number that was never measured says so rather than reading zero")
+
+    ask = popup.calSpread(40, 15, 12, 8)
+    check(ask.choices[1].action == "keep" and ask.choices[2].action == "drop",
+        "readings that disagree can be kept or thrown away")
+
+    ask = popup.calFront(175, -5, 180)
+    check(ask.choices[1].action == "confirm" and ask.choices[2].action == "again",
+        "and the front is confirmed by the pilot or read again")
+
+    -- == the two alignment stages exist and are in the right order ==
+    local order = {}
+    for _, stage in ipairs(cal.STAGES) do order[#order + 1] = stage.id end
+    check(table.concat(order, ",") == "sides,balloon,yaw,align,forward,cruise,brake",
+        "align comes after yaw and cruise after forward")
+    check(cal.stageById("align") ~= nil and cal.stageById("cruise") ~= nil,
+        "and both are reachable by name")
+
     -- == the sides, swapped ==
     -- The yaw stage offers this when the hull turns the other way to the one it
     -- was asked for, which is the sides filed backwards and nothing else.
@@ -881,6 +944,9 @@ function tests.run()
             balloonCurve = { { rpm = 15, speed = 1.8 } },
             stressAtTurn = opts.stressAtTurn or 1000,
             stressAtCruise = opts.stressAtCruise or 1000,
+            -- false means never measured, which a Lua and/or cannot say.
+            noseOffset = (opts.noseOffset ~= false) and (opts.noseOffset or 0) or nil,
+            frontOffset = (opts.frontOffset ~= false) and (opts.frontOffset or 0) or nil,
             linesOfSide = function(side)
                 if side == "left" then return opts.left or { "2:a" } end
                 if side == "right" then return opts.right or { "2:b" } end
@@ -928,6 +994,7 @@ function tests.run()
     local fakeConfig = {
         get = function(key)
             if key == "fuelCrit" then return 12 end
+            if key == "calFlipTol" then return 60 end
             return nil
         end,
         values = { cruiseSpeed = 12, yawRateMax = 30, fuelMargin = 1.25,
@@ -942,6 +1009,23 @@ function tests.run()
     check(report.byId.steer.ok, "with a side each way it can steer")
     check(report.byId.balloon.ok, "and something is holding the balloon")
     check(#preflight.failures(report) == 0, "and there is nothing to report")
+
+    -- Which end is the front. A ship nobody has confirmed still flies, and one
+    -- whose thrust points out of its stern does not.
+    report = preflight.check(fakeShip(true), fakeCal({ frontOffset = false }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    check(report.ok, "a ship whose front was never confirmed still flies")
+    check(report.byId.front.ok == false and report.byId.front.kind == "warn",
+        "and says so as a warning")
+
+    report = preflight.check(fakeShip(true), fakeCal({ frontOffset = 175 }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    check(report.ok == false, "a ship whose thrust points out of its stern does not fly")
+    check(report.byId.front.kind == "bad", "and that is a refusal, not a warning")
+
+    report = preflight.check(fakeShip(true), fakeCal({ frontOffset = 30, noseOffset = 25 }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    check(report.byId.front.ok, "a hull that crabs a little is not a hull that is backwards")
 
     report = preflight.check(fakeShip(false), fakeCal(), fakeFuel("live", 0.5, 3600),
         fakeTurbines(), fakeConfig)

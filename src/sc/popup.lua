@@ -280,4 +280,134 @@ function popup.measured(entry, value, typed)
     }
 end
 
+-- == THE WIZARD ASKS =========================================
+--
+-- Calibration measures the ship and is sometimes wrong about it, and the only
+-- thing in the room that can tell is the pilot. These are the questions it asks
+-- when it is about to overwrite something it worked out itself. They are
+-- popups rather than another line of wizard log on purpose: a line scrolls
+-- past, and what is being decided here is which way round the ship is.
+--
+-- Enter is the answer that changes nothing, on every one of these. A pilot
+-- pressing it to get past a box has not agreed to have their calibration
+-- rewritten, and the one box where nothing-to-change is not a choice, the front
+-- confirmation, spends Enter on "not sure" rather than on "yes".
+--
+-- Nothing here parks anything. The control loop is already out of the
+-- propellers for the whole wizard, which is the one place in the program where
+-- that is true.
+
+-- Thrust and the front of the ship pointing opposite ways. Whatever measured
+-- it, the meaning is the same: every line is filed the wrong way round, and
+-- the ship will fly away from anything it is sent to.
+function popup.calBackwards(detail, evidence)
+    local lines, cost = {}, {}
+    say(lines, "bad", "%s", detail)
+    for _, item in ipairs(evidence or {}) do say(lines, "dim", "%s", item) end
+    say(cost, "warn", "turning them round reverses thrust and leaves the turn alone")
+    say(cost, "dim", "the two sides swap with them, which is what keeps the yaw ladder")
+    return {
+        severity = "alarm",
+        title = "THE SHIP IS FILED BACKWARDS",
+        lines = lines,
+        cost = cost,
+        choices = {
+            { key = "t", label = "turn every line round", action = "flip" },
+            { key = "enter", label = "leave it as it is", action = "leave" },
+        },
+    }
+end
+
+-- The turn running away instead of arriving. Left and right are the wrong way
+-- round, which is one mistake made once, because every line was read against
+-- the same yaw.
+function popup.calHandedness(detail, evidence)
+    local lines, cost = {}, {}
+    say(lines, "bad", "%s", detail)
+    for _, item in ipairs(evidence or {}) do say(lines, "dim", "%s", item) end
+    say(cost, "warn", "swapping them turns the ship the other way for the same command")
+    say(cost, "dim", "an autopilot that steers the wrong way never arrives at all")
+    return {
+        severity = "alarm",
+        title = "THE TURN GOES THE WRONG WAY",
+        lines = lines,
+        cost = cost,
+        choices = {
+            { key = "s", label = "swap left and right", action = "swap" },
+            { key = "enter", label = "leave it as it is", action = "leave" },
+        },
+    }
+end
+
+-- A better reading of something already measured. Both numbers are on the
+-- screen with what each was measured over, because a pilot asked to replace a
+-- number they cannot see is a pilot pressing whichever key is nearest.
+function popup.calReplace(title, what, oldValue, newValue, unit, over)
+    local lines, cost = {}, {}
+    say(lines, "hi", "%s", what)
+    say(lines, oldValue == nil and "warn" or "dim", "now      %s %s",
+        oldValue and string.format("%+.1f", oldValue) or "never measured", unit or "")
+    say(lines, "good", "measured  %+.1f %s", newValue or 0, unit or "")
+    if over then say(cost, "dim", "%s", over) end
+    say(cost, "warn", "the autopilot steers by this number on every leg")
+    return {
+        severity = "info",
+        title = string.upper(title),
+        lines = lines,
+        cost = cost,
+        choices = {
+            { key = "t", label = "take the new one", action = "take" },
+            { key = "enter", label = "keep what is there", action = "keep" },
+        },
+    }
+end
+
+-- Readings that do not agree with each other. Their average is still an
+-- average, and it is offered, but a pilot who keeps it should know what they
+-- are keeping.
+function popup.calSpread(spread, allowed, mean, count)
+    local lines, cost = {}, {}
+    say(lines, "warn", "the %d readings disagree by up to %.0f degrees", count or 0, spread or 0)
+    say(lines, "dim", "which is past the %.0f this ship calls consistent", allowed or 0)
+    say(cost, "hi", "their average is %+.1f degrees", mean or 0)
+    say(cost, "dim", "a ship that was not steady when it was read does this")
+    return {
+        severity = "warn",
+        title = "THE READINGS DISAGREE",
+        lines = lines,
+        cost = cost,
+        choices = {
+            { key = "enter", label = "keep the average", action = "keep" },
+            { key = "d", label = "throw the stage away", action = "drop" },
+        },
+    }
+end
+
+-- The question the alignment stages exist for. The program cannot see the ship
+-- and the pilot cannot see the pose, so this is the one place the two are put
+-- side by side and the pilot is asked which of them is lying.
+function popup.calFront(seen, pose, offset)
+    local lines, cost = {}, {}
+    say(lines, "hi", "you read       %+.1f degrees", seen or 0)
+    say(lines, "hi", "the pose says  %+.1f degrees", pose or 0)
+    say(lines, math.abs(offset or 0) < 1 and "good" or "warn",
+        "the front sits %+.1f degrees off the hull", offset or 0)
+    say(cost, "dim", "this is what the screens will read in from now on")
+    say(cost, "warn", "if that does not match what you can see, read it again")
+    return {
+        severity = "info",
+        title = "WHERE THE FRONT IS",
+        lines = lines,
+        cost = cost,
+        choices = {
+            { key = "y", label = "that is right", action = "confirm" },
+            { key = "r", label = "read it again", action = "again" },
+            -- Enter is neither of those on purpose. A pilot who presses it
+            -- without looking at the ship has not confirmed anything, and
+            -- confirming is exactly what preflight will believe afterwards.
+            { key = "enter", label = "not sure", action = "unsure" },
+        },
+    }
+end
+
 return popup

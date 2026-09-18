@@ -193,7 +193,7 @@ config.SCHEMA = {
       symptom = "the fallback yaw rate is noisy, or lags a turn that is changing" },
 
     -- == CALIBRATION =========================================
-    -- The five stage wizard measures the ship with these. They are the only
+    -- The seven stage wizard measures the ship with these. They are the only
     -- numbers here that describe a measurement rather than a flight.
     { key = "calRpm",        group = "cal",    kind = "int",    def = 128,  min = 16,  max = 256, step = 16,
       help = "RPM one line spins at while the wizard reads which side it is on.",
@@ -234,6 +234,18 @@ config.SCHEMA = {
     { key = "calBalloonStep", group = "cal",   kind = "int",    def = 3,    min = 1,   max = 5,   step = 1,
       help = "Strengths skipped in the balloon sweep before it refines around hover.",
       symptom = "the balloon sweep takes an age, or steps over hover entirely" },
+    { key = "calAlignTol",   group = "cal",    kind = "number", def = 5,    min = 0.5, max = 45,  step = 0.5,
+      help = "How close to the heading it was asked for, in degrees, counts as the ship having arrived. Colours the align stage's error and decides whether a turn is reported as having converged at all.",
+      symptom = "every point of the rose reads as a turn that missed, or none of them do" },
+    { key = "calAlignSpread", group = "cal",   kind = "number", def = 15,   min = 1,   max = 90,  step = 1,
+      help = "Spread across the eight readings, in degrees, above which they are called inconsistent. Their average is still offered, and said to be worth little.",
+      symptom = "a rose whose readings disagree is written down as though they agreed" },
+    { key = "calCourseMin",  group = "cal",    kind = "number", def = 20,   min = 2,   max = 500, step = 1,
+      help = "Shortest leg, in meters, the cruise stage will take a course from. Under it the reading is the noise in the pose rather than a heading.",
+      symptom = "a course measured over four blocks is written into the nose offset" },
+    { key = "calFlipTol",    group = "cal",    kind = "number", def = 60,   min = 10,  max = 90,  step = 5,
+      help = "How near half a circle, in degrees, counts as the ship being filed backwards rather than as a hull that crabs.",
+      symptom = "a ship that flies sideways is offered the flip, or one that flies backwards is not" },
 
     -- == PREFLIGHT ===========================================
     { key = "fuelMargin",    group = "preflight", kind = "number", def = 1.25, min = 1, max = 5, step = 0.05,

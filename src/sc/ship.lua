@@ -301,6 +301,33 @@ function ship.yawRate()
     return reported
 end
 
+-- Which way north is, as a heading in the same convention everything else here
+-- speaks. CC: Sable keeps it per dimension rather than per world, and a
+-- datapack can move it, so it is asked for rather than written down as 180.
+--
+-- This is the one direction in the program that is not measured off the ship.
+-- It is what the calibration wizard turns to so the pilot can look at the sky
+-- and say whether the ship agrees, which is the only check for handedness and
+-- for which end is the front that this program can never make on its own.
+--
+-- Returns nil and what to put on screen, the way readState does.
+function ship.magneticNorth()
+    if type(aero) ~= "table" or not aero.getMagneticNorth then
+        return nil, "NO CC: SABLE AERODYNAMICS"
+    end
+    local ok, raw = pcall(aero.getMagneticNorth)
+    if not ok then return nil, "THIS DIMENSION HAS NO MAGNETIC NORTH" end
+    local vec = util.toVec(raw)
+    if not vec then return nil, "NORTH SHAPE " .. util.keyList(raw) end
+    -- A north of zero length is a dimension where the direction means nothing,
+    -- which is a different thing from the call having failed and is said
+    -- differently.
+    if math.abs(vec.x) < 1e-9 and math.abs(vec.z) < 1e-9 then
+        return nil, "NORTH IS STRAIGHT UP OR NOWHERE AT ALL"
+    end
+    return util.wrapAngle(math.deg(math.atan2(-vec.x, vec.z)))
+end
+
 -- Extras that are nice on the panel and never load-bearing. Each one is
 -- optional hardware, so each one is allowed to come back nil.
 function ship.readExtras()
