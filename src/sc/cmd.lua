@@ -4,7 +4,8 @@
 -- screen itself. That makes the whole command set testable, and it is why the
 -- same dispatcher can later be pointed at a modem without any of it changing.
 
-local util, ship, cal, control, nav, fuel, turbine, config, ui, log = ...
+local util, ship, cal, control, nav, fuel, turbine, config, ui, log, preflight, popup,
+    telemetry = ...
 
 local cmd = {}
 
@@ -23,6 +24,66 @@ local function currentPos()
     local state = ship.readState()
     if not state then return nil, "no pose: " .. tostring(select(2, ship.readState())) end
     return state.position
+end
+
+-- == THE GATE ================================================
+--
+-- Everything that puts the propellers to work runs the checker first and
+-- refuses by name if it fails. Calibration is the one thing that does not,
+-- because calibration is how a ship reaches a state the checker would pass in
+-- the first place.
+--
+-- Every refusal can be overridden from the popup. The point of this is not to
+-- stop a pilot, it is to make sure that flying without a side of turbines is a
+-- thing somebody decided rather than a thing nobody noticed.
+
+local function firstFailure(report)
+    return preflight.failures(report)[1]
+end
+
+local function gate(what, to, descriptor)
+    local report = preflight.check(ship, cal, fuel, turbine, config)
+
+    if not report.ok then
+        local item = firstFailure(report)
+        telemetry.event("gate", "refused " .. what, item and item.text)
+        local choice = ui.showPopup(descriptor and descriptor(report)
+            or popup.preflight(report, what))
+        if choice ~= "override" then
+            return false, item and item.text or "not ready to " .. what
+        end
+        log.warn(what .. ": flown past the gate on " .. tostring(item and item.id))
+        telemetry.event("gate", "overridden " .. what, item and item.id)
+        return true
+    end
+
+    -- The ship is fit. Whether this particular leg is affordable is a second
+    -- question, and only a leg with somewhere to go has it.
+    local plan = to and preflight.planFor(ship, cal, config, to)
+    if not plan then return true end
+
+    local tanks = fuel.status()
+    local leg = preflight.forLeg(report, tanks, turbine.status(), plan)
+    if leg.ok then return true end
+
+    local shortfall = leg.byId.fuelTime
+    local modal
+    if shortfall and not shortfall.ok then
+        local short = leg.seconds * config.get("fuelMargin") - (tanks.endurance or 0)
+        local speed = cal.topForward() or config.get("cruiseSpeed")
+        modal = popup.fuelShortfall(short, short * speed)
+    else
+        modal = popup.preflight(leg, what)
+    end
+
+    local item = firstFailure(leg)
+    telemetry.event("gate", "refused leg for " .. what, item and item.text)
+    if ui.showPopup(modal) ~= "override" then
+        return false, item and item.text or "the leg is not affordable"
+    end
+    log.warn(what .. ": leg flown past the gate on purpose")
+    telemetry.event("gate", "overridden leg for " .. what, item and item.id)
+    return true
 end
 
 -- == WAYPOINTS ===============================================
@@ -88,6 +149,9 @@ define("goto", {
     run = function(args)
         if not args[1] then return "usage: goto <name>", "warn" end
         local pos = currentPos()
+        local wp = nav.find(args[1])
+        local allowed, refused = gate("fly", wp)
+        if not allowed then return refused, "bad" end
         local ok, err = nav.goTo(args[1], pos and pos.y or nil)
         if not ok then return tostring(err), "bad" end
         ui.tab = 1
@@ -107,6 +171,8 @@ define("fly", {
             x, z, y = x, y, pos.y
         end
         if not (x and y and z) then return "usage: fly <x> <y> <z>", "warn" end
+        local allowed, refused = gate("fly", { x = x, y = y, z = z })
+        if not allowed then return refused, "bad" end
         local ok, err = nav.goToCoords(x, y, z)
         if not ok then return tostring(err), "bad" end
         ui.tab = 1
@@ -123,6 +189,11 @@ define("route", {
             return "route cleared", "warn"
         end
         local pos = currentPos()
+        -- Gated on the ship, not on the legs. A route is checked leg by leg as
+        -- each one is engaged, and quoting a fuel budget for the whole list
+        -- would be quoting it against a position the ship is not at yet.
+        local allowed, refused = gate("fly the route")
+        if not allowed then return refused, "bad" end
         local ok, err = nav.setRoute(args, pos and pos.y or nil)
         if not ok then return tostring(err), "bad" end
         ui.tab = 1
@@ -160,6 +231,8 @@ define("resume", {
     usage = "resume",
     help = "Re-engage on the target already set.",
     run = function()
+        local allowed, refused = gate("engage", control.target)
+        if not allowed then return refused, "bad" end
         local ok, err = control.start()
         return ok and "engaged" or tostring(err), ok and "good" or "warn"
     end,
@@ -175,6 +248,10 @@ define("manual", {
         local throttle = util.clamp(tonumber(args[1]) or 0, -1, 1)
         local yaw = util.clamp(tonumber(args[2]) or 0, -1, 1)
         local level = args[3] and util.clamp(tonumber(args[3]) or 0, 0, 15) or nil
+        if throttle ~= 0 or yaw ~= 0 or level then
+            local allowed, refused = gate("fly by hand", nil, popup.manualOverride)
+            if not allowed then return refused, "bad" end
+        end
         control.setManual(throttle, yaw, level)
         if not control.manual then return "manual off", "warn" end
         ui.tab = 1

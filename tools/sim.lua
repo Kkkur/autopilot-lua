@@ -943,6 +943,12 @@ if options.script == "cal" then
 elseif options.script == "tabs" then
     -- Walk every tab and photograph each one, which is the cheapest way to
     -- catch a draw that indexes off the end of something.
+    --
+    -- The wait is the preflight gate, not decoration. Every propeller is on a
+    -- relay and they adopt about a second after boot, so a leg ordered before
+    -- then is a leg ordered on a ship with no propellers on it, and the gate
+    -- refuses it with a popup.
+    queueWait(60)
     typeLine("save home")
     typeLine("save dock 200 96 -140")
     typeLine("fly 120 95 60")
@@ -961,7 +967,10 @@ elseif options.script == "clicks" then
     end
 else
 
--- A short flight: save where we are, fly somewhere, watch it get there.
+-- A short flight: save where we are, fly somewhere, watch it get there. The
+-- wait first, because the relays carry every propeller and adopt about a second
+-- in, and the preflight gate refuses a leg on a ship that has none yet.
+queueWait(60)
 queueEvent("char", "f")
 queueEvent("char", "l")
 queueEvent("char", "y")

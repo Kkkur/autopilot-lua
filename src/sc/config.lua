@@ -212,6 +212,16 @@ config.SCHEMA = {
     { key = "requireStressBudget", group = "preflight", kind = "bool", def = true,
       help = "Refuse a leg the kinetic network cannot supply at full demand." },
 
+    -- Telemetry. This is how the ship is read from outside the game: a CC
+    -- computer's disk is a folder on the host, so what gets written here is what
+    -- anyone debugging a flight afterwards has to work from.
+    { key = "telemetry",     group = "telemetry", kind = "bool",   def = true,
+      help = "Write the flight to starcatcher/telemetry. Off costs nothing and tells nobody anything." },
+    { key = "telemetryHz",   group = "telemetry", kind = "number", def = 2.0, min = 0.1, max = 20, step = 0.5,
+      help = "Samples per second written to flight.csv. The sample itself touches no peripheral." },
+    { key = "telemetryMaxKb", group = "telemetry", kind = "int",   def = 200, min = 16, max = 2048, step = 16,
+      help = "Kilobytes per flight.csv before it starts a numbered new one." },
+
     -- Screen
     { key = "uiTick",        group = "ui",     kind = "number", def = 0.25, min = 0.05, max = 2, step = 0.05,
       help = "Screen refresh period, seconds." },
@@ -235,6 +245,7 @@ config.GROUPS = {
     { id = "cal",      title = "CALIBRATION" },
     { id = "fuel",     title = "FUEL" },
     { id = "turbine",  title = "TURBINE RELAY" },
+    { id = "telemetry", title = "TELEMETRY" },
     { id = "ui",       title = "INTERFACE" },
 }
 

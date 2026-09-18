@@ -56,6 +56,10 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     local stubTurbine = { hasBalloon = function() return false end }
     local calModule = loadModule("cal", util, stubShip, config, stubLog,
         flightModule, stubTurbine)
+    -- preflight and popup are pure in the same way flight is, so both load with
+    -- nothing attached and both are checked against stub tables.
+    local preflightModule = loadModule("preflight", util, flightModule)
+    local popupModule = loadModule("popup", util)
     -- The fuel module never touches a peripheral until init is called, so it
     -- can be loaded and have its arithmetic checked on a computer with no modem.
     local fuelModule = loadModule("fuel", util, stubShip, stubCal, stubControl, config, stubLog)
@@ -65,7 +69,7 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     local shipModule = loadModule("ship", util)
     local turbineModule = loadModule("turbine", util, shipModule, config, stubLog)
     local tests = loadModule("tests", util, config, calModule, fuelModule,
-        turbineModule, shipModule, flightModule)
+        turbineModule, shipModule, flightModule, preflightModule, popupModule)
     return tests.run() and 0 or 1
 end
 
@@ -95,6 +99,9 @@ config.init(DATA)
 local log = loadModule("log")
 log.init(DATA, function() return config.get("logLevel") end)
 
+local telemetry = loadModule("telemetry", util, config)
+telemetry.init(DATA)
+
 local ship = loadModule("ship", util)
 local flight = loadModule("flight", util)
 -- turbine before cal and before control: the balloon is a relay, and both the
@@ -102,13 +109,19 @@ local flight = loadModule("flight", util)
 -- before they are built.
 local turbine = loadModule("turbine", util, ship, config, log)
 local cal = loadModule("cal", util, ship, config, log, flight, turbine)
-local control = loadModule("control", util, ship, cal, config, log, flight, turbine)
+local control = loadModule("control", util, ship, cal, config, log, flight, turbine,
+    telemetry)
 local nav = loadModule("nav", util, control, log)
 local fuel = loadModule("fuel", util, ship, cal, control, config, log)
-local ui = loadModule("ui", util, ship, cal, control, nav, fuel, turbine, config, log)
-local cmd = loadModule("cmd", util, ship, cal, control, nav, fuel, turbine, config, ui, log)
+local preflight = loadModule("preflight", util, flight)
+local popup = loadModule("popup", util)
+local ui = loadModule("ui", util, ship, cal, control, nav, fuel, turbine, config, log,
+    telemetry)
+local cmd = loadModule("cmd", util, ship, cal, control, nav, fuel, turbine, config, ui, log,
+    preflight, popup, telemetry)
 
 log.info("=== starcatcher starting ===")
+telemetry.event("boot", "starcatcher starting", "computer " .. os.getComputerID())
 log.infof("computer %d, screen %dx%d", os.getComputerID(), ui.size())
 
 local wired = ship.discover()
@@ -137,6 +150,44 @@ ui.onCommand = function(text) return cmd.run(text) end
 config.onChange = function(key)
     control.refreshGains()
     if key then log.infof("set %s = %s", key, config.format(key)) end
+end
+
+-- What the control loop does when something goes wrong in the air. The ship has
+-- already done the safe thing by the time this runs: safeHold puts thrust at
+-- zero and freezes the balloon, and this only asks what to do next. That order
+-- matters, because a modal that had to be answered before the ship acted would
+-- be a modal the ship waited behind.
+control.onAlarm = function(kind, what, detail)
+    if kind == "part" then
+        ui.raise(popup.partLost(what, detail), function(action)
+            if action == "resume" then
+                control.clearSafeHold()
+                control.start()
+            elseif action == "stop" then
+                control.clearSafeHold()
+                control.stop("STOPPED AFTER A PART WAS LOST")
+                nav.clearRoute()
+            end
+        end)
+    elseif kind == "overstress" then
+        ui.raise(popup.overstressed(what), function(action)
+            if action == "hold" then
+                control.safeHold("OVERSTRESSED")
+            elseif action == "ease" then
+                config.set("cruiseMaxRpm", math.floor(config.get("cruiseMaxRpm") / 2))
+                ui.say("cruiseMaxRpm eased to " .. config.format("cruiseMaxRpm"), "warn")
+            end
+        end)
+    elseif kind == "pitch" then
+        ui.raise(popup.pitch(what, config.get("pitchLimit")), function(action)
+            if action == "hold" then
+                control.safeHold("NOSED OVER")
+            elseif action == "ease" then
+                config.set("brakeSlew", math.max(1, math.floor(config.get("brakeSlew") / 2)))
+                ui.say("brakeSlew eased to " .. config.format("brakeSlew"), "warn")
+            end
+        end)
+    end
 end
 
 -- An arrival pops the next leg of the route, if there is one.
@@ -226,6 +277,21 @@ local function controlLoop()
     end
 end
 
+-- Its own loop, at its own rate. Nothing it reads touches a peripheral: the
+-- pose is the one the control loop already read and both relay statuses come
+-- off what last arrived on the radio, so this costs no server tick and cannot
+-- slow the propellers down by running.
+local function telemetryLoop()
+    while true do
+        if config.get("telemetry") then
+            local ok, err = pcall(telemetry.sample, control.snapshot(), fuel.status(),
+                turbine.status(), ui.popup and ui.popup.title or nil)
+            if not ok then log.error("telemetry: " .. tostring(err)) end
+        end
+        sleep(1 / math.max(0.1, config.get("telemetryHz")))
+    end
+end
+
 local function screenLoop()
     while true do
         if not ui.busy then
@@ -264,7 +330,7 @@ log.info("boot complete")
 ui.draw()
 
 local ok, err = pcall(parallel.waitForAny, controlLoop, screenLoop, inputLoop,
-    fuel.listen, turbine.listen, turbine.heartbeat, bootReport)
+    fuel.listen, turbine.listen, turbine.heartbeat, bootReport, telemetryLoop)
 
 -- setTargetSpeed yields, and a yield after Ctrl+T raises Terminated again, so
 -- the stop has to survive being interrupted or the propellers keep spinning
@@ -291,6 +357,8 @@ if not ok and err ~= "Terminated" then
     if path then print("written to " .. path) end
 end
 
+telemetry.event("boot", "shutting down", tostring(control.phase))
+telemetry.close()
 fuel.close()
 turbine.close()
 log.close()

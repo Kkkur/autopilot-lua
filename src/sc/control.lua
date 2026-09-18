@@ -12,7 +12,7 @@
 -- holding the ship up and there is no phase in which it should stop being
 -- commanded.
 
-local util, ship, cal, config, log, flight, turbine = ...
+local util, ship, cal, config, log, flight, turbine, telemetry = ...
 
 local control = {}
 
@@ -30,8 +30,10 @@ control.eta = nil
 control.demands = {}           -- line name -> rpm last decided
 control.arrivedAt = nil        -- set once on arrival, cleared by whoever reads it
 control.onArrive = nil         -- hook the navigator hangs its queue off
+control.onAlarm = nil          -- hook the screen hangs its loud popups off
 control.manual = nil           -- { throttle, yaw, level } or nil
 control.hold = nil             -- position being held, once arrived
+control.safe = false           -- in a safe hold: thrust at zero, balloon frozen
 
 -- What the screen wants to see and the pilot wants to argue with.
 control.info = {
@@ -88,14 +90,17 @@ end
 
 local function enterPhase(phase, why)
     if control.phase ~= phase then
+        local from = control.phase
         control.phase = phase
         alignedFor = 0
         log.infof("phase %s: %s", phase, tostring(why))
+        telemetry.event("phase", from .. " to " .. phase, why)
     end
     control.reason = why
 end
 
 function control.setTarget(x, y, z, name)
+    control.clearSafeHold()
     control.target = { x = x, y = y, z = z }
     control.targetName = name
     control.hold = nil
@@ -115,6 +120,7 @@ end
 
 function control.start()
     if not control.target and not control.manual then return false, "no target" end
+    control.clearSafeHold()
     control.running = true
     legBegan = os.clock()
     creepTries = 0
@@ -139,6 +145,41 @@ function control.stop(why)
     log.info("stopped: " .. (why or "by command"))
 end
 
+-- == SAFE HOLD ===============================================
+--
+-- What losing a part in the air means. Thrust to zero, the leg abandoned, the
+-- heading left exactly where it is, and the balloon frozen at the level it was
+-- already holding.
+--
+-- It does not descend, and that is the point of the whole thing rather than
+-- caution for its own sake: the computer that would fly a descent may be the
+-- one that just went quiet. Refusing to arm is safe. Flying a ship down on the
+-- strength of a number that stopped arriving is not.
+function control.safeHold(why)
+    control.safe = true
+    control.running = false
+    control.manual = nil
+    control.target = nil
+    control.targetName = nil
+    control.hold = nil
+    control.phase = "safe"
+    control.reason = why
+    control.status = "SAFE HOLD: " .. tostring(why)
+    control.statusKind = "bad"
+    control.resetPIDs()
+    for _, name in ipairs(ship.order) do control.demands[name] = 0 end
+    pcall(ship.allStop)
+    log.warn("safe hold: " .. tostring(why))
+    telemetry.event("safehold", why, "thrust zero, balloon frozen at "
+        .. tostring(control.lastBalloon))
+end
+
+function control.clearSafeHold()
+    control.safe = false
+    control.clearAlarms()
+    if control.phase == "safe" then control.phase = "idle" end
+end
+
 -- Fly by hand. Throttle and yaw are fractions of the ship's own maxima, so what
 -- the pilot asks for means the same thing on a ship whose curves have been
 -- measured and on one whose have not. Level is the balloon, straight through.
@@ -148,6 +189,7 @@ function control.setManual(throttle, yaw, level)
         if not control.target then control.stop("MANUAL OFF") end
         return
     end
+    control.clearSafeHold()
     control.manual = { throttle = throttle or 0, yaw = yaw or 0, level = level }
     control.target = nil
     control.targetName = nil
@@ -171,6 +213,10 @@ end
 -- do, which is why this is not inside the phase machine below.
 local function driveBalloon(state, wantY)
     if not turbine or not turbine.setBalloon then return nil end
+    -- The one exception, and it is the safe hold's whole point. A ship that has
+    -- lost a part keeps the level it was already holding rather than being
+    -- flown on a loop whose inputs may be the thing that went quiet.
+    if control.safe then return control.lastBalloon end
     local haveY = state.position.y
     local altErr = (wantY or haveY) - haveY
     local vspeed = state.velocity and state.velocity.y or 0
@@ -182,6 +228,60 @@ local function driveBalloon(state, wantY)
         pcall(turbine.setBalloon, level)
     end
     return level
+end
+
+-- == WATCHING FOR A PART GOING QUIET =========================
+--
+-- A relay that never spoke is a ship that has not finished booting, and the
+-- preflight gate is what refuses that. A relay that spoke and then stopped is a
+-- part lost in the air, which is a different event and the only one that trips
+-- a safe hold.
+local spoke = {}
+local alarmed = {}
+
+local function raise(kind, what, detail)
+    if alarmed[kind] then return false end
+    alarmed[kind] = true
+    telemetry.event("alarm", kind .. ": " .. tostring(what), detail)
+    if control.onAlarm then pcall(control.onAlarm, kind, what, detail) end
+    return true
+end
+
+-- Cleared whenever the pilot commits to something new, so a second leg is
+-- watched as carefully as the first.
+function control.clearAlarms()
+    alarmed = {}
+end
+
+local function watchForLoss(state)
+    local status = turbine.status()
+
+    for _, one in ipairs(status.relays or {}) do
+        if one.link == "live" then
+            spoke[one.relayId] = true
+        elseif one.link == "stale" and spoke[one.relayId] then
+            local what = string.format("relay #%d stopped answering", one.relayId)
+            control.safeHold(what)
+            raise("part", what, one.hasBalloon
+                and "it was the one holding the balloon"
+                or string.format("%d propeller(s) went with it", #(one.lines or {})))
+            return true
+        end
+    end
+
+    if status.overstressed or (status.fraction
+            and status.fraction * 100 >= config.get("stressCrit")) then
+        raise("overstress", status)
+    end
+
+    if config.get("pitchWatch") and state then
+        local pitch = util.pitchOf(state.orientation)
+        if math.abs(pitch) > config.get("pitchLimit") then
+            raise("pitch", pitch)
+        end
+    end
+
+    return false
 end
 
 -- == THE LOOP ================================================
@@ -339,6 +439,11 @@ function control.tick()
     end
 
     local cfg = config.values
+
+    -- Before the balloon, because a safe hold changes what the balloon is told
+    -- and a tick late is a tick of the wrong thing.
+    if control.running then watchForLoss(state) end
+
     local goal = control.hold or control.target
 
     -- Altitude first, and unconditionally, because it is the only loop whose
@@ -346,9 +451,11 @@ function control.tick()
     driveBalloon(state, goal and goal.y or nil)
 
     if not control.running then
-        setStatus(control.target and "READY" or "NO TARGET",
-            control.target and "warn" or "dim")
-        control.phase = "idle"
+        if not control.safe then
+            setStatus(control.target and "READY" or "NO TARGET",
+                control.target and "warn" or "dim")
+            control.phase = "idle"
+        end
         local zeros = {}
         for _, name in ipairs(ship.order) do zeros[name] = 0 end
         control.demands = flight.applySlew(control.demands, zeros, cfg.rpmSlew)
@@ -415,6 +522,7 @@ function control.snapshot()
         statusKind = control.statusKind,
         state = control.state,
         fault = control.fault,
+        safe = control.safe,
         target = control.target,
         targetName = control.targetName,
         hold = control.hold,

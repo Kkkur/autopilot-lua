@@ -8,7 +8,7 @@
 -- Everything the pilot can do has both a key and a command. Keys are for
 -- flying, commands are for saying exactly what you mean.
 
-local util, ship, cal, control, nav, fuel, turbine, config, log = ...
+local util, ship, cal, control, nav, fuel, turbine, config, log, telemetry = ...
 
 local ui = {}
 
@@ -27,6 +27,7 @@ ui.message = nil          -- transient line under the status bar
 ui.messageKind = "hi"
 ui.onCommand = nil        -- set by the host
 ui.busy = false           -- a wizard owns the screen
+ui.popup = nil            -- a modal descriptor owns the screen and the keyboard
 
 -- == COLOURS =================================================
 
@@ -836,6 +837,90 @@ local function drawLog()
     while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
 end
 
+-- == POPUPS ==================================================
+--
+-- A popup is a descriptor from sc/popup.lua drawn over whatever tab is up. It
+-- owns the screen and the keyboard and nothing else.
+--
+-- It does not set ui.busy, and that is deliberate rather than an oversight.
+-- ui.busy parks the control loop, which is right for the calibration wizard
+-- because the wizard has its hands on the propellers. A modal that stopped the
+-- balloon being commanded would drop the ship out of the sky while the pilot
+-- read it.
+
+local function popupBody(p, width)
+    local body = {}
+    local function fold(list)
+        for _, item in ipairs(list or {}) do
+            for _, text in ipairs(wrapText(item.text, width)) do
+                body[#body + 1] = { text = text, kind = item.kind }
+            end
+        end
+    end
+    fold(p.lines)
+    if p.cost and #p.cost > 0 then
+        body[#body + 1] = { text = "", kind = "dim" }
+        fold(p.cost)
+    end
+    return body
+end
+
+local function choiceLine(p)
+    local parts = {}
+    for _, choice in ipairs(p.choices or {}) do
+        parts[#parts + 1] = string.format("[%s] %s",
+            choice.key == "enter" and "Enter" or string.upper(choice.key), choice.label)
+    end
+    return table.concat(parts, "  ")
+end
+
+local function centre(text, y, fg, bg)
+    at(math.max(1, math.floor((W - #text) / 2) + 1), y, text, fg, bg)
+end
+
+-- Losing a part in the air takes the whole screen, because it is the one thing
+-- in this program that must not be mistaken for a status line.
+local function drawAlarm(p)
+    local field = C("bad")
+    for y = 1, H do line(y, "", C("hi"), field) end
+    local title = " " .. p.title .. " "
+    local inverted = math.floor(os.clock() * 2) % 2 == 0
+    centre(title, 2, inverted and field or C("hi"), inverted and C("hi") or field)
+    local y = 4
+    for _, item in ipairs(popupBody(p, W - 4)) do
+        if y <= H - 3 then at(3, y, item.text, C("hi"), field); y = y + 1 end
+    end
+    line(H - 1, "", C("ink"), C("hi"))
+    centre(choiceLine(p), H - 1, C("ink"), C("hi"))
+end
+
+local function drawBox(p)
+    local inner = math.min(W - 6, 44)
+    local body = popupBody(p, inner)
+    local height = #body + 4
+    local top = math.max(2, math.floor((H - height) / 2))
+    local left = math.max(1, math.floor((W - inner - 2) / 2) + 1)
+    local panel = C("panel")
+    local header = C(p.severity == "warn" and "warn" or "accent")
+
+    for row = top, math.min(H, top + height - 1) do
+        at(left, row, string.rep(" ", inner + 2), C("hi"), panel)
+    end
+    at(left, top, string.rep(" ", inner + 2), C("ink"), header)
+    at(left + 1, top, p.title:sub(1, inner), C("ink"), header)
+
+    local y = top + 1
+    for _, item in ipairs(body) do
+        at(left + 1, y, item.text, kindColour(item.kind), panel)
+        y = y + 1
+    end
+    at(left + 1, y + 1, choiceLine(p):sub(1, inner), C("hi"), panel)
+end
+
+local function drawPopup(p)
+    if p.severity == "alarm" then drawAlarm(p) else drawBox(p) end
+end
+
 -- == DRAW ====================================================
 
 -- Paint one frame. Everything that yields has already been read by the caller,
@@ -854,7 +939,12 @@ local function paint(snap, reads)
     else drawLog() end
     drawStatusBar(snap)
     drawInput()
+    if ui.popup then drawPopup(ui.popup) end
     win.setVisible(true)
+    if ui.popup then
+        win.setCursorBlink(false)
+        return
+    end
     win.setCursorPos(3 + #ui.input, H)
     win.setTextColour(C("hi"))
     win.setCursorBlink(true)
@@ -946,7 +1036,70 @@ local function listStep(dir)
     end
 end
 
+-- Which choice an event picks, or nil. Letters are matched on the char event
+-- rather than the key event on purpose: a key event arrives first and its char
+-- follows, so resolving on the key would leave the char queued and it would
+-- type itself into the command line the moment the popup closed.
+local function popupChoice(p, event, p1)
+    for _, choice in ipairs(p.choices or {}) do
+        if choice.key == "enter" then
+            if event == "key" and p1 == keys.enter then return choice.action end
+        elseif event == "char" and tostring(p1):lower() == choice.key then
+            return choice.action
+        end
+        if event == "key" and p1 == keys.escape and choice.action == "cancel" then
+            return choice.action
+        end
+    end
+    return nil
+end
+
+local function closePopup(p, action)
+    if ui.popup == p then ui.popup = nil end
+    telemetry.event("popup", "answered " .. p.title, action)
+    if p.onChoice then pcall(p.onChoice, action) end
+    return action
+end
+
+-- Put a popup up and carry on. This is what the control loop's alarms use: the
+-- ship has already done the safe thing by the time it is drawn, and the answer
+-- arrives whenever the pilot gets to it.
+function ui.raise(descriptor, onChoice)
+    descriptor.onChoice = onChoice or descriptor.onChoice
+    ui.popup = descriptor
+    telemetry.event("popup", "raised " .. descriptor.title, descriptor.severity)
+    pcall(ui.repaint)
+    return descriptor
+end
+
+-- Put a popup up and wait for the answer, which is what a gate needs. This runs
+-- on the input loop and blocks only that: the control loop and the screen loop
+-- are untouched, so the balloon is still being commanded while the pilot reads.
+function ui.showPopup(descriptor)
+    ui.popup = descriptor
+    telemetry.event("popup", "asked " .. descriptor.title, descriptor.severity)
+    pcall(ui.repaint)
+    while ui.popup == descriptor do
+        local event, p1 = os.pullEvent()
+        if event == "term_resize" or event == "monitor_resize" then
+            ui.resize()
+        else
+            local action = popupChoice(descriptor, event, p1)
+            if action then return closePopup(descriptor, action) end
+        end
+        pcall(ui.repaint)
+    end
+    -- Something else took the screen while this was up, which is an alarm
+    -- arriving mid question. The gate reads a nil as no.
+    return nil
+end
+
 function ui.handleKey(key)
+    if ui.popup then
+        local action = popupChoice(ui.popup, "key", key)
+        if action then closePopup(ui.popup, action) end
+        return
+    end
     if key == keys.tab then
         local guess = completeFor(ui.input)
         if guess then ui.input = guess end
@@ -954,10 +1107,10 @@ function ui.handleKey(key)
     end
     if key == keys.enter then
         if ui.input == "" and ui.tab == 3 and nav.points[ui.sel.nav] then
-            local wp = nav.points[ui.sel.nav]
-            local state = ship.readState()
-            local ok, err = nav.goTo(wp.name, state and state.position.y or nil)
-            ui.say(ok and ("flying to " .. wp.name) or tostring(err), ok and "good" or "bad")
+            -- Through the command line rather than straight at nav, so a
+            -- waypoint flown from the list passes the same gate one typed does.
+            ui.input = "goto " .. nav.points[ui.sel.nav].name
+            submit()
         else
             submit()
         end
@@ -1013,11 +1166,17 @@ function ui.handleKey(key)
 end
 
 function ui.handleChar(ch)
+    if ui.popup then
+        local action = popupChoice(ui.popup, "char", ch)
+        if action then closePopup(ui.popup, action) end
+        return
+    end
     ui.input = ui.input .. ch
     ui.historyAt = nil
 end
 
 function ui.handleClick(x, y)
+    if ui.popup then return end
     if y == 1 then
         local at_ = 1
         for index, label in ipairs(tabLabels()) do
@@ -1031,10 +1190,8 @@ function ui.handleClick(x, y)
         local index = (ui.navFirst or 1) + (y - (ui.navTop or 3))
         if nav.points[index] then
             if ui.sel.nav == index then
-                local state = ship.readState()
-                local ok, err = nav.goTo(nav.points[index].name, state and state.position.y or nil)
-                ui.say(ok and ("flying to " .. nav.points[index].name) or tostring(err),
-                    ok and "good" or "bad")
+                ui.input = "goto " .. nav.points[index].name
+                submit()
             else
                 ui.sel.nav = index
             end

@@ -6,7 +6,7 @@
 -- No ship, no peripherals, no modem. If this passes on a bare computer, the
 -- maths that flies the ship is sound and anything still wrong is wiring.
 
-local util, config, cal, fuel, turbine, ship, flight = ...
+local util, config, cal, fuel, turbine, ship, flight, preflight, popup = ...
 
 local tests = {}
 
@@ -709,6 +709,241 @@ function tests.run()
         { err = 0, yawRate = 0, d = 8, v = 0, lateral = 0.1, stopped = true }, cfg, calShip)
     check(phase == "tank", "stopped short but on the line simply goes again")
     check(reason:find("short") ~= nil, "and says that instead, in different words")
+
+
+    -- == preflight ==
+    --
+    -- The checker never touches a peripheral, so the whole of it runs against
+    -- tables that say what a ship would have said. Each stub below is a ship in
+    -- one particular state, and what is checked is that the failure is named
+    -- correctly, not merely counted. This runs on a bare computer in the world
+    -- as `starcatcher --test`, which is where it gets run now.
+
+    local function fakeShip(hasPose)
+        return {
+            order = { "2:a", "2:b", "3:c" },
+            remoteLines = {},
+            readState = function()
+                if not hasPose then return nil, "NOT ON A SUB-LEVEL" end
+                return {
+                    position = { x = 0, y = 100, z = 0 },
+                    orientation = { x = 0, y = 0, z = 0, w = 1 },
+                    velocity = { x = 0, y = 0, z = 0 },
+                    yaw = 0, speed = 0, bx = 0, by = 0, bz = 0,
+                }
+            end,
+        }
+    end
+
+    local function fakeCal(opts)
+        opts = opts or {}
+        return {
+            sides = {},
+            noseOffset = 0,
+            yawCurve = { pos = { { rpm = 256, speed = 30 } } },
+            fwdCurve = { pos = { { rpm = 256, speed = 12 } } },
+            brakeCurve = { main = { { rpm = 256, speed = 3 } } },
+            balloonCurve = { { rpm = 15, speed = 1.8 } },
+            stressAtTurn = opts.stressAtTurn or 1000,
+            stressAtCruise = opts.stressAtCruise or 1000,
+            linesOfSide = function(side)
+                if side == "left" then return opts.left or { "2:a" } end
+                if side == "right" then return opts.right or { "2:b" } end
+                return opts.main or { "3:c" }
+            end,
+            inventoryCheck = function()
+                if opts.inventory == false then
+                    return false, { { kind = "bad",
+                        text = "relay #2 had 4 line(s) when the ship was measured and has 2 now" } }
+                end
+                return true, {}
+            end,
+            summary = function()
+                if opts.unmeasured then
+                    return { { title = "SIDES", done = true }, { title = "YAW", done = false } }
+                end
+                return { { title = "SIDES", done = true }, { title = "YAW", done = true } }
+            end,
+            topForward = function() return 12 end,
+        }
+    end
+
+    local function fakeFuel(link, fraction, endurance)
+        return { status = function()
+            return { link = link, fraction = fraction, endurance = endurance }
+        end }
+    end
+
+    local function fakeTurbines(opts)
+        opts = opts or {}
+        return {
+            status = function()
+                return {
+                    link = opts.link or "live",
+                    relays = opts.relays or { { relayId = 2, link = "live", lines = {} } },
+                    stressOk = opts.stressOk ~= false,
+                    capacity = opts.capacity or 8192,
+                    stress = opts.stress or 900,
+                }
+            end,
+            hasBalloon = function() return opts.balloon ~= false end,
+        }
+    end
+
+    local fakeConfig = {
+        get = function(key)
+            if key == "fuelCrit" then return 12 end
+            return nil
+        end,
+        values = { cruiseSpeed = 12, yawRateMax = 30, fuelMargin = 1.25,
+            requireStressBudget = true, brakeMargin = 3.0, brakeRpmMax = 256 },
+    }
+
+    local whole = function() return preflight.check(fakeShip(true), fakeCal(),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig) end
+
+    local report = whole()
+    check(report.ok, "a whole ship passes the gate")
+    check(report.byId.steer.ok, "with a side each way it can steer")
+    check(report.byId.balloon.ok, "and something is holding the balloon")
+    check(#preflight.failures(report) == 0, "and there is nothing to report")
+
+    report = preflight.check(fakeShip(false), fakeCal(), fakeFuel("live", 0.5, 3600),
+        fakeTurbines(), fakeConfig)
+    check(not report.ok, "no pose is a refusal")
+    check(report.byId.sable.text:find("SUB%-LEVEL") ~= nil,
+        "and it is refused in CC: Sable's own words")
+    check(report.byId.sable.cost ~= nil, "a failure always says what it would cost")
+
+    report = preflight.check(fakeShip(true), fakeCal({ right = {} }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    check(not report.ok, "a missing side is a refusal")
+    check(report.byId.steer.text:find("0 on the right") ~= nil, "and it says which side")
+    check(report.byId.cruise.ok, "but there is still something pushing forward")
+
+    report = preflight.check(fakeShip(true), fakeCal(), fakeFuel("live", 0.5, 3600),
+        fakeTurbines({ balloon = false }), fakeConfig)
+    check(not report.ok, "nothing holding the balloon is a refusal")
+
+    report = preflight.check(fakeShip(true), fakeCal(), fakeFuel("live", 0.5, 3600),
+        fakeTurbines({ relays = { { relayId = 2, link = "stale", lines = {} } } }), fakeConfig)
+    check(not report.ok, "a relay that stopped answering is a refusal")
+    check(report.byId.relays.text:find("#2") ~= nil, "and it is named by number")
+
+    report = preflight.check(fakeShip(true), fakeCal(), fakeFuel("live", 0.04, 3600),
+        fakeTurbines(), fakeConfig)
+    check(not report.ok, "four percent of fuel is a refusal, not a warning")
+
+    report = preflight.check(fakeShip(true), fakeCal(), fakeFuel("waiting"),
+        fakeTurbines(), fakeConfig)
+    check(report.ok, "but a fuel relay that has not spoken only warns")
+    check(not report.byId.fuel.ok, "and it still says so")
+
+    report = preflight.check(fakeShip(true), fakeCal({ inventory = false }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    check(not report.ok, "a ship that is not the measured one is a refusal")
+    check(report.byId.inventory.text:find("has 2 now") ~= nil,
+        "in the words cal.inventoryCheck already wrote")
+
+    report = preflight.check(fakeShip(true), fakeCal({ unmeasured = true }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    check(not report.ok, "an unmeasured stage is a refusal")
+    check(report.byId.curves.text:find("yaw") ~= nil, "and it names the stage")
+
+    check(preflight.failures(whole()) ~= nil, "failures always returns a list")
+    local ranked = preflight.failures(preflight.check(fakeShip(true),
+        fakeCal({ right = {} }), fakeFuel("waiting"), fakeTurbines(), fakeConfig))
+    check(ranked[1].kind == "bad", "and it puts the refusals above the warnings")
+
+    -- == the leg ==
+
+    local fit = whole()
+    local plan = { dist = 500, headingChange = 90, altChange = 0,
+        cal = fakeCal(), cfg = fakeConfig.values }
+
+    local leg = preflight.forLeg(fit, { endurance = 3600 },
+        { stressOk = true, capacity = 8192, stress = 900 }, plan)
+    check(leg.ok, "an hour of fuel covers a five hundred block leg")
+    check(leg.seconds > 0, "and the leg has a length in seconds")
+
+    leg = preflight.forLeg(fit, { endurance = 5 },
+        { stressOk = true, capacity = 8192, stress = 900 }, plan)
+    check(not leg.ok, "five seconds of fuel does not")
+    check(leg.byId.fuelTime.cost:find("short") ~= nil, "and it says how far short")
+
+    leg = preflight.forLeg(fit, { endurance = 3600 },
+        { stressOk = true, capacity = 100, stress = 90 }, plan)
+    check(not leg.ok, "a network that cannot carry the turn is a refusal")
+
+    leg = preflight.forLeg(fit, { endurance = 3600 }, nil, plan)
+    check(leg.ok, "no stressometer is a warning rather than a refusal")
+
+    plan.cfg = { cruiseSpeed = 12, yawRateMax = 30, fuelMargin = 1.25,
+        requireStressBudget = false, brakeMargin = 3.0, brakeRpmMax = 256 }
+    leg = preflight.forLeg(fit, { endurance = 3600 },
+        { stressOk = true, capacity = 100, stress = 90 }, plan)
+    check(leg.ok, "and so is the captain turning the budget off")
+
+    -- == popups ==
+    --
+    -- What is checked is the sentence, because the sentence is the whole reason
+    -- this module is separate from the drawing.
+
+    local function joined(list)
+        local out = ""
+        for _, item in ipairs(list or {}) do out = out .. " " .. item.text end
+        return out
+    end
+
+    local failing = preflight.check(fakeShip(true), fakeCal({ right = {} }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    local modal = popup.preflight(failing, "fly")
+    check(modal.severity == "alarm", "a refusal is loud")
+    check(modal.title:find("FLY") ~= nil, "and says what it is refusing")
+    check(#modal.lines > 0, "it lists what is wrong")
+    check(#modal.cost > 0, "and what each one would cost")
+    local actions = {}
+    for _, choice in ipairs(modal.choices) do actions[choice.action] = choice.key end
+    check(actions.override ~= nil and actions.cancel ~= nil,
+        "every refusal can be overridden or cancelled")
+
+    modal = popup.partLost("relay #2 stopped answering", "it was holding the balloon")
+    check(modal.severity == "alarm", "a part lost in the air is the loud one")
+    check(modal.lines[1].text:find("#2") ~= nil, "and it names the part")
+    check(joined(modal.cost):find("balloon") ~= nil, "it says the balloon is being held")
+    check(joined(modal.cost):find("zero") ~= nil, "and that thrust is already at zero")
+
+    modal = popup.fuelShortfall(120, 1400)
+    check(modal.title:find("FUEL") ~= nil, "the fuel popup is about fuel")
+    check(joined(modal.cost):find("short") ~= nil, "and quotes the shortfall")
+
+    modal = popup.altitudeChange(100, 60)
+    check(modal.title == "DESCENT", "going down is called a descent")
+    modal = popup.altitudeChange(100, 160)
+    check(modal.title == "CLIMB", "and going up a climb")
+    check(#modal.choices == 3, "and it offers change, keep or cancel")
+
+    modal = popup.overstressed({ overstressed = true, fraction = 1, worstRelay = 3 })
+    check(modal.lines[1].text:find("stopped") ~= nil, "an overstressed network has stopped")
+    check(modal.lines[2].text:find("#3") ~= nil, "and the worst relay is named")
+
+    modal = popup.pitch(-19, 12)
+    check(modal.lines[1].text:find("19") ~= nil, "the pitch popup quotes the angle")
+
+    -- Every popup in the program offers a way out, because one that does not is
+    -- a modal a pilot cannot dismiss while the ship is in the air.
+    for _, built in ipairs({
+        popup.preflight(failing, "fly"),
+        popup.manualOverride(failing),
+        popup.fuelShortfall(10, 100),
+        popup.altitudeChange(100, 60),
+        popup.overstressed({ fraction = 0.99 }),
+        popup.pitch(-19, 12),
+        popup.partLost("something", nil),
+    }) do
+        check(#built.choices > 0, built.title .. " offers at least one way out")
+        check(built.title ~= nil and #built.title > 0, built.title .. " has a title")
+    end
 
     print(string.format("%d passed, %d failed", passed, failed))
     return failed == 0

@@ -419,6 +419,29 @@ end
 local sent = 0
 local latest = buildMessage()
 
+
+-- == TELEMETRY ===============================================
+--
+-- A relay that goes quiet is the one event nobody can see from the flight
+-- computer, because the way it is seen from there is by the messages stopping.
+-- So the relay writes its own last word to its own disk, which is a folder on
+-- the host: whatever it was reading, and when, still readable after it fell off
+-- the radio. Same shape as the message it broadcasts, because that message is
+-- already everything it knows.
+local TELEMETRY = fs.combine(DATA, "telemetry")
+
+local function writeTelemetry(message)
+    pcall(function()
+        if not fs.exists(TELEMETRY) then fs.makeDir(TELEMETRY) end
+        local handle = fs.open(fs.combine(TELEMETRY, "snapshot.txt"), "w")
+        if not handle then return end
+        handle.writeLine("-- rewritten every sample, computer " .. os.getComputerID())
+        handle.writeLine("-- clock " .. string.format("%.1f", os.clock()))
+        handle.writeLine(textutils.serialise(message))
+        handle.close()
+    end)
+end
+
 local function sampleLoop()
     while true do
         for _, entry in ipairs(tanks) do readTank(entry) end
@@ -426,6 +449,7 @@ local function sampleLoop()
         for _, entry in ipairs(tanks) do total = total + entry.amount end
         record(total)
         latest = buildMessage()
+        writeTelemetry(latest)
         noteTanks()
         noteLevels(latest.fraction)
         sleep(SAMPLE)
