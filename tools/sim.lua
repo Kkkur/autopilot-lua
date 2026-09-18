@@ -456,6 +456,9 @@ files["starcatcher/cal.cfg"] = [[{
   frontOffset = 0,
   frontConfirmed = true,
   yawAuth = { left = 0.0594, right = 0.0655 },
+  -- 32 deg/s against a yaw drag of 0.8 is 25.6 deg/s/s from rest, which is what
+  -- the wizard reads off the rise of the top rung.
+  yawAccel = 25.6,
   yawCurve = {
     pos = { { rpm = 64, speed = 8.0 }, { rpm = 128, speed = 16.0 },
             { rpm = 192, speed = 24.0 }, { rpm = 256, speed = 32.0 } },
@@ -1298,6 +1301,13 @@ if options.script == "cal" then
         local fwdTop = top(measured.fwdCurve)
         claim("top speed", fwdTop > 12.5 and fwdTop < 14.5,
             string.format("%.2f m/s, want 13.96", fwdTop))
+        -- The toy hull reaches 32 deg/s against a drag of 0.8, so from rest at
+        -- a full differential it accelerates at about 25.6 deg/s/s. That is
+        -- the number the approach brakes on, and a run that measured it two
+        -- times too high would sail past every heading it was given.
+        claim("yaw acceleration", (measured.yawAccel or 0) > 12
+            and (measured.yawAccel or 0) < 34,
+            string.format("%.1f deg/s/s, want about 25.6", measured.yawAccel or 0))
         claim("hover strength", measured.altHover == 7 or measured.altHover == 8,
             tostring(measured.altHover) .. ", want 7 or 8")
         claim("both sides have an authority",

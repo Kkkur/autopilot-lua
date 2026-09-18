@@ -62,6 +62,7 @@ cal.fwdCurve = nil    -- { pos, neg }, common RPM against settled speed
 cal.brakeCurve = nil  -- { main, all }, reverse RPM against deceleration
 cal.balloonCurve = nil
 cal.altHover = nil
+cal.yawAccel = nil     -- deg/s/s, how fast the hull gets into a turn and out of one
 cal.stressAtTurn = nil
 cal.stressAtCruise = nil
 cal.inventory = nil   -- what the ship looked like when it was last measured
@@ -221,6 +222,7 @@ function cal.load()
     cal.noseOffset, cal.yawCurve, cal.fwdCurve, cal.brakeCurve = nil, nil, nil, nil
     cal.balloonCurve, cal.altHover, cal.inventory = nil, nil, nil
     cal.stressAtTurn, cal.stressAtCruise = nil, nil
+    cal.yawAccel = nil
     cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
     cal.frontConfirmed = nil
 
@@ -233,6 +235,7 @@ function cal.load()
 
     cal.sides = cal.parseSides(data.sides)
     cal.noseOffset = tonumber(data.noseOffset)
+    cal.yawAccel = tonumber(data.yawAccel)
     cal.frontOffset = tonumber(data.frontOffset)
     cal.alignSpread = tonumber(data.alignSpread)
     cal.alignPoints = cal.parsePoints(data.alignPoints)
@@ -270,6 +273,7 @@ function cal.save()
         brakeCurve = cal.brakeCurve, balloonCurve = cal.balloonCurve,
         altHover = cal.altHover, inventory = cal.inventory,
         stressAtTurn = cal.stressAtTurn, stressAtCruise = cal.stressAtCruise,
+        yawAccel = cal.yawAccel,
         meta = cal.meta,
     }))
     handle.close()
@@ -418,6 +422,10 @@ cal.MEASURED = {
       help = "The redstone strength that came nearest to holding this ship's height.",
       get = function() return cal.altHover end,
       set = function(v) cal.altHover = v end },
+    { id = "yawAccel", title = "yaw acceleration", unit = "deg/s/s", stage = "yaw",
+      help = "How fast the hull gets up to a turn, which is what the approach assumes it can be stopped at. Too high and it sails past the heading; too low and the last ninety degrees crawl.",
+      get = function() return cal.yawAccel end,
+      set = function(v) cal.yawAccel = v end },
     { id = "stressAtTurn", title = "stress, turning", unit = "su", stage = "yaw",
       help = "What the kinetic network was carrying at a full turn.",
       get = function() return cal.stressAtTurn end,
@@ -579,7 +587,8 @@ function cal.summary()
         elseif stage.id == "yaw" then
             row.done = cal.yawCurve ~= nil
             if row.done then
-                row.detail = string.format("top %.1f deg/s%s", cal.topYawRate() or 0,
+                row.detail = string.format("top %.1f deg/s%s%s", cal.topYawRate() or 0,
+                    cal.yawAccel and string.format(", %.1f deg/s/s", cal.yawAccel) or "",
                     cal.stressAtTurn and string.format(", %.0f su", cal.stressAtTurn) or "")
             end
         elseif stage.id == "forward" then
@@ -730,6 +739,10 @@ local function track(ctx, opts)
     local started = os.clock()
     local history = {}
     local lost = false
+    -- The steepest the reading rose while the rung was coming up to speed. The
+    -- settled value is what the ladder wants; this is how fast the hull got
+    -- there, and it is free here because the samples are being taken anyway.
+    local climb = 0
 
     local function sampler()
         while true do
@@ -747,6 +760,13 @@ local function track(ctx, opts)
                 local a, b = history[1], history[#history]
                 local span = b.t - a.t
                 if span > 0.2 then slope = (b.v - a.v) / span end
+            end
+
+            if math.abs(slope) > math.abs(climb) and value * slope > 0 then
+                -- Only a rise, and only one in the direction the reading is
+                -- already going. A fall is the hull being stopped by the
+                -- cooldown that follows, which is a different measurement.
+                climb = math.abs(slope)
             end
 
             if opts.live then
@@ -786,7 +806,7 @@ local function track(ctx, opts)
     elseif opts.wantSign and result * opts.wantSign <= 0 then
         reason = "went the wrong way"
     end
-    return result, reason
+    return result, reason, climb
 end
 
 -- Between rungs the ship has to shed what the last one built up, or the next
@@ -1146,6 +1166,9 @@ local function stageYaw(ctx)
     local total = #ladder * #ways
     local index = 0
     cal.yawCurve = cal.yawCurve or {}
+    -- Forgotten at the start of the run rather than kept and beaten, because
+    -- the largest rise ever seen on any ship is not a property of this one.
+    cal.yawAccel = nil
     -- The swap below is offered once, and only while the ladder has kept
     -- nothing, because the offer is about how the sides were filed and not
     -- about this rung. Past the first kept reading a hull that turns the wrong
@@ -1163,7 +1186,7 @@ local function stageYaw(ctx)
             local again = true
             while again do
                 again = false
-                local rate, reason = track(ctx, {
+                local rate, reason, climb = track(ctx, {
                     apply = function()
                         ship.flush(flight.mix(0, diff * sign, ship.order, cal, cfg()))
                     end,
@@ -1220,6 +1243,14 @@ local function stageYaw(ctx)
                     if rate and not reason then
                         samples[#samples + 1] = { rpm = diff, speed = math.abs(rate) }
                         kept = kept + 1
+                        -- How hard the hull can be got turning, which is also
+                        -- how hard it can be stopped: the same propellers do
+                        -- both and the drag is on the braking side. The
+                        -- fastest rise any rung managed is the one kept,
+                        -- because it is the top rung that a turn is flown at.
+                        if climb and climb > (cal.yawAccel or 0) then
+                            cal.yawAccel = climb
+                        end
                         ctx.note(string.format("%+4d rpm -> %s deg/s", diff * sign,
                             fine(math.abs(rate))), "good")
                         log.infof("cal: yaw way=%s rpm=%d rate=%.2f %s", way, diff, rate, reason or "settled")
@@ -1231,6 +1262,11 @@ local function stageYaw(ctx)
                             if stress then
                                 cal.stressAtTurn = stress
                                 ctx.note(string.format("a full turn draws %.0f su", stress))
+                            end
+                            if cal.yawAccel then
+                                ctx.note(string.format(
+                                    "the hull gets up to a turn at %s deg/s/s, which is what the approach brakes on",
+                                    fine(cal.yawAccel)))
                             end
                         end
                     else
@@ -1313,13 +1349,16 @@ local function turnTo(ctx, want, label)
 
             pose = state.yaw
             err = util.wrapAngle(want - pose)
-            local demand = flight.tankDemand(err, pid, cal, cfg(), dt)
+            -- The rate the hull is actually turning at, which is what lets the
+            -- turn stop rather than coast through the heading.
+            local rate = ship.yawRate()
+            local demand = flight.tankDemand(err, pid, cal, cfg(), dt, rate)
             ship.flush(flight.mix(0, demand.diff, ship.order, cal, cfg()))
 
             ctx.panel({
                 rungLabel = label,
                 value = err, valueLabel = "off", unit = "deg",
-                slope = ship.yawRate() or 0,
+                slope = rate or 0,
                 elapsed = now - started,
                 steady = math.abs(err) <= tol,
                 moving = true,

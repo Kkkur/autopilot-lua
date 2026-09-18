@@ -377,7 +377,7 @@ local function flyLeg(state, goal, dt)
 
     -- Tank: rotate, do not translate.
     if control.phase == "tank" then
-        local demand = flight.tankDemand(err, yawPID, cal, cfg, dt)
+        local demand = flight.tankDemand(err, yawPID, cal, cfg, dt, yawRate)
         control.info.want = 0
         control.info.common = 0
         control.info.differential = demand.diff

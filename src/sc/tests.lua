@@ -210,6 +210,103 @@ function tests.run()
     check(named, "and the relay that is missing is named")
     cal.inventory = nil
 
+    -- == the approach to a heading ==
+    -- A turn that asks for the fastest rate allowed until the error is small
+    -- and then asks the hull to stop dead is a turn that sails past. What can
+    -- still be stopped in the error that is left is a sum, not a gain.
+    config.values = config.defaults()
+    near(flight.approachRate(90, 20, 1, 0), 60, "a wide error may be turned at full speed")
+    near(flight.approachRate(10, 20, 1, 0), 20, "a narrow one may not")
+    near(flight.approachRate(10, 20, 0.25, 0), 10,
+        "and trusting a quarter of the deceleration halves the rate it allows")
+    near(flight.approachRate(0, 20, 1, 1.5), 1.5,
+        "the floor is what closes the last fraction of a degree")
+    check(flight.approachRate(90, nil, 1, 0) == nil,
+        "a ship whose acceleration was never measured gets no profile at all")
+    check(flight.approachRate(90, 0, 1, 0) == nil, "and neither does one that cannot turn")
+
+    -- The rate the profile allows is exactly the rate that arrives with nothing
+    -- left over: v squared over twice the deceleration is the error itself.
+    local accel, atErr = 18, 40
+    local allowed = flight.approachRate(atErr, accel, 1, 0)
+    near(allowed * allowed / (2 * accel), atErr,
+        "the allowed rate is the one that stops precisely on the heading")
+
+    -- The gain of the inner loop is not a number anybody chooses: a hull that
+    -- reaches its top rate at a full differential answers a rate error the size
+    -- of that top rate with a full differential.
+    local rateLadder = { pos = { { rpm = 128, speed = 16 }, { rpm = 256, speed = 32 } } }
+    rateLadder.neg = rateLadder.pos
+    near(flight.rpmPerRate({ yawCurve = rateLadder }, config.values), 256 / 32,
+        "the ladder itself says what a degree a second is worth")
+    near(flight.rpmPerRate({}, config.values), config.get("tankRpmMax") / config.get("yawRateMax"),
+        "and with no ladder the configured limits do")
+
+    -- The one thing feed forward alone can never do. The target is still ahead,
+    -- so every term of the old loop pointed forwards, and the hull that is
+    -- already turning too fast to stop needs the propellers the other way.
+    local braking = { yawCurve = rateLadder, yawAuth = { left = 0.06, right = 0.06 },
+                      sides = {}, yawAccel = 8 }
+    local hot = flight.tankDemand(20, util.newPID(4, 0, 0, -1e6, 1e6, 50),
+        braking, config.values, 0.1, 30)
+    check(hot.diff < 0,
+        "a hull turning faster than it can stop is given the propellers in reverse")
+    local cold = flight.tankDemand(20, util.newPID(4, 0, 0, -1e6, 1e6, 50),
+        braking, config.values, 0.1, 0)
+    check(cold.diff > 0, "and one that is not yet turning is given them forwards")
+
+    -- == a turn that has to arrive ==
+    -- Flown against a hull with mass: yaw rate integrates towards the demand
+    -- rather than becoming it, which is the whole reason a proportional turn
+    -- overshoots. The check is the ship ending up on the heading, not the shape
+    -- of the numbers on the way.
+    local function flyTurn(turnCal, drag)
+        local cfg = config.values
+        local pid = util.newPID(cfg.yawKp, cfg.yawKi, cfg.yawKd, -1e6, 1e6, 50)
+        local yaw, rate, dt = 0, 0, 0.1
+        -- How far past the heading it went, which is the fault being fixed.
+        local past = 0
+        for _ = 1, 1200 do
+            local err = util.wrapAngle(120 - yaw)
+            local demand = flight.tankDemand(err, pid, turnCal, cfg, dt, rate)
+            -- The hull answers a differential the way the simulator's does:
+            -- torque in, drag out, and the rate is what is left.
+            local wanted = demand.diff / 256 * 32
+            rate = rate + ((wanted * drag) - rate * drag) * dt
+            yaw = util.wrapAngle(yaw + rate * dt)
+            local beyond = util.wrapAngle(yaw - 120)
+            if beyond > past then past = beyond end
+        end
+        return util.wrapAngle(120 - yaw), rate, past
+    end
+
+    local ladder = { pos = { { rpm = 64, speed = 8 }, { rpm = 128, speed = 16 },
+                             { rpm = 192, speed = 24 }, { rpm = 256, speed = 32 } } }
+    ladder.neg = ladder.pos
+    -- A heavy hull: it tops out at 32 deg/s and takes its time getting there,
+    -- which is 8 deg/s/s from rest. That is the number the wizard reads off the
+    -- rise of a rung, so it is the number the profile is given here.
+    local braked = { yawCurve = ladder, yawAuth = { left = 0.06, right = 0.06 },
+                     sides = {}, yawAccel = 8 }
+    local leftErr, leftRate, leftPast = flyTurn(braked, 0.25)
+    check(math.abs(leftErr) <= config.get("tankPadding"),
+        string.format("a hull with a measured acceleration arrives, %.2f deg out", leftErr))
+    check(math.abs(leftRate) <= config.get("tankHoldRate"),
+        string.format("and is no longer swinging when it gets there, %.2f deg/s", leftRate))
+
+    -- The same hull with nothing measured still turns. It is allowed to arrive
+    -- untidily; what it may not do is fail to turn at all, because that is the
+    -- ship every calibration starts as.
+    local plain = { yawCurve = ladder, yawAuth = { left = 0.06, right = 0.06 }, sides = {} }
+    local plainErr, _, plainPast = flyTurn(plain, 0.25)
+    check(math.abs(plainErr) < 90, "and one with nothing measured still comes round")
+    -- The point of the whole profile, in one line: the same hull, the same
+    -- gains, the same 120 degree turn, and the only difference is whether the
+    -- controller knew how hard the ship can be stopped.
+    check(leftPast < plainPast / 2,
+        string.format("knowing that halves the overshoot, %.1f deg against %.1f",
+            leftPast, plainPast))
+
     -- == headings a pilot typed, and headings averaged ==
     -- The align stage lives on both of these. An average of headings is not an
     -- average of numbers, and a heading of zero is due south rather than a

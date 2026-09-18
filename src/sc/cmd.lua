@@ -485,7 +485,7 @@ define("forget", {
             cal.balloonCurve, cal.altHover = nil, nil
             cal.meta.balloonAt = nil
         elseif what == "yaw" then
-            cal.yawCurve, cal.stressAtTurn = nil, nil
+            cal.yawCurve, cal.stressAtTurn, cal.yawAccel = nil, nil, nil
             cal.meta.yawAt = nil
         elseif what == "forward" then
             cal.fwdCurve, cal.stressAtCruise = nil, nil
@@ -508,6 +508,7 @@ define("forget", {
             cal.noseOffset, cal.yawCurve, cal.fwdCurve = nil, nil, nil
             cal.brakeCurve, cal.balloonCurve, cal.altHover = nil, nil, nil
             cal.stressAtTurn, cal.stressAtCruise, cal.inventory = nil, nil, nil
+            cal.yawAccel = nil
             cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
             cal.frontConfirmed = nil
         else

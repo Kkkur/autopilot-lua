@@ -48,6 +48,7 @@
 --   sides        line key -> { side = "left"|"right"|"main"|"none", reverse }
 --   noseOffset   degrees between the hull's +Z and where the main actually pushes
 --   yawAuth      { left = deg/s per RPM, right = deg/s per RPM }
+--   yawAccel     deg/s/s, how fast the hull gets up to a turn and out of one
 --   yawCurve     { pos = ladder, neg = ladder }, differential RPM against yaw rate
 --   fwdCurve     { pos = ladder, neg = ladder }, common RPM against settled speed
 --   brakeCurve   { main = ladder, all = ladder }, reverse RPM against deceleration
@@ -103,6 +104,31 @@ function flight.wantYawRate(err, pid, rateCap, dt)
     return util.clamp(pid:update(err, dt), -rateCap, rateCap)
 end
 
+-- The fastest the hull may still be turning at this heading error and be able
+-- to stop on the heading rather than sail past it.
+--
+-- This is the braking distance sum, in degrees instead of metres. A hull that
+-- can shed `accel` degrees a second every second needs `rate^2 / 2accel`
+-- degrees to come to a stop, so at an error of `err` the most it can be doing
+-- and still arrive is the square root of twice the deceleration times the
+-- error. A proportional controller has no such term: it asks for the fastest
+-- turn allowed until the error is small and then asks the hull to stop dead,
+-- which a hull with any mass to it cannot do. That is not a gain that wants
+-- raising, it is a sum that was missing.
+--
+-- `safety` is how much of the measured deceleration to trust. Less than all of
+-- it, because the number was measured once, on a ship whose cargo moves.
+--
+-- The floor matters as much as the curve. Without it the profile asks for
+-- nothing at all in the last fraction of a degree, the demand falls under
+-- tankRpmMin, and the hull stops half a degree out for ever.
+function flight.approachRate(err, accel, safety, floor)
+    if not accel or accel <= 0 then return nil end
+    local usable = accel * util.clamp(safety or 1, 0.05, 1)
+    local rate = math.sqrt(2 * usable * math.abs(err))
+    return math.max(rate, floor or 0)
+end
+
 -- Calibration gives deg/s of yaw per RPM for each side, and they differ,
 -- because the two sides of a hand built hull are never the same distance out.
 -- Equal torque needs the weaker side at full RPM and the stronger held back to
@@ -127,18 +153,73 @@ function flight.yawDifferential(wantRate, yawCurve, rpmCap)
     return util.clamp(rpm, 0, rpmCap) * util.sign(wantRate)
 end
 
+-- How much differential a change of one degree a second of yaw is worth, in
+-- RPM. Off the measured ladder when there is one, since that is exactly what
+-- the ladder says, and off the configured limits when there is not.
+--
+-- This is the gain the inner loop needs and it is not a number anybody has to
+-- choose: a hull that reaches its top rate at full differential answers a rate
+-- error the size of that top rate with a full differential.
+function flight.rpmPerRate(cal, cfg)
+    local top = nil
+    if cal.yawCurve then
+        for _, way in ipairs({ "pos", "neg" }) do
+            local speed = util.curveTopSpeed(cal.yawCurve[way])
+            if speed and (not top or speed > top) then top = speed end
+        end
+    end
+    if not top or top <= 0 then top = cfg.yawRateMax end
+    if top <= 0 then return 0 end
+    return cfg.tankRpmMax / top
+end
+
 -- The whole tank phase in one call: rotate, do not translate.
 --
 -- The pid is an argument rather than something this module keeps, because a
 -- module that keeps state is a module that cannot be tested twice in one run.
-function flight.tankDemand(err, pid, cal, cfg, dt)
+--
+-- `haveRate` is what the hull is actually doing, and without it this is a turn
+-- flown blind. The ladder says what differential holds a rate once the hull has
+-- settled at it, which is a fine thing to ask for and no way to stop: a hull
+-- asked for a slower turn simply gets less push, and coasts through the heading
+-- on the momentum it already had. Nothing in that loop can ever command the
+-- other way. That is the overshoot, and no gain fixes it, because the number
+-- that says to reverse is one this function was never given.
+--
+-- So the demand is the ladder's feed forward plus the error between the rate
+-- wanted and the rate there is. When the hull is turning faster than the
+-- approach allows, that term goes negative and the propellers push the other
+-- way, which is what stopping is.
+function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
     local wantRate = flight.wantYawRate(err, pid, cfg.yawRateMax, dt)
+
+    -- Held down to what can still be stopped in the error that is left, and
+    -- only when the demand is driving the hull towards the heading. A demand
+    -- pointing the other way is the controller braking an overshoot out, and
+    -- limiting that would be limiting the recovery by how small the mistake
+    -- is: the tighter the overshoot the weaker the correction allowed, which
+    -- is backwards and was measured as such.
+    local limit = flight.approachRate(err, cal.yawAccel, cfg.yawBrakeSafety,
+        cfg.yawApproachMin)
+    if limit and wantRate * err > 0 and math.abs(wantRate) > limit then
+        wantRate = util.sign(wantRate) * limit
+    end
+
     local diff = flight.yawDifferential(wantRate, cal.yawCurve, cfg.tankRpmMax)
 
     if not diff then
         -- No ladder yet, so the best available statement is that a full rate
         -- deserves full RPM. Calibration replaces this with the truth.
         diff = cfg.tankRpmMax * util.clamp(wantRate / cfg.yawRateMax, -1, 1)
+    end
+
+    -- The inner loop: what the hull is doing against what it was asked for.
+    -- Feed forward alone holds a rate; this is what changes one, and it is the
+    -- only term in the whole turn that can put the propellers into reverse.
+    if haveRate and (cfg.yawRateKp or 0) > 0 then
+        local slope = flight.rpmPerRate(cal, cfg)
+        diff = diff + (wantRate - haveRate) * slope * cfg.yawRateKp
+        diff = util.clamp(diff, -cfg.tankRpmMax, cfg.tankRpmMax)
     end
 
     -- Below the minimum a speed controller buzzes without turning anything, so
