@@ -1853,21 +1853,33 @@ function ui.makeWizard(title)
         -- One live row, whatever the stage happens to be measuring. The label
         -- and the unit come with the reading, so a yaw rate is never drawn as
         -- metres per second.
+        -- No progress bars any more, because there is no longer anything to be
+        -- making progress towards: a rung ends when the pilot says it has
+        -- ended. What is drawn instead is the two things the pilot is deciding
+        -- on, whether the reading has stopped moving and whether the ship is
+        -- moving at all, and how long they have been watching it.
         if fields.value then
-            line(y, string.format(" %-6s %+7.2f %-5s  trend %+6.3f  %s",
+            line(y, string.format(" %-6s %+7.2f %-5s  trend %+6.3f",
                 fields.valueLabel or "value", fields.value, fields.unit or "",
-                fields.slope or 0, (fields.phase or ""):upper()),
+                fields.slope or 0),
                 fields.phase == "cooldown" and C("warn") or C("hi")); y = y + 1
-            at(1, y, " hold ", C("dim"), C("bg"))
-            bar(7, y, math.max(6, W - 22), (fields.held or 0) / math.max(0.1, fields.holdNeeded or 1),
-                fields.phase == "cooldown" and C("warn") or C("good"))
-            at(W - 14, y, string.format("%4.1f/%-4.1fs", fields.held or 0, fields.holdNeeded or 0),
-                C("dim"), C("bg")); y = y + 1
-            at(1, y, " time ", C("dim"), C("bg"))
-            bar(7, y, math.max(6, W - 22), (fields.elapsed or 0) / math.max(0.1, fields.settle or 1),
-                C("panel"))
-            at(W - 14, y, string.format("%4.1f/%-4.1fs", fields.elapsed or 0, fields.settle or 0),
-                C("dim"), C("bg")); y = y + 1
+
+            local state, colour
+            if fields.phase == "cooldown" then
+                state, colour = "COMING TO REST", C("warn")
+            elseif fields.phase == "braking" then
+                state, colour = "STOPPING", C("warn")
+            elseif fields.moving == false then
+                state, colour = string.format("READS AS NO MOVEMENT, UNDER %.2f",
+                    fields.floor or 0), C("bad")
+            elseif fields.steady then
+                state, colour = "STEADY, THIS IS THE READING", C("good")
+            else
+                state, colour = "STILL CHANGING", C("dim")
+            end
+            at(1, y, " " .. state, colour, C("bg"))
+            at(W - 7, y, string.format("%5.1fs", fields.elapsed or 0), C("dim"), C("bg"))
+            y = y + 1
         end
 
         -- The sides stage reads two numbers at once and the second one is the
@@ -1900,6 +1912,11 @@ function ui.makeWizard(title)
         -- panel{prompt = false} clears it, which merging a nil could not do.
         if fields.prompt and fields.prompt ~= false then
             line(y, " " .. fields.prompt, C("accent")); y = y + 1
+        end
+        -- What ends the rung, said on the screen that is showing the rung. A
+        -- wizard that waits for a key it never named is a wizard that has hung.
+        if fields.keepPrompt and fields.keepPrompt ~= false then
+            line(y, " " .. fields.keepPrompt, C("accent")); y = y + 1
         end
 
         -- The notes are the running commentary and they live at the bottom.

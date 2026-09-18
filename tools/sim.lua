@@ -25,7 +25,7 @@ for index = 1, #(arg or {}) do
     if arg[index] == "--verbose" then options.verbose = true end
     if arg[index] == "--tabs" then options.script = "tabs"; options.frames = 400 end
 if arg[index] == "--clicks" then options.script = "clicks"; options.frames = 400 end
-    if arg[index] == "--cal" then options.script = "cal"; options.frames = 9000 end
+    if arg[index] == "--cal" then options.script = "cal"; options.frames = 24000 end
     if arg[index] == "--test" then options.script = "test" end
     -- The physics probe is about the hull, so it picks its own ship and there is
     -- no sense in asking for it against the other one.
@@ -476,16 +476,13 @@ files["starcatcher/cal.cfg"] = [[{
 }]]
 
 -- The wizard, driven headless, measures a ship that is not really there in real
--- time. Every rung waits for a number to stop moving, and at the shipped
--- defaults five stages take about eight minutes of simulated time. These are
--- the same settings a pilot can reach from the TUNE tab, wound down to what the
--- toy ship needs, so what is being tested is the wizard and not the patience of
--- whoever runs it.
+-- time. Nothing in it waits out a clock any more, so what is wound down here
+-- is only the size of the run: a shorter ladder and a faster live row. These
+-- are the same settings a pilot can reach from the TUNE tab, so what is being
+-- tested is the wizard and not the patience of whoever runs it.
 if options.script == "cal" then
     files["starcatcher/config.cfg"] = [[{
-      calSettle = 8, calHold = 1, calStable = 0.3, calYawStable = 1.5,
-      calCooldown = 1, calSample = 0.2, calSteps = 3,
-      calBalloonDwell = 4, calRunup = 5,
+      calStable = 0.3, calYawStable = 1.5, calSample = 0.2, calSteps = 3,
     }]]
     -- and it starts from a ship nobody has ever measured, because a run that
     -- began from the seeded answers would be testing the file rather than the
@@ -918,44 +915,32 @@ local function typeLine(text)
 end
 
 if options.script == "cal" then
-    -- Walk the five stage wizard with a pilot who agrees with everything: run
-    -- the stage, accept the side it read, yes run the brake test.
+    -- Walk the five stage wizard with a pilot who agrees with everything and
+    -- who waits before agreeing.
     --
-    -- The waits are what makes this work rather than decoration. A key pressed
-    -- while a rung is settling is swallowed by the abort watcher the settle runs
-    -- against, so every answer has to arrive after the measurement it answers
-    -- has finished. Generous is safe: the wizard sits at its prompt.
+    -- Nothing in the wizard ends a rung by itself any more: every reading is
+    -- kept when the pilot presses Enter. So the script cannot count seconds of
+    -- settling, and counting rungs would be a second copy of the wizard's own
+    -- arithmetic that goes wrong the first time calSteps changes. It presses
+    -- Enter on a slow tick instead, which answers a prompt when there is a
+    -- prompt and keeps a reading when there is a reading.
+    --
+    -- The tick is what makes the measurement real. Ten seconds is far longer
+    -- than the toy ship needs to reach a demand, so every reading is taken
+    -- from a ship that has finished responding, which is the whole point of
+    -- the change being tested.
+    --
     -- Nothing is on the network at boot. Every propeller on this ship is on a
     -- relay and they adopt about a second in, so a wizard started before that
     -- measures a ship with no propellers on it.
     queueWait(60)
     typeLine("cal")
 
-    -- Sides: one prompt to spin each line and one to accept what it read.
-    queueWait(20); queueEvent("key", keys.enter)
-    for _ = 1, 5 do
-        queueWait(20);  queueEvent("key", keys.enter)
-        queueWait(230); queueEvent("key", keys.enter)
+    for _ = 1, 70 do
+        queueWait(285)
+        queueEvent("key", keys.enter)
     end
 
-    -- Balloon: a sweep and a refinement, and nothing to answer while it runs.
-    queueWait(20); queueEvent("key", keys.enter)
-    queueWait(900)
-
-    -- Yaw, then forward. Both ladders, both ways, no questions.
-    queueEvent("key", keys.enter)
-    queueWait(1300)
-    queueEvent("key", keys.enter)
-    queueWait(1300)
-
-    -- Braking: four run ups, each one confirmed on its own.
-    queueEvent("key", keys.enter)
-    for _ = 1, 4 do
-        queueWait(20);  queueEvent("key", keys.enter)
-        queueWait(420)
-    end
-
-    queueWait(20); queueEvent("key", keys.enter)
 elseif options.script == "tabs" then
     -- Walk every tab and photograph each one, which is the cheapest way to
     -- catch a draw that indexes off the end of something.

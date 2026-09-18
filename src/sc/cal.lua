@@ -28,6 +28,16 @@
 -- Everything here is allowed to be missing. A ship that has never been
 -- calibrated still flies, badly, on the fallbacks in flight.lua, and an
 -- uncalibrated ship saying so beats an uncalibrated ship pretending.
+--
+-- **No measurement here ends on a clock.** Every rung runs until the pilot
+-- presses Enter, with the live number and whether it has stopped moving on the
+-- screen the whole time. The wizard used to end a rung once the reading had
+-- been steady for a few seconds, which sounds right and is not: a hull that
+-- has not begun to move yet is perfectly steady at zero, so on a real ship
+-- with turbines that take seconds to come up, every rung ended before the
+-- ship had answered. A whole balloon sweep read no climb at any strength. The
+-- pilot is standing there watching the ship, and is the only thing in the
+-- room that can tell a settled reading from one that has not started.
 
 local util, ship, config, log, flight, turbine = ...
 
@@ -542,32 +552,39 @@ local function stressNow()
     return status.stress
 end
 
--- One rung: drive it, watch the number it is supposed to move, and keep the
--- value it stopped moving at. Every stage measures something different, so what
--- is driven and what is read are both arguments, and what counts as steady is
--- config's.
+-- One rung: drive it, show what the ship is doing, and keep the reading when
+-- the pilot says so. Every stage measures something different, so what is
+-- driven and what is read are both arguments.
 --
--- A rung that runs out of patience is kept anyway, from the average of the last
--- readings rather than from the largest one seen. A ship that never settled
--- still has a speed; the peak it touched on the way is a transient and writing
--- that down would put a number in the ladder the hull cannot hold.
+-- **Nothing here is on a clock, and that is the whole of the fix.** A rung
+-- used to end itself once the reading had been steady for a few seconds, and a
+-- hull that has not begun to move yet is perfectly steady at zero. So every
+-- rung ended about three seconds in, off a number the turbines had not
+-- produced yet: a balloon sweep where all six strengths read no climb, a yaw
+-- ladder whose second rung was slower than its first. The pilot is standing
+-- there watching the ship. The pilot decides when the reading is the reading.
+--
+-- What is kept is the average over the last second and a half rather than the
+-- instant Enter landed on, because a hand on a key is not a measurement.
 local function track(ctx, opts)
-    local settle = opts.settle or config.get("calSettle")
-    local hold = opts.hold or config.get("calHold")
     local stable = opts.stable or config.get("calStable")
+    local floor = opts.floor or 0
 
     if opts.apply then opts.apply() end
+    -- The prompt that offered this rung is gone the moment it is running, and
+    -- the one that ends it takes its place.
+    ctx.panel({ prompt = false })
 
     local started = os.clock()
-    local history, holdFrom = {}, nil
-    local result, reason = nil, nil
+    local history = {}
+    local lost = false
 
     local function sampler()
         while true do
             local now = os.clock()
             local value = opts.read()
             if value == nil then
-                reason = "lost the pose"
+                lost = true
                 return
             end
 
@@ -581,60 +598,71 @@ local function track(ctx, opts)
                 if span > 0.2 then slope = (b.v - a.v) / span end
             end
 
-            -- Steady is not enough on its own where a sign was asked for: a ship
-            -- that has not started moving yet is perfectly steady at zero.
-            local steady = math.abs(slope) <= stable
-            if opts.wantSign then steady = steady and value * opts.wantSign > 0 end
-            holdFrom = steady and (holdFrom or now) or nil
-            local held = holdFrom and (now - holdFrom) or 0
-
             if opts.live then
+                -- Steady and moving are advice, not a decision. They are what
+                -- the panel colours, so the pilot can see the moment the ship
+                -- has finished answering rather than count seconds.
                 opts.live({
-                    value = value, slope = slope, held = held, holdNeeded = hold,
-                    elapsed = now - started, settle = settle,
-                    phase = steady and "settling" or "changing",
+                    value = value, slope = slope, elapsed = now - started,
+                    steady = math.abs(slope) <= stable,
+                    moving = math.abs(value) >= floor,
+                    floor = floor > 0 and floor or nil,
+                    phase = math.abs(slope) <= stable and "steady" or "changing",
+                    keepPrompt = "[Enter] keeps this reading   q stops",
                 })
             end
 
-            if held >= hold then
-                result = value
-                return
-            end
-            if now - started > settle then
-                local sum, count = 0, 0
-                for _, entry in ipairs(history) do sum = sum + entry.v; count = count + 1 end
-                result = count > 0 and sum / count or value
-                reason = "did not settle"
-                return
-            end
             sleep(config.get("calSample"))
         end
     end
 
-    parallel.waitForAny(sampler, ctx.waitAbort)
+    parallel.waitForAny(sampler, ctx.waitEnter)
+    ctx.panel({ keepPrompt = false })
     if ctx.aborted() then return nil, "stopped" end
+    if lost then return nil, "lost the pose" end
+
+    local sum, count = 0, 0
+    for _, entry in ipairs(history) do sum = sum + entry.v; count = count + 1 end
+    if count == 0 then return nil, "nothing was read" end
+    local result = sum / count
+
+    -- The reading is kept whatever it says, because the pilot asked for it to
+    -- be. What it is worth is said out loud alongside it, in the words of the
+    -- thing that is wrong with it.
+    local reason = nil
+    if math.abs(result) < floor then
+        reason = "never moved"
+    elseif opts.wantSign and result * opts.wantSign <= 0 then
+        reason = "went the wrong way"
+    end
     return result, reason
 end
 
 -- Between rungs the ship has to shed what the last one built up, or the next
--- rung starts from the wrong speed and reads high.
-local function cooldown(ctx, read, label)
-    local secs = config.get("calCooldown")
-    if secs <= 0 or ctx.aborted() then return end
+-- rung starts from the wrong speed and reads high. This is not a clock either:
+-- it ends when the ship is actually back to rest, and the pilot can cut it
+-- short on a hull that drifts for ever.
+local function cooldown(ctx, read, label, floor)
+    if ctx.aborted() then return end
+    floor = floor or config.get("calMinDrift")
     ship.allStop()
     local started = os.clock()
     local function wait()
-        while os.clock() - started < secs do
+        while true do
+            local value = read() or 0
+            if math.abs(value) < floor then return end
             ctx.panel({
-                value = read() or 0, valueLabel = label, phase = "cooldown",
-                elapsed = os.clock() - started, settle = secs,
-                held = os.clock() - started, holdNeeded = secs, slope = 0,
+                value = value, valueLabel = label, phase = "cooldown",
+                elapsed = os.clock() - started, slope = 0,
+                steady = false, moving = true, floor = floor,
+                keepPrompt = "[Enter] goes on without waiting   q stops",
                 pitch = false, yawRate = false, drift = false, guess = false,
             })
             sleep(config.get("calSample"))
         end
     end
-    parallel.waitForAny(wait, ctx.waitAbort)
+    parallel.waitForAny(wait, ctx.waitEnter)
+    ctx.panel({ keepPrompt = false, phase = false })
     ship.allStop()
 end
 
@@ -812,7 +840,6 @@ local function stageBalloon(ctx)
     end
 
     local step = config.get("calBalloonStep")
-    local dwell = config.get("calBalloonDwell")
     local levels, seen = {}, {}
     for level = 0, 15, step do
         levels[#levels + 1] = level
@@ -825,7 +852,8 @@ local function stageBalloon(ctx)
         local climb, reason = track(ctx, {
             apply = function() pcall(turbine.setBalloon, level) end,
             read = climbRate,
-            settle = dwell,
+            -- No floor: at hover the answer is no climb at all, and a rung
+            -- that refused to believe a zero would refuse to find hover.
             live = function(live)
                 live.rungIndex = index
                 live.rungTotal = total
@@ -847,8 +875,8 @@ local function stageBalloon(ctx)
         return climb
     end
 
-    ctx.note(string.format("sweeping %d strengths, %.0fs each. The ship will sink and climb.",
-        #levels, dwell), "warn")
+    ctx.note(string.format("sweeping %d strengths. The ship will sink and climb, and each "
+        .. "strength is kept when you press Enter.", #levels), "warn")
     for index, level in ipairs(levels) do
         if ctx.aborted() then break end
         if not measure(level, index, #levels) then break end
@@ -931,6 +959,7 @@ local function stageYaw(ctx)
                 read = ship.yawRate,
                 stable = config.get("calYawStable"),
                 wantSign = sign,
+                floor = config.get("calMinYaw"),
                 live = function(live)
                     live.rungIndex = index
                     live.rungTotal = total
@@ -943,10 +972,12 @@ local function stageYaw(ctx)
             })
 
             if ctx.aborted() then break end
-            if rate and math.abs(rate) > 0 then
+            -- A rung that never turned the hull is not a slow rung, it is not
+            -- a reading. Writing it down puts a rpm in the ladder that the
+            -- mixer will later ask the ship for and not get.
+            if rate and not reason then
                 samples[#samples + 1] = { rpm = diff, speed = math.abs(rate) }
-                ctx.note(string.format("%+4d rpm -> %.1f deg/s%s", diff * sign, math.abs(rate),
-                    reason and (" (" .. reason .. ")") or ""), reason and "warn" or "good")
+                ctx.note(string.format("%+4d rpm -> %.1f deg/s", diff * sign, math.abs(rate)), "good")
                 log.infof("cal: yaw way=%s rpm=%d rate=%.2f %s", way, diff, rate, reason or "settled")
                 -- The stress of a full turn is read at the top rung, while the
                 -- ship is actually doing it. Read after the stop and it is the
@@ -959,8 +990,8 @@ local function stageYaw(ctx)
                     end
                 end
             else
-                ctx.note(string.format("%+4d rpm -> no reading (%s)", diff * sign,
-                    tostring(reason)), "bad")
+                ctx.note(string.format("%+4d rpm -> nothing kept: %s", diff * sign,
+                    tostring(reason or "no reading")), "bad")
             end
 
             cal.yawCurve[way] = util.tidyCurve(samples)
@@ -1004,6 +1035,7 @@ local function stageForward(ctx)
                 end,
                 read = forwardSpeed,
                 wantSign = sign,
+                floor = config.get("calMinDrift"),
                 live = function(live)
                     live.rungIndex = index
                     live.rungTotal = total
@@ -1016,10 +1048,9 @@ local function stageForward(ctx)
             })
 
             if ctx.aborted() then break end
-            if speed and math.abs(speed) > 0 then
+            if speed and not reason then
                 samples[#samples + 1] = { rpm = rpm, speed = math.abs(speed) }
-                ctx.note(string.format("%+4d rpm -> %.2f m/s%s", rpm * sign, math.abs(speed),
-                    reason and (" (" .. reason .. ")") or ""), reason and "warn" or "good")
+                ctx.note(string.format("%+4d rpm -> %.2f m/s", rpm * sign, math.abs(speed)), "good")
                 log.infof("cal: forward way=%s rpm=%d speed=%.3f %s", way, rpm, speed,
                     reason or "settled")
                 if rpm == ladder[#ladder] then
@@ -1030,8 +1061,8 @@ local function stageForward(ctx)
                     end
                 end
             else
-                ctx.note(string.format("%+4d rpm -> no reading (%s)", rpm * sign,
-                    tostring(reason)), "bad")
+                ctx.note(string.format("%+4d rpm -> nothing kept: %s", rpm * sign,
+                    tostring(reason or "no reading")), "bad")
             end
 
             cal.fwdCurve[way] = util.tidyCurve(samples)
@@ -1055,21 +1086,37 @@ end
 -- and the ship covers ground it has to have.
 local function brakeRun(ctx, which, rpm, label)
     local top = config.get("cruiseMaxRpm")
+    -- Half the speed the ship is known to make. A stop measured from a crawl
+    -- is a deceleration the hull never has to produce, and it goes into the
+    -- ladder the arrival phase reads, so it is worth asking about rather than
+    -- keeping quietly.
+    local measured = cal.topForward()
+    local floor = measured and measured * 0.5 or config.get("calMinDrift")
     local v0 = track(ctx, {
         apply = function() ship.flush(flight.mix(top, 0, ship.order, cal, cfg())) end,
         read = forwardSpeed,
-        settle = config.get("calRunup"),
         wantSign = 1,
+        floor = floor,
         live = function(live)
             live.rungLabel = label .. ", running up"
             live.valueLabel = "speed"
             live.unit = "m/s"
+            live.keepPrompt = "[Enter] starts the stop   q stops"
             ctx.panel(live)
         end,
     })
     if ctx.aborted() or not v0 or v0 <= 0 then
         ship.allStop()
         return nil, ctx.aborted() and "stopped" or "never got moving"
+    end
+    if v0 < floor then
+        ship.allStop()
+        if not ctx.yesno(string.format(
+                "only reached %.1f m/s, under half the %.1f this ship makes. Stop from that anyway?",
+                v0, measured or 0), false) then
+            return nil, string.format("run up reached only %.1f m/s", v0)
+        end
+        ship.flush(flight.mix(top, 0, ship.order, cal, cfg()))
     end
 
     -- The reverse itself is not a settle. What is wanted is the slope of the
@@ -1079,7 +1126,6 @@ local function brakeRun(ctx, which, rpm, label)
     ship.flush(flight.mixParts(-rpm, turbines, 0, ship.order, cal, cfg()))
 
     local started = os.clock()
-    local limit = config.get("calSettle")
     local worstPitch, v, elapsed = 0, v0, 0
 
     local function run()
@@ -1097,15 +1143,20 @@ local function brakeRun(ctx, which, rpm, label)
             ctx.panel({
                 rungLabel = label .. ", stopping",
                 valueLabel = "speed", unit = "m/s", value = speed, slope = 0,
-                phase = "braking", elapsed = elapsed, settle = limit,
-                held = 0, holdNeeded = 0, pitch = worstPitch, from = v0,
+                phase = "braking", elapsed = elapsed,
+                steady = false, moving = true,
+                keepPrompt = "[Enter] takes the stop as measured   q stops",
+                pitch = worstPitch, from = v0,
             })
-            if speed <= 0 or elapsed >= limit then return end
+            -- The stop ends when the ship has stopped, which is an event and
+            -- not a length of time. A hull whose reverse cannot hold it is one
+            -- the pilot ends by hand, and that is worth knowing too.
+            if speed <= 0 then return end
             sleep(config.get("calSample"))
         end
     end
 
-    parallel.waitForAny(run, ctx.waitAbort)
+    parallel.waitForAny(run, ctx.waitEnter)
     ship.allStop()
     if ctx.aborted() then return nil, "stopped" end
     if elapsed <= 0 then return nil, "stopped before it was measured" end
