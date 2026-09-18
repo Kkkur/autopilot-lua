@@ -15,6 +15,8 @@ log.path = nil
 log.dir = nil
 log.levelFn = function() return 2 end
 log.seq = 0
+log.dropped = 0     -- lines the disk refused, which is how a full disk is seen
+log.KEEP_FILES = 8  -- sessions kept on disk, oldest deleted at the next boot
 
 local function nextLogNumber(dir)
     local highest = 0
@@ -33,10 +35,27 @@ function log.timestamp()
         math.floor(secs / 3600) % 24, math.floor(secs / 60) % 60, secs % 60)
 end
 
+-- A CC: Tweaked computer holds about a megabyte and says nothing about it
+-- until a write fails somewhere else entirely: the first sign here was an
+-- installer that could not land a file. One session is one log file, so the
+-- files are what grows without limit, and the oldest of them are worth least.
+local function pruneLogs(dir)
+    local numbers = {}
+    for _, name in ipairs(fs.list(dir)) do
+        local n = tonumber(name:match("^log_(%d+)%.txt$") or "")
+        if n then numbers[#numbers + 1] = n end
+    end
+    table.sort(numbers)
+    for index = 1, #numbers - (log.KEEP_FILES - 1) do
+        pcall(fs.delete, fs.combine(dir, "log_" .. numbers[index] .. ".txt"))
+    end
+end
+
 function log.init(dataDir, levelFn)
     log.dir = fs.combine(dataDir, "logs")
     if not fs.exists(log.dir) then fs.makeDir(log.dir) end
     if levelFn then log.levelFn = levelFn end
+    pcall(pruneLogs, log.dir)
     log.path = fs.combine(log.dir, "log_" .. nextLogNumber(log.dir) .. ".txt")
     log.file = fs.open(log.path, "w")
     log.write("INFO", "log opened: " .. log.path)
@@ -55,9 +74,19 @@ function log.write(level, msg)
         while #log.lines > log.MAX_LINES do table.remove(log.lines, 1) end
     end
 
+    -- The disk filling up must not take the ship down with it. A write that
+    -- fails is counted and the file is let go of, so the screen buffer carries
+    -- on and the loop that was flying carries on with it.
     if log.file then
-        log.file.writeLine(string.format("[%s] [%s] %s", log.timestamp(), level, entry.msg))
-        log.file.flush()
+        local ok = pcall(function()
+            log.file.writeLine(string.format("[%s] [%s] %s", log.timestamp(), level, entry.msg))
+            log.file.flush()
+        end)
+        if not ok then
+            log.dropped = log.dropped + 1
+            pcall(log.file.close)
+            log.file = nil
+        end
     end
 end
 

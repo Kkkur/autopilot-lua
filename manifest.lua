@@ -19,8 +19,8 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.9.5",
-    note = "stage 9: a silent relay is named rather than waited on for ever",
+    version = "0.9.6",
+    note = "stage 9: the ship stops filling its own disk",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths

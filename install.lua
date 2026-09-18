@@ -514,7 +514,18 @@ local spec = manifest.roles[role]
 print("")
 print("installing the " .. spec.title .. ", " .. #spec.files .. " files")
 
-local written, failed = 0, {}
+-- A CC: Tweaked computer holds about a megabyte, and the game says nothing
+-- about that until a write fails. What fills one is never the program, which
+-- is a few hundred kilobytes: it is what the program wrote about itself, a
+-- flight csv and a log file per session. So the room is counted out loud
+-- before anything is downloaded, because a pilot told at the start that the
+-- disk is nearly full can clear it before a half installed ship is on it.
+local free = fs.getFreeSpace("/")
+if type(free) == "number" then
+    print(string.format("%d kB free on this computer", math.floor(free / 1024)))
+end
+
+local written, failed, noRoom = 0, {}, false
 for _, entry in ipairs(spec.files) do
     local from, to = entry[1], entry[2]
     write("  " .. to .. " ")
@@ -530,10 +541,30 @@ for _, entry in ipairs(spec.files) do
             failed[#failed + 1] = to .. ": could not be opened for writing"
             print("FAILED")
         else
-            handle.write(text)
-            handle.close()
-            written = written + 1
-            print("ok")
+            -- A full disk raises here rather than returning anything, and an
+            -- unguarded raise took the installer out mid file, leaving a
+            -- truncated program on the computer and no word of why. The part
+            -- file goes with it: half a module is worse than none, since the
+            -- next boot loads it and fails somewhere further in.
+            local ok, why = pcall(function()
+                handle.write(text)
+                handle.close()
+            end)
+            if ok then
+                written = written + 1
+                print("ok")
+            else
+                pcall(handle.close)
+                pcall(fs.delete, to)
+                local text_ = tostring(why)
+                if text_:find("out of space") then
+                    noRoom = true
+                    failed[#failed + 1] = to .. ": no room left on this computer"
+                else
+                    failed[#failed + 1] = to .. ": " .. text_
+                end
+                print("FAILED")
+            end
         end
     end
 end
@@ -542,6 +573,15 @@ print("")
 if #failed > 0 then
     printError(#failed .. " file(s) did not land:")
     for _, line in ipairs(failed) do printError("  " .. line) end
+    if noRoom then
+        printError("")
+        printError("The disk is full. The program is not what fills it. These are,")
+        printError("and both are records rather than program, safe to delete:")
+        printError("  " .. spec.data .. "/telemetry   one csv per flight")
+        printError("  " .. spec.data .. "/logs        one file per session")
+        printError("  delete " .. spec.data .. "/telemetry")
+        printError("Then run this again.")
+    end
     printError("Nothing has been stamped. Run it again rather than rebooting.")
     return
 end

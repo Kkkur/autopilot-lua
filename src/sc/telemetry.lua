@@ -69,6 +69,25 @@ local function nextNumber(dir, pattern)
     return highest + 1
 end
 
+-- A CC: Tweaked computer holds about a megabyte and nothing in the game says
+-- so until a write fails. The rotation on its own only decided how big each
+-- file was, never how many there were, so a ship that flew often filled its
+-- own disk and the first thing to notice was the installer failing to write a
+-- file. The oldest files go when a new one starts: the record of the flight
+-- happening now is worth more than the record of the tenth one back.
+local function prune()
+    local keep = config.get("telemetryKeep")
+    local numbers = {}
+    for _, name in ipairs(fs.list(telemetry.dir)) do
+        local n = tonumber(name:match("^flight_(%d+)%.csv$") or "")
+        if n then numbers[#numbers + 1] = n end
+    end
+    table.sort(numbers)
+    for index = 1, #numbers - keep do
+        pcall(fs.delete, fs.combine(telemetry.dir, "flight_" .. numbers[index] .. ".csv"))
+    end
+end
+
 local function openCsv()
     local n = nextNumber(telemetry.dir, "^flight_(%d+)%.csv$")
     csvPath = fs.combine(telemetry.dir, "flight_" .. n .. ".csv")
@@ -78,6 +97,7 @@ local function openCsv()
         csv.writeLine(table.concat(telemetry.COLUMNS, ","))
         csv.flush()
     end
+    safely(prune)
 end
 
 function telemetry.init(dataDir)

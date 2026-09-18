@@ -122,6 +122,22 @@ function fs.open(path, mode)
     }
 end
 
+-- Deleting and counting the room left are what the log and the telemetry do to
+-- keep a computer's megabyte from filling, so they are here: without them that
+-- housekeeping is pcall'd into nothing on the desktop and only ever runs for
+-- the first time on the ship.
+function fs.delete(path)
+    path = normalise(path)
+    files[path] = nil
+    dirs[path] = nil
+end
+
+function fs.getFreeSpace()
+    local used = 0
+    for _, text in pairs(files) do used = used + #text end
+    return math.max(0, 1000000 - used)
+end
+
 -- == TERMINAL ================================================
 
 local WIDTH, HEIGHT = 51, 19

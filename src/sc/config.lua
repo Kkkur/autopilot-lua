@@ -291,6 +291,9 @@ config.SCHEMA = {
     { key = "telemetryMaxKb", group = "telemetry", kind = "int",   def = 200, min = 16, max = 2048, step = 16,
       help = "Kilobytes per flight.csv before it starts a numbered new one.",
       symptom = "one enormous csv, or a hundred tiny ones" },
+    { key = "telemetryKeep", group = "telemetry", kind = "int",   def = 4,   min = 1,   max = 64,  step = 1,
+      help = "Flight csv files kept. The oldest is deleted when a new one starts, because a CC computer holds about a megabyte in total.",
+      symptom = "the computer is out of space, and nothing can be installed on it" },
 
     -- == SCREEN ==============================================
     { key = "uiTick",        group = "ui",     kind = "number", def = 0.25, min = 0.05, max = 2, step = 0.05,
