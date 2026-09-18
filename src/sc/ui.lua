@@ -1906,6 +1906,19 @@ function ui.makeWizard(title)
     local fields = {}
     local abort = false
 
+    -- Everything on this screen that is a sentence rather than a field goes
+    -- through here. `line` cuts at the right hand edge, and a stage that says
+    -- in one sentence how much clear air it wants, with the half naming the
+    -- distance cut off, has told the pilot nothing. A continuation is indented
+    -- so a wrapped sentence still reads as one thing rather than two notes.
+    local function flow(y, text, colour)
+        for index, part in ipairs(wrapText(text, W - 4)) do
+            line(y, (index == 1 and " " or "   ") .. part, colour)
+            y = y + 1
+        end
+        return y
+    end
+
     local function render()
         wizardFrame(title, "q or Q stops")
         local y = 2
@@ -1915,11 +1928,11 @@ function ui.makeWizard(title)
         if fields.stageTitle then
             line(y, string.format(" stage %d of %d   %s", fields.stageIndex or 1,
                 fields.stageTotal or 1, fields.stageTitle), C("accent")); y = y + 1
-            if fields.what then line(y, " " .. fields.what, C("hi")); y = y + 1 end
-            if fields.room then line(y, " " .. fields.room, C("warn")); y = y + 1 end
+            if fields.what then y = flow(y, fields.what, C("hi")) end
+            if fields.room then y = flow(y, fields.room, C("warn")) end
             if fields.current then
-                line(y, string.format(" now: %s%s", fields.current,
-                    fields.at and ("   last run " .. fields.at) or ""), C("dim")); y = y + 1
+                y = flow(y, string.format("now: %s%s", fields.current,
+                    fields.at and ("   last run " .. fields.at) or ""), C("dim"))
             end
         end
 
@@ -1934,7 +1947,7 @@ function ui.makeWizard(title)
             local counter = fields.rungIndex
                 and string.format("measurement %d of %d   ", fields.rungIndex, fields.rungTotal or 0)
                 or ""
-            line(y, " " .. counter .. fields.rungLabel, C("hi")); y = y + 1
+            y = flow(y, counter .. fields.rungLabel, C("hi"))
         end
 
         -- One live row, whatever the stage happens to be measuring. The label
@@ -2011,26 +2024,45 @@ function ui.makeWizard(title)
             for _, sample in ipairs(fields.samples) do
                 parts[#parts + 1] = string.format("%d:%.1f", sample.rpm, sample.speed)
             end
-            line(y, " " .. table.concat(parts, "  "), C("dim")); y = y + 1
+            y = flow(y, table.concat(parts, "  "), C("dim"))
         end
 
         -- panel{prompt = false} clears it, which merging a nil could not do.
         if fields.prompt and fields.prompt ~= false then
-            line(y, " " .. fields.prompt, C("accent")); y = y + 1
+            y = flow(y, fields.prompt, C("accent"))
         end
         -- What ends the rung, said on the screen that is showing the rung. A
-        -- wizard that waits for a key it never named is a wizard that has hung.
+        -- wizard that waits for a key it never named is a wizard that has hung,
+        -- and one whose last key ran off the edge has hung just as thoroughly.
         if fields.keepPrompt and fields.keepPrompt ~= false then
-            line(y, " " .. fields.keepPrompt, C("accent")); y = y + 1
+            y = flow(y, fields.keepPrompt, C("accent"))
         end
 
         -- The notes are the running commentary and they live at the bottom.
+        --
+        -- Wrapped from the newest backwards rather than the oldest forwards.
+        -- What a full commentary can afford to lose is the top of the oldest
+        -- note; what it cannot lose is the tail of the newest, which is the one
+        -- naming whatever just went wrong.
         local noteTop = math.max(y + 1, H - 8)
         rule(noteTop)
+        local room = H - noteTop
+        local rows = {}
+        for index = #notes, 1, -1 do
+            local parts = wrapText(notes[index].text, W - 4)
+            for back = #parts, 1, -1 do
+                table.insert(rows, 1, {
+                    text = (back == 1 and " " or "   ") .. parts[back],
+                    kind = notes[index].kind,
+                })
+            end
+            if #rows >= room then break end
+        end
+        while #rows > room do table.remove(rows, 1) end
+
         local row = noteTop + 1
-        local first = math.max(1, #notes - (H - noteTop - 2))
-        for index = first, #notes do
-            line(row, " " .. notes[index].text, kindColour(notes[index].kind))
+        for _, entry in ipairs(rows) do
+            line(row, entry.text, kindColour(entry.kind))
             row = row + 1
         end
         while row <= H do line(row, "", C("bg")); row = row + 1 end

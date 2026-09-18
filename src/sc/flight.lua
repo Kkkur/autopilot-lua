@@ -193,14 +193,36 @@ end
 function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
     local wantRate = flight.wantYawRate(err, pid, cfg.yawRateMax, dt)
 
+    -- A hull inside the padding is lined up, and a hull that is lined up is not
+    -- asked to turn. The rate wanted of it is nothing at all.
+    --
+    -- This is not a deadband on the demand, which would cut the brakes off at
+    -- the edge of the band and let the nose coast straight through it. Only the
+    -- rate asked for goes to zero. The inner loop below still runs, now against
+    -- a wanted rate of nothing, so a nose still swinging is stopped rather than
+    -- ridden out, and a hull already at rest is left alone.
+    --
+    -- Without it the approach floor keeps asking for its slowest turn a third
+    -- of a degree from the heading. On a ship whose whole range is two and a
+    -- half degrees a second, that slowest turn is most of the differential it
+    -- has, so the align stage sat on the heading calling for full RPM.
+    local lined = math.abs(err) < cfg.tankPadding
+    if lined then wantRate = 0 end
+
     -- Held down to what can still be stopped in the error that is left, and
     -- only when the demand is driving the hull towards the heading. A demand
     -- pointing the other way is the controller braking an overshoot out, and
     -- limiting that would be limiting the recovery by how small the mistake
     -- is: the tighter the overshoot the weaker the correction allowed, which
     -- is backwards and was measured as such.
-    local limit = flight.approachRate(err, cal.yawAccel, cfg.yawBrakeSafety,
-        cfg.yawApproachMin)
+    --
+    -- A ship whose acceleration was never measured is not a ship that can stop
+    -- instantly, but that is what no profile at all amounts to: the cap never
+    -- applies and every turn runs at whatever the gain asks for. So an
+    -- unmeasured hull is flown on yawAccelAssumed, which is low on purpose,
+    -- because guessing low brakes early and guessing high sails past.
+    local limit = flight.approachRate(err, cal.yawAccel or cfg.yawAccelAssumed,
+        cfg.yawBrakeSafety, cfg.yawApproachMin)
     if limit and wantRate * err > 0 and math.abs(wantRate) > limit then
         wantRate = util.sign(wantRate) * limit
     end

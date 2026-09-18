@@ -222,7 +222,7 @@ function tests.run()
     near(flight.approachRate(0, 20, 1, 1.5), 1.5,
         "the floor is what closes the last fraction of a degree")
     check(flight.approachRate(90, nil, 1, 0) == nil,
-        "a ship whose acceleration was never measured gets no profile at all")
+        "the sum has no answer without a deceleration to put in it")
     check(flight.approachRate(90, 0, 1, 0) == nil, "and neither does one that cannot turn")
 
     -- The rate the profile allows is exactly the rate that arrives with nothing
@@ -266,7 +266,11 @@ function tests.run()
         local yaw, rate, dt = 0, 0, 0.1
         -- How far past the heading it went, which is the fault being fixed.
         local past = 0
-        for _ = 1, 1200 do
+        -- When it first got there, which is what a profile flown on a guessed
+        -- deceleration costs. Braking early is slower, and slower is the price
+        -- worth paying.
+        local arrived = nil
+        for step = 1, 1200 do
             local err = util.wrapAngle(120 - yaw)
             local demand = flight.tankDemand(err, pid, turnCal, cfg, dt, rate)
             -- The hull answers a differential the way the simulator's does:
@@ -276,8 +280,11 @@ function tests.run()
             yaw = util.wrapAngle(yaw + rate * dt)
             local beyond = util.wrapAngle(yaw - 120)
             if beyond > past then past = beyond end
+            if not arrived and math.abs(util.wrapAngle(120 - yaw)) <= cfg.tankPadding then
+                arrived = step * dt
+            end
         end
-        return util.wrapAngle(120 - yaw), rate, past
+        return util.wrapAngle(120 - yaw), rate, past, arrived
     end
 
     local ladder = { pos = { { rpm = 64, speed = 8 }, { rpm = 128, speed = 16 },
@@ -288,24 +295,46 @@ function tests.run()
     -- rise of a rung, so it is the number the profile is given here.
     local braked = { yawCurve = ladder, yawAuth = { left = 0.06, right = 0.06 },
                      sides = {}, yawAccel = 8 }
-    local leftErr, leftRate, leftPast = flyTurn(braked, 0.25)
+    local leftErr, leftRate, leftPast, leftWhen = flyTurn(braked, 0.25)
     check(math.abs(leftErr) <= config.get("tankPadding"),
         string.format("a hull with a measured acceleration arrives, %.2f deg out", leftErr))
     check(math.abs(leftRate) <= config.get("tankHoldRate"),
         string.format("and is no longer swinging when it gets there, %.2f deg/s", leftRate))
 
-    -- The same hull with nothing measured still turns. It is allowed to arrive
-    -- untidily; what it may not do is fail to turn at all, because that is the
-    -- ship every calibration starts as.
+    -- The same hull with nothing measured. It is flown on yawAccelAssumed,
+    -- which for this ship is eight times less deceleration than it really has,
+    -- so it brakes far too early. That is the whole point of guessing low: the
+    -- ship every calibration starts as is allowed to be slow, and is not
+    -- allowed to sail past.
     local plain = { yawCurve = ladder, yawAuth = { left = 0.06, right = 0.06 }, sides = {} }
-    local plainErr, _, plainPast = flyTurn(plain, 0.25)
-    check(math.abs(plainErr) < 90, "and one with nothing measured still comes round")
-    -- The point of the whole profile, in one line: the same hull, the same
-    -- gains, the same 120 degree turn, and the only difference is whether the
-    -- controller knew how hard the ship can be stopped.
-    check(leftPast < plainPast / 2,
-        string.format("knowing that halves the overshoot, %.1f deg against %.1f",
-            leftPast, plainPast))
+    local plainErr, _, plainPast, plainWhen = flyTurn(plain, 0.25)
+    check(math.abs(plainErr) <= config.get("tankPadding"),
+        string.format("and one with nothing measured still arrives, %.2f deg out", plainErr))
+    check(plainPast <= leftPast,
+        string.format("a guessed deceleration brakes early rather than late, %.1f deg past against %.1f",
+            plainPast, leftPast))
+    check(leftWhen and plainWhen and leftWhen < plainWhen,
+        string.format("and pays for it in time, there in %.1fs measured against %.1fs guessed",
+            leftWhen or -1, plainWhen or -1))
+
+    -- The bug the padding closes. A third of a degree from the heading is lined
+    -- up, and a ship that is lined up is asked for nothing: without this the
+    -- approach floor still called for its slowest turn, the ladder priced that
+    -- at most of the differential, and the align stage sat on the heading at
+    -- full RPM.
+    local settled = util.newPID(config.get("yawKp"), config.get("yawKi"),
+        config.get("yawKd"), -1e6, 1e6, 50)
+    local onHeading = flight.tankDemand(-0.3, settled, plain, config.values, 0.15, 0)
+    check(onHeading.diff == 0,
+        string.format("a hull sitting a third of a degree out is asked for nothing, not %d rpm",
+            onHeading.diff))
+
+    -- The same error with the nose still swinging through it. The padding zeroes
+    -- the rate asked for, never the demand, so what is left is the brake.
+    settled:reset()
+    local swinging = flight.tankDemand(-0.3, settled, plain, config.values, 0.15, 6)
+    check(swinging.diff < 0,
+        "and one still swinging through it is given the propellers the other way")
 
     -- == headings a pilot typed, and headings averaged ==
     -- The align stage lives on both of these. An average of headings is not an
