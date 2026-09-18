@@ -1329,6 +1329,10 @@ local function turnTo(ctx, want, label)
     if ctx.aborted() then return nil, "stopped" end
     local pid = util.newPID(config.get("yawKp"), config.get("yawKi"),
         config.get("yawKd"), -1e6, 1e6, 50)
+    -- Each point of the rose is its own turn and gets its own memory of what
+    -- the last crossing cost. Carrying one across the whole stage would hold
+    -- the eighth point to a ceiling the first point earned.
+    local swing = flight.newSwing()
     local tol = config.get("calAlignTol")
     local started = os.clock()
     local last = started
@@ -1352,7 +1356,7 @@ local function turnTo(ctx, want, label)
             -- The rate the hull is actually turning at, which is what lets the
             -- turn stop rather than coast through the heading.
             local rate = ship.yawRate()
-            local demand = flight.tankDemand(err, pid, cal, cfg(), dt, rate)
+            local demand = flight.tankDemand(err, pid, cal, cfg(), dt, rate, swing)
             ship.flush(flight.mix(0, demand.diff, ship.order, cal, cfg()))
 
             ctx.panel({
@@ -1412,22 +1416,44 @@ local function stageAlign(ctx)
     flyClear(ctx, "turning to each point of the compass")
 
     local points, offsets, misses = {}, {}, {}
+    -- What the front is believed to be off the hull by, as the rose is walked.
+    --
+    -- The stage sends the ship to a compass point and the pilot reads where the
+    -- FRONT ended up, so the heading commanded has to be the one that puts the
+    -- front there, not the hull. Nothing is known at the first point of a first
+    -- run and the hull is sent bare; from the second point on the running mean
+    -- is subtracted, and a ship whose front is the other end from its +Z stops
+    -- being driven a half turn away from every point it is asked for.
+    --
+    -- A re-run starts from what the last one found, so the front is flown from
+    -- the very first point.
+    local known = cal.frontOffset
+
     for index, point in ipairs(ROSE) do
         if ctx.aborted() then break end
         local want = util.wrapAngle(north + point.from)
-        local label = string.format("point %d of %d, %s, heading %+.1f",
-            index, #ROSE, point.name, want)
         ctx.panel({ rungIndex = index, rungTotal = #ROSE })
 
-        local pose, reason, missed = turnTo(ctx, want, label)
-        if ctx.aborted() then break end
-        if not pose then
-            ctx.note(string.format("%s: %s", point.name, tostring(reason)), "warn")
-        else
-            -- How close the controller got, which needs no pilot at all and is
-            -- the only evidence in the stage about the turn rather than about
-            -- the hull.
-            misses[#misses + 1] = missed or util.wrapAngle(want - pose)
+        -- One retake per point, and only when the front missed by more than the
+        -- stage's own tolerance. The first reading of a first run is the one
+        -- that discovers a hull filed back to front, and reading the rest of the
+        -- rose off a ship pointing the wrong way would be eight readings of the
+        -- same mistake. So the point that taught it is flown again, now around
+        -- the front, and what is kept is the second reading.
+        local tries = 0
+        while tries < 2 do
+            tries = tries + 1
+            local aim = flight.hullHeadingFor(want, known)
+            local label = string.format("point %d of %d, %s, front to %+.1f%s",
+                index, #ROSE, point.name, want,
+                known and string.format(" (hull to %+.1f)", aim) or "")
+
+            local pose, reason, missed = turnTo(ctx, aim, label)
+            if ctx.aborted() then break end
+            if not pose then
+                ctx.note(string.format("%s: %s", point.name, tostring(reason)), "warn")
+                break
+            end
 
             local typed = ctx.ask(
                 "Facing the way the ship's front faces, what does F3 say?",
@@ -1436,16 +1462,48 @@ local function stageAlign(ctx)
             local seen, bad = util.parseHeading(typed)
             if not seen then
                 ctx.note(string.format("%s: %s", point.name, tostring(bad)), "bad")
+                break
+            end
+
+            local offset = util.wrapAngle(seen - pose)
+            -- How far the front ended up from the point it was sent to, which
+            -- is the thing the pilot is looking at and the thing that decides
+            -- whether this point is worth flying again.
+            local frontMiss = util.wrapAngle(want - seen)
+            local first = known == nil
+
+            known = known or offset
+            if math.abs(frontMiss) > config.get("calAlignTol") and tries < 2 then
+                -- Learned from this reading rather than kept. Writing down a
+                -- point the front was never at would put the miss into the
+                -- spread, where it would read as a hull that cannot hold a
+                -- heading rather than as one that had not been measured yet.
+                known = offset
+                ctx.note(string.format(
+                    "%s: the front came out %+.1f, %.0f off the %+.1f it was sent to",
+                    point.name, seen, math.abs(frontMiss), want), "warn")
+                ctx.note(first
+                    and string.format("the front sits %+.1f off the hull, so that point was flown backwards. Going round again on the front.", offset)
+                    or "going round again, now that the front is known", "warn")
+                log.infof("cal: align retake %s want=%.1f seen=%.1f offset=%.1f",
+                    point.name, want, seen, offset)
             else
-                local offset = util.wrapAngle(seen - pose)
+                -- How close the controller got, which needs no pilot at all and
+                -- is the only evidence in the stage about the turn rather than
+                -- about the hull.
+                misses[#misses + 1] = missed or util.wrapAngle(aim - pose)
                 points[#points + 1] = { want = want, pose = pose, seen = seen }
                 offsets[#offsets + 1] = offset
-                ctx.note(string.format("%s: you read %+.1f, the hull reads %+.1f, front %+.1f off",
-                    point.name, seen, pose, offset), "good")
-                log.infof("cal: align %s want=%.1f pose=%.1f seen=%.1f offset=%.1f",
-                    point.name, want, pose, seen, offset)
+                known = util.meanAngle(offsets) or offset
+                ctx.note(string.format(
+                    "%s: the front reads %+.1f against the %+.1f asked for, and sits %+.1f off the hull",
+                    point.name, seen, want, offset), "good")
+                log.infof("cal: align %s want=%.1f aim=%.1f pose=%.1f seen=%.1f offset=%.1f",
+                    point.name, want, aim, pose, seen, offset)
+                break
             end
         end
+        if ctx.aborted() then break end
     end
 
     ship.allStop()

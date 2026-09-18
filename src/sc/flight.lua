@@ -173,6 +173,82 @@ function flight.rpmPerRate(cal, cfg)
     return cfg.tankRpmMax / top
 end
 
+-- Which way to point the hull so that the end of it the crew calls the front
+-- ends up on a given heading.
+--
+-- The hull is what the autopilot can command and the front is what a pilot can
+-- see, and on a ship whose +Z runs aft they are a half turn apart. The align
+-- stage sends the ship to each point of the compass and asks where the front
+-- came out, so the heading it commands has to be this one. Sending the hull
+-- bare drives the front to the opposite point and files eight readings of the
+-- same mistake.
+--
+-- With no offset known yet this is the heading itself, which is the only honest
+-- answer on the first point of a first run.
+function flight.hullHeadingFor(want, frontOffset)
+    return util.wrapAngle(want - (frontOffset or 0))
+end
+
+-- == CLOSE IN ================================================
+--
+-- The profile above is a good statement about a wide turn and a bad one about
+-- the last few degrees of it. Near the heading the ladder prices a third of a
+-- degree at most of the differential the ship owns, the hull arrives carrying
+-- speed it then spends the next swing undoing, and the swing after that undoes
+-- the undoing. The measurement is not wrong. Asking a measurement of a turn
+-- what to do when there is almost no turn left is.
+--
+-- So inside yawNearBand the push is a flat step in RPM rather than anything
+-- derived: what the pilot watches on the PROPS tab is what the pilot set on the
+-- TUNE tab. Inside yawFineBand there is no push at all, because the ship has
+-- arrived. Past the band the profile has the say again, floored at yawMidRpm so
+-- a hull five degrees out is not left crawling by a deceleration nobody
+-- measured.
+--
+-- `pushed` is what the loop above arrived at, and it is only ever raised to the
+-- floor, never lowered to it.
+function flight.nearRpm(err, pushed, cfg)
+    local e = math.abs(err)
+    if e < cfg.yawFineBand then return 0 end
+    if e < cfg.yawNearBand then return cfg.yawNearRpm end
+    return math.max(pushed, cfg.yawMidRpm)
+end
+
+-- A turn that remembers the push that threw it past the heading.
+--
+-- A hull crosses the bearing on the differential it was carrying when it got
+-- there. The correction that follows is aimed the other way with the same
+-- authority the controller has always had, which is how one overshoot becomes
+-- four: nothing in the loop knows that the last push was too much, only that
+-- the error changed sign. This writes down what the crossing cost and holds the
+-- next push under it.
+--
+-- The ceiling recovers at yawOvershootRecover a second while the hull stays on
+-- one side of the heading, because a ship that has settled should not still be
+-- flying on a limit it earned two swings ago. It never falls under yawNearRpm,
+-- which is the flat close-in push and the slowest thing that still turns a hull.
+--
+-- `swing` is a plain table the caller owns, the way the PID is, so that two
+-- turns in one run cannot inherit each other's mistakes.
+function flight.newSwing() return {} end
+
+function flight.markCrossing(err, cfg, swing)
+    if not swing then return end
+    local side = util.sign(err)
+    if side ~= 0 and swing.side and side ~= swing.side and swing.push then
+        local cost = swing.push * util.clamp(cfg.yawOvershootEase, 0.05, 1)
+        swing.ceiling = math.max(cfg.yawNearRpm,
+            math.min(swing.ceiling or cost, cost))
+    end
+    if side ~= 0 then swing.side = side end
+end
+
+function flight.easeSwing(dt, cfg, swing)
+    if not swing or not swing.ceiling then return end
+    swing.ceiling = math.min(cfg.tankRpmMax,
+        swing.ceiling + cfg.yawOvershootRecover * (dt or 0))
+end
+
 -- The whole tank phase in one call: rotate, do not translate.
 --
 -- The pid is an argument rather than something this module keeps, because a
@@ -190,24 +266,13 @@ end
 -- wanted and the rate there is. When the hull is turning faster than the
 -- approach allows, that term goes negative and the propellers push the other
 -- way, which is what stopping is.
-function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
-    local wantRate = flight.wantYawRate(err, pid, cfg.yawRateMax, dt)
+function flight.tankDemand(err, pid, cal, cfg, dt, haveRate, swing)
+    -- The crossing is read before anything is commanded, because what it is
+    -- about to cost is decided by the push the hull was already carrying.
+    flight.markCrossing(err, cfg, swing)
+    flight.easeSwing(dt, cfg, swing)
 
-    -- A hull inside the padding is lined up, and a hull that is lined up is not
-    -- asked to turn. The rate wanted of it is nothing at all.
-    --
-    -- This is not a deadband on the demand, which would cut the brakes off at
-    -- the edge of the band and let the nose coast straight through it. Only the
-    -- rate asked for goes to zero. The inner loop below still runs, now against
-    -- a wanted rate of nothing, so a nose still swinging is stopped rather than
-    -- ridden out, and a hull already at rest is left alone.
-    --
-    -- Without it the approach floor keeps asking for its slowest turn a third
-    -- of a degree from the heading. On a ship whose whole range is two and a
-    -- half degrees a second, that slowest turn is most of the differential it
-    -- has, so the align stage sat on the heading calling for full RPM.
-    local lined = math.abs(err) < cfg.tankPadding
-    if lined then wantRate = 0 end
+    local wantRate = flight.wantYawRate(err, pid, cfg.yawRateMax, dt)
 
     -- Held down to what can still be stopped in the error that is left, and
     -- only when the demand is driving the hull towards the heading. A demand
@@ -242,6 +307,31 @@ function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
         local slope = flight.rpmPerRate(cal, cfg)
         diff = diff + (wantRate - haveRate) * slope * cfg.yawRateKp
         diff = util.clamp(diff, -cfg.tankRpmMax, cfg.tankRpmMax)
+    end
+
+    -- Everything from here shapes the push that is driving the hull and nothing
+    -- else. The brake keeps the whole differential, because the term that stops
+    -- a swing must never end up the weaker of the two.
+    --
+    -- Which of the two a demand is cannot be read off the heading error. A nose
+    -- swinging left through a heading that is itself off to the left is being
+    -- braked by a demand pointing left, and by the error alone that is
+    -- indistinguishable from driving. What tells them apart is the rate: a
+    -- demand opposing the way the hull is already turning is a brake, whatever
+    -- the error is doing. A hull at rest, or one on a ship with no rate to read,
+    -- can only be being driven.
+    local braking = haveRate and math.abs(haveRate) > 0 and diff * haveRate < 0
+    local driving = not braking and diff * err > 0
+
+    if driving then
+        diff = util.sign(err) * flight.nearRpm(err, math.abs(diff), cfg)
+        if swing and swing.ceiling and math.abs(diff) > swing.ceiling then
+            diff = util.sign(diff) * swing.ceiling
+        end
+        -- What the next crossing will be charged for. Written after the shaping
+        -- rather than before it, so what is remembered is what the ship was
+        -- actually given.
+        if swing then swing.push = math.abs(diff) end
     end
 
     -- Below the minimum a speed controller buzzes without turning anything, so

@@ -317,24 +317,88 @@ function tests.run()
         string.format("and pays for it in time, there in %.1fs measured against %.1fs guessed",
             leftWhen or -1, plainWhen or -1))
 
-    -- The bug the padding closes. A third of a degree from the heading is lined
-    -- up, and a ship that is lined up is asked for nothing: without this the
-    -- approach floor still called for its slowest turn, the ladder priced that
-    -- at most of the differential, and the align stage sat on the heading at
-    -- full RPM.
-    local settled = util.newPID(config.get("yawKp"), config.get("yawKi"),
-        config.get("yawKd"), -1e6, 1e6, 50)
-    local onHeading = flight.tankDemand(-0.3, settled, plain, config.values, 0.15, 0)
-    check(onHeading.diff == 0,
-        string.format("a hull sitting a third of a degree out is asked for nothing, not %d rpm",
-            onHeading.diff))
+    -- == what the last few degrees are worth ==
+    -- The bug this closes: the ladder and the approach between them priced a
+    -- third of a degree at the whole differential, so the align stage sat on
+    -- the heading calling for 256. Close in the push is a flat step instead.
+    local function freshPID()
+        return util.newPID(config.get("yawKp"), config.get("yawKi"),
+            config.get("yawKd"), -1e6, 1e6, 50)
+    end
+    local onHeading = flight.tankDemand(-0.3, freshPID(), plain, config.values, 0.15, 0)
+    near(math.abs(onHeading.diff), config.get("yawNearRpm"),
+        "a third of a degree out is worth the flat close in push, not the whole ship")
+    check(onHeading.diff < 0, "and it is pointed at the heading rather than away from it")
 
-    -- The same error with the nose still swinging through it. The padding zeroes
-    -- the rate asked for, never the demand, so what is left is the brake.
-    settled:reset()
-    local swinging = flight.tankDemand(-0.3, settled, plain, config.values, 0.15, 6)
+    local arrived = flight.tankDemand(-0.1, freshPID(), plain, config.values, 0.15, 0)
+    check(arrived.diff == 0,
+        "inside the fine band the hull has arrived and is asked for nothing")
+
+    local nearer = flight.tankDemand(-4, freshPID(), plain, config.values, 0.15, 0)
+    near(math.abs(nearer.diff), config.get("yawNearRpm"),
+        "and four degrees out is worth exactly the same, because the band is flat")
+
+    local wider = flight.tankDemand(-20, freshPID(), plain, config.values, 0.15, 0)
+    check(math.abs(wider.diff) >= config.get("yawMidRpm"),
+        string.format("past the band the floor is yawMidRpm, %d rpm", math.abs(wider.diff)))
+
+    -- The shaping is on the push towards the heading and on nothing else. A
+    -- nose swinging through the fine band still gets the whole differential the
+    -- other way, or the band would be a place where the brakes come off.
+    local swinging = flight.tankDemand(-0.1, freshPID(), plain, config.values, 0.15, 6)
     check(swinging.diff < 0,
-        "and one still swinging through it is given the propellers the other way")
+        "a nose swinging through the fine band is still given the propellers the other way")
+    check(math.abs(swinging.diff) > config.get("yawNearRpm"),
+        "and with more than the close in push, because stopping it is not a nudge")
+
+    -- == the push that overshot ==
+    -- One crossing of the bearing, and what it cost is what the next push is
+    -- held under. Without this the correction after an overshoot is aimed the
+    -- other way with the same authority, which is how one overshoot becomes four.
+    local swing = flight.newSwing()
+    local held = config.defaults()
+    held.yawOvershootRecover = 0
+    local pid = freshPID()
+    flight.tankDemand(20, pid, plain, held, 0.15, 0, swing)
+    local before = swing.push
+    check(before and before > 0, "the push on the way in is remembered")
+    flight.tankDemand(-20, pid, plain, held, 0.15, 0, swing)
+    check(swing.ceiling and swing.ceiling < before,
+        string.format("crossing the bearing writes down a ceiling under it, %.0f of %.0f",
+            swing.ceiling or -1, before or -1))
+    local after = flight.tankDemand(-20, pid, plain, held, 0.15, 0, swing)
+    near(math.abs(after.diff), swing.ceiling,
+        "and the push that follows is held to it")
+
+    -- The ceiling is not a punishment that lasts. It climbs back while the hull
+    -- stays on one side of the heading.
+    local low = swing.ceiling
+    for _ = 1, 20 do flight.easeSwing(1.0, config.values, swing) end
+    check(swing.ceiling > low, "a hull that has settled does not keep flying on it")
+    check(swing.ceiling <= config.get("tankRpmMax"), "and it never climbs past the maximum")
+
+    -- It never falls under the flat close in push, because that is the slowest
+    -- thing that still turns a hull.
+    local floored = flight.newSwing()
+    floored.side = 1
+    floored.push = 1
+    flight.markCrossing(-1, config.values, floored)
+    near(floored.ceiling, config.get("yawNearRpm"),
+        "a tiny push that overshot does not floor the ceiling at nothing")
+
+    -- == pointing the front rather than the hull ==
+    -- The align stage's whole job. A ship built back to front reads its own +Z
+    -- as pointing a half turn away from the end the crew stands at, and a stage
+    -- that commands the hull sends the front to the opposite compass point.
+    near(flight.hullHeadingFor(180, nil), 180,
+        "with nothing known yet the hull is sent to the heading itself")
+    near(flight.hullHeadingFor(180, 0), 180, "and a ship built the right way round is the same")
+    near(flight.hullHeadingFor(0, -179.1), 179.1,
+        "a ship filed back to front is sent the other way, so the front lands on south")
+    near(flight.hullHeadingFor(180, -179.1), -0.9,
+        "and to face the front north the hull is pointed very nearly south")
+    near(flight.hullHeadingFor(90, 45), 45, "a quarter turn of offset comes straight off")
+    near(flight.hullHeadingFor(-170, 30), 160, "and the answer wraps past north like every other heading")
 
     -- == headings a pilot typed, and headings averaged ==
     -- The align stage lives on both of these. An average of headings is not an
@@ -800,6 +864,9 @@ function tests.run()
     local cfg = {
         tankRpmMax = 256, tankRpmMin = 16, tankPadding = 2.0, tankHold = 2.0,
         tankHoldRate = 2.0, tankReentry = 25, yawRateMax = 30,
+        yawFineBand = 0.25, yawNearBand = 5.0, yawNearRpm = 64, yawMidRpm = 128,
+        yawOvershootEase = 0.6, yawOvershootRecover = 16, yawAccelAssumed = 1.0,
+        yawApproachMin = 0.5, yawBrakeSafety = 0.6, yawRateKp = 2.0,
         cruiseSpeed = 12, cruiseRampTime = 7.0, yawTrimThresh = 0.5, yawTrimRpm = 128,
         arriveDist = 1.0, brakeMargin = 1.3, brakeRpmMax = 256, pitchLimit = 12,
         lateralCorrect = 4.0,
@@ -847,7 +914,12 @@ function tests.run()
     -- hull turns right is by pushing harder on its left.
     check(demand.left > 0 and demand.right < 0, "a right hand error pushes the left side")
     check(demand.main == 0, "and the main stays out of a tank turn")
-    near(demand.rate, 30, "the wanted rate is capped at yawRateMax")
+    -- Not yawRateMax any more. Twenty degrees from the heading, on a ship with
+    -- no measured deceleration, the approach profile is what decides the rate,
+    -- and it decides on the assumption that stopping is slow.
+    near(demand.rate, flight.approachRate(20, cfg.yawAccelAssumed,
+        cfg.yawBrakeSafety, cfg.yawApproachMin),
+        "the wanted rate is what the approach profile allows at that error")
 
     pid:reset()
     demand = flight.tankDemand(-20, pid, calShip, cfg, 0.2)

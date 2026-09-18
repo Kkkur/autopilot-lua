@@ -53,6 +53,11 @@ local lastTick = nil
 
 local yawPID, spdPID, altPID
 
+-- What the last crossing of the bearing cost, so the next push can be held
+-- under it. It belongs beside the PIDs because it is the same kind of thing:
+-- memory of the turn so far, cleared when the turn is.
+local yawSwing = flight.newSwing()
+
 local function makePIDs()
     yawPID = util.newPID(config.get("yawKp"), config.get("yawKi"), config.get("yawKd"),
         -1e6, 1e6, 50)
@@ -82,6 +87,7 @@ end
 
 function control.resetPIDs()
     if yawPID then yawPID:reset(); spdPID:reset(); altPID:reset() end
+    yawSwing = flight.newSwing()
     alignedFor = 0
     lastTick = nil
 end
@@ -377,7 +383,7 @@ local function flyLeg(state, goal, dt)
 
     -- Tank: rotate, do not translate.
     if control.phase == "tank" then
-        local demand = flight.tankDemand(err, yawPID, cal, cfg, dt, yawRate)
+        local demand = flight.tankDemand(err, yawPID, cal, cfg, dt, yawRate, yawSwing)
         control.info.want = 0
         control.info.common = 0
         control.info.differential = demand.diff

@@ -19,8 +19,8 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.11.1",
-    note = "stage 10: a ship that is lined up is not asked to turn",
+    version = "0.12.0",
+    note = "stage 11: the rose is walked on the front, not on the hull",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths
