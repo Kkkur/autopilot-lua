@@ -386,7 +386,17 @@ end
 if modemSide then
     local wrapped = peripheral.wrap(modemSide)
     rednet.open(modemSide)
-    rednet.host(PROTOCOL, HOSTNAME)
+    -- Hosting is a courtesy: nothing on this ship looks the fuel relay up by
+    -- name, every reading is broadcast and every question arrives addressed.
+    -- rednet.host raises on a name another computer already holds, and an
+    -- unguarded raise here happened before the responder loop started, which
+    -- is a relay that is powered, wired and cannot be paired. So a refusal is
+    -- reported and the relay carries on.
+    local hosted, why = pcall(rednet.host, PROTOCOL, HOSTNAME)
+    if not hosted then
+        log.warnf("rednet.host refused the name %s: %s. Readings are broadcast, so this costs nothing.",
+            HOSTNAME, tostring(why))
+    end
     log.infof("rednet open on %s (%s), id %d, protocol %s", modemSide,
         (wrapped.isWireless and wrapped.isWireless()) and "wireless" or "wired",
         os.getComputerID(), PROTOCOL)

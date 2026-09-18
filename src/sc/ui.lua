@@ -183,6 +183,95 @@ function ui.say(text, kind)
     ui.messageAt = os.clock()
 end
 
+-- == PANE ====================================================
+--
+-- A tab body is built as a list of rows and then placed, rather than written
+-- straight down the screen as it is composed. Almost every tab has rows to
+-- spare: before this they all fell to the bottom as one dead block while the
+-- readout above them sat shoulder to shoulder, which is what made a tab hard
+-- to read without anything being wrong with what it said.
+--
+-- A gap is a request for air between two groups. It is spent only out of the
+-- rows nothing else wanted, one at a time and evenly, so the tab that has
+-- something to say on every line loses no room and the tab that has not comes
+-- out spaced. Nothing is ever dropped to make a gap.
+local Pane = {}
+Pane.__index = Pane
+
+local function pane(top, bottom)
+    return setmetatable({ top = top or 2, bottom = bottom or (H - 2), items = {} },
+        Pane)
+end
+
+-- fn(y) draws one row, and is called only once the row it lands on is known.
+function Pane:row(fn)
+    self.items[#self.items + 1] = { draw = fn }
+    return self
+end
+
+function Pane:text(text, fg, bg)
+    return self:row(function(y) line(y, text, fg, bg) end)
+end
+
+function Pane:rule(label)
+    return self:row(function(y) rule(y, label) end)
+end
+
+-- weight is the most air this boundary can take. One row reads as a break
+-- between groups; a large weight is how a tab pins what follows to the bottom.
+function Pane:gap(weight)
+    self.items[#self.items + 1] = { gap = weight or 1, rows = 0 }
+    return self
+end
+
+-- How many rows are left for content, so a list knows how much of itself fits
+-- before it starts queueing rows that would be cut off the bottom.
+function Pane:left()
+    local used = 0
+    for _, item in ipairs(self.items) do
+        if item.draw then used = used + 1 end
+    end
+    return self.bottom - self.top + 1 - used
+end
+
+function Pane:place()
+    local free = self:left()
+    local gaps = {}
+    for _, item in ipairs(self.items) do
+        if item.gap then item.rows = 0; gaps[#gaps + 1] = item end
+    end
+    -- Round robin rather than first come first served: two groups either side
+    -- of a tab both want the same air, and handing it all to the first gap
+    -- pushes everything below it into the same huddle this is meant to undo.
+    local handed = true
+    while free > 0 and handed do
+        handed = false
+        for _, gap in ipairs(gaps) do
+            if free > 0 and gap.rows < gap.gap then
+                gap.rows = gap.rows + 1
+                free = free - 1
+                handed = true
+            end
+        end
+    end
+
+    local y = self.top
+    for _, item in ipairs(self.items) do
+        if y > self.bottom then break end
+        if item.draw then
+            item.draw(y)
+            y = y + 1
+        else
+            for _ = 1, item.rows do
+                if y > self.bottom then break end
+                line(y, "", C("bg"))
+                y = y + 1
+            end
+        end
+    end
+    while y <= self.bottom do line(y, "", C("bg")); y = y + 1 end
+end
+
 -- == CHROME ==================================================
 
 -- The tabs are cells of equal width rather than labels with spaces between
@@ -375,129 +464,131 @@ local function rowNote(y, text, colour)
 end
 
 local function drawFlight(snap, reads)
-    local y = 2
+    local p = pane()
     local state = snap.state
     local info = snap.info or {}
 
+    -- Four groups, in the order a pilot asks the questions: where am I, what
+    -- am I doing, how hard is the ship working at it, and what is it spending.
     if state then
-        local p = state.position
-        line(y, string.format(" X %8.1f  Y %7.1f  Z %8.1f   %s", p.x, p.y, p.z,
-            util.compass(state.yaw)), C("hi")); y = y + 1
-        line(y, string.format(" HDG %5.1f  SPD %5.2f m/s  VS %+5.2f  PITCH %+5.1f",
+        local pos = state.position
+        p:text(string.format(" X %8.1f  Y %7.1f  Z %8.1f   %s", pos.x, pos.y, pos.z,
+            util.compass(state.yaw)), C("hi"))
+        p:text(string.format(" HDG %5.1f  SPD %5.2f m/s  VS %+5.2f  PITCH %+5.1f",
             state.yaw, state.speed, state.velocity.y, util.pitchOf(state.orientation)),
-            C("dim")); y = y + 1
+            C("dim"))
     else
-        line(y, " position unavailable: " .. tostring(snap.fault), C("bad")); y = y + 1
-        line(y, " nothing below this line is being flown", C("dim")); y = y + 1
+        p:text(" position unavailable: " .. tostring(snap.fault), C("bad"))
+        p:text(" nothing below this line is being flown", C("dim"))
     end
 
-    drawPhases(y, snap.phase); y = y + 1
+    p:gap()
+    p:row(function(y) drawPhases(y, snap.phase) end)
 
     -- The leg. Distance and ETA belong next to the name of the thing they are
     -- distance and ETA to.
     if snap.target then
         local t = snap.target
-        line(y, string.format(" %-10s %5d %4d %6d   %6.1f blk   %s",
+        p:text(string.format(" %-10s %5d %4d %6d   %6.1f blk   %s",
             snap.targetName or "[coords]", util.round(t.x), util.round(t.y), util.round(t.z),
             snap.dist or 0, snap.eta and util.fmtETA(snap.eta) or "--"), C("warn"))
-        y = y + 1
         if #nav.route > 0 then
-            line(y, " then " .. table.concat(nav.route, " > "), C("dim")); y = y + 1
+            p:text(" then " .. table.concat(nav.route, " > "), C("dim"))
         end
     else
-        line(y, " no target. `goto <name>` or `fly <x> <y> <z>`", C("dim")); y = y + 1
+        p:text(" no target. `goto <name>` or `fly <x> <y> <z>`", C("dim"))
+    end
+    if snap.reason then
+        p:text(" " .. tostring(snap.reason), C("dim"))
     end
 
-    rule(y)
-    at(WANT_AT + 3, y, " WANT ", C("dim"), C("bg"))
-    at(HAVE_AT + 3, y, " HAVE ", C("dim"), C("bg"))
-    y = y + 1
+    p:gap()
+    p:row(function(y)
+        rule(y)
+        at(WANT_AT + 3, y, " WANT ", C("dim"), C("bg"))
+        at(HAVE_AT + 3, y, " HAVE ", C("dim"), C("bg"))
+    end)
 
     -- Heading: the error is what the turn is working on, so that is what is
     -- drawn rather than two absolute bearings a pilot has to subtract.
     local lined = math.abs(info.err or 0) <= config.get("tankPadding")
-    if info.bearing then
-        wantHave(y, "HDG deg", info.bearing, state and state.yaw,
-            info.differential or 0, config.get("tankRpmMax"),
-            lined and C("good") or C("hi"))
-        rowNote(y, string.format("%+.1f off", info.err or 0),
-            lined and C("good") or C("warn"))
-    else
-        wantHave(y, "HDG deg", nil, state and state.yaw, 0, config.get("tankRpmMax"), C("dim"))
-    end
-    y = y + 1
+    p:row(function(y)
+        if info.bearing then
+            wantHave(y, "HDG deg", info.bearing, state and state.yaw,
+                info.differential or 0, config.get("tankRpmMax"),
+                lined and C("good") or C("hi"))
+            rowNote(y, string.format("%+.1f off", info.err or 0),
+                lined and C("good") or C("warn"))
+        else
+            wantHave(y, "HDG deg", nil, state and state.yaw, 0,
+                config.get("tankRpmMax"), C("dim"))
+        end
+    end)
 
-    wantHave(y, "SPD m/s", info.want, info.have, info.common or 0,
-        config.get("cruiseMaxRpm"))
-    local top = cal.topForward()
-    rowNote(y, top and string.format("top %.1f", top) or "unmeasured")
-    y = y + 1
+    p:row(function(y)
+        wantHave(y, "SPD m/s", info.want, info.have, info.common or 0,
+            config.get("cruiseMaxRpm"))
+        local top = cal.topForward()
+        rowNote(y, top and string.format("top %.1f", top) or "unmeasured")
+    end)
 
     -- Lift is the one row that is not a propeller demand, so its bar is the
     -- strength itself: zero to fifteen, the whole range the balloon has.
-    if info.balloon then
-        local onFloor = info.balloon <= config.get("balloonFloor")
-        at(1, y, string.rep(" ", W), C("hi"), C("bg"))
-        at(2, y, util.pad("LIFT blk", WANT_AT - 3), C("dim"), C("bg"))
-        at(WANT_AT, y, string.format("%7s",
-            info.altErr and string.format("%+.1f", info.altErr) or "by hand"),
-            onFloor and C("warn") or C("hi"), C("bg"))
-        at(HAVE_AT, y, string.format("%7s", string.format("%d/15", info.balloon)),
-            onFloor and C("warn") or C("hi"), C("bg"))
-        rowNote(y, onFloor and "on the floor" or "")
-        bar(BAR_AT, y, BAR_WIDTH, info.balloon / 15, onFloor and C("warn") or C("bar"))
-    else
-        line(y, " LIFT  no relay is holding the balloon", C("bad"))
-    end
-    y = y + 1
-
-    if snap.reason and y <= H - 2 then
-        line(y, " " .. tostring(snap.reason), C("dim")); y = y + 1
-    end
+    p:row(function(y)
+        if info.balloon then
+            local onFloor = info.balloon <= config.get("balloonFloor")
+            at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+            at(2, y, util.pad("LIFT blk", WANT_AT - 3), C("dim"), C("bg"))
+            at(WANT_AT, y, string.format("%7s",
+                info.altErr and string.format("%+.1f", info.altErr) or "by hand"),
+                onFloor and C("warn") or C("hi"), C("bg"))
+            at(HAVE_AT, y, string.format("%7s", string.format("%d/15", info.balloon)),
+                onFloor and C("warn") or C("hi"), C("bg"))
+            rowNote(y, onFloor and "on the floor" or "")
+            bar(BAR_AT, y, BAR_WIDTH, info.balloon / 15, onFloor and C("warn") or C("bar"))
+        else
+            line(y, " LIFT  no relay is holding the balloon", C("bad"))
+        end
+    end)
 
     -- Fuel and stress, one line each, on the tab the pilot actually watches. A
     -- level that only appears when you go looking for it is a level nobody sees
     -- until it is a problem.
-    if y <= H - 2 then
-        local status = reads.fuel
-        if status.link == "live" or status.link == "stale" then
-            local text = string.format(" FUEL %3d%%  %s mB",
-                math.floor(status.fraction * 100 + 0.5), comma(status.total))
-            if status.burn > 0 then
-                text = text .. "   " .. util.fmtETA(status.endurance) .. " to reserve"
-            elseif status.filling then
-                text = text .. "   filling"
-            end
-            if status.link == "stale" then text = text .. "   LINK LOST" end
-            line(y, text, status.link == "stale" and C("bad") or fuelColour(status.fraction))
-            y = y + 1
+    p:gap(2)
+    local status = reads.fuel
+    if status.link == "live" or status.link == "stale" then
+        local text = string.format(" FUEL %3d%%  %s mB",
+            math.floor(status.fraction * 100 + 0.5), comma(status.total))
+        if status.burn > 0 then
+            text = text .. "   " .. util.fmtETA(status.endurance) .. " to reserve"
+        elseif status.filling then
+            text = text .. "   filling"
         end
+        if status.link == "stale" then text = text .. "   LINK LOST" end
+        p:text(text, status.link == "stale" and C("bad") or fuelColour(status.fraction))
     end
 
-    if y <= H - 2 then
-        local turbines = reads.turbines
-        if turbines.overstressed then
-            line(y, " OVERSTRESSED. The kinetic network has stopped turning.", C("bad")); y = y + 1
-        elseif turbines.link == "stale" then
-            line(y, " A TURBINE RELAY HAS STOPPED ANSWERING", C("bad")); y = y + 1
-        elseif turbines.fraction then
-            line(y, string.format(" STRESS %3d%%  %.0f su spare   %d lines on %d relays",
-                math.floor(turbines.fraction * 100 + 0.5), turbines.headroom or 0,
-                #ship.order, #(turbines.relays or {})), stressColour(turbines.fraction))
-            y = y + 1
-        end
+    local turbines = reads.turbines
+    if turbines.overstressed then
+        p:text(" OVERSTRESSED. The kinetic network has stopped turning.", C("bad"))
+    elseif turbines.link == "stale" then
+        p:text(" A TURBINE RELAY HAS STOPPED ANSWERING", C("bad"))
+    elseif turbines.fraction then
+        p:text(string.format(" STRESS %3d%%  %.0f su spare   %d lines on %d relays",
+            math.floor(turbines.fraction * 100 + 0.5), turbines.headroom or 0,
+            #ship.order, #(turbines.relays or {})), stressColour(turbines.fraction))
     end
 
     local extras = reads.extras
-    if y <= H - 2 and (extras.altitude or extras.mass) then
+    if extras.altitude or extras.mass then
         local bits = {}
         if extras.altitude then bits[#bits + 1] = string.format("ALT %.0fm", extras.altitude) end
         if extras.pressure then bits[#bits + 1] = string.format("PRESS %.0f%%", extras.pressure * 100) end
         if extras.mass then bits[#bits + 1] = string.format("MASS %.0f", extras.mass) end
-        line(y, " " .. table.concat(bits, "   "), C("dim")); y = y + 1
+        p:text(" " .. table.concat(bits, "   "), C("dim"))
     end
 
-    while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
+    p:place()
 end
 
 -- == TAB: MANUAL =============================================
@@ -528,104 +619,107 @@ local function manualRow(y, label, value, span, keys_, colour)
 end
 
 local function drawManual(snap)
-    local y = 2
+    local p = pane()
     local hand = control.manual
     local state = snap.state
 
-    rule(y, "BY HAND"); y = y + 1
+    p:rule("BY HAND")
     if hand then
-        line(y, " the propellers are taking orders from this tab", C("warn"))
+        p:text(" the propellers are taking orders from this tab", C("warn"))
     else
-        line(y, " not by hand. Any key below takes control.", C("dim"))
+        p:text(" not by hand. Any key below takes control.", C("dim"))
     end
-    y = y + 1
+    p:gap()
 
-    manualRow(y, "THROTTLE", hand and hand.throttle or 0, 1, "I up  K down",
-        hand and C("warn") or C("dim")); y = y + 1
-    manualRow(y, "YAW", hand and hand.yaw or 0, 1, "J left  L rt",
-        hand and C("warn") or C("dim")); y = y + 1
+    p:row(function(y)
+        manualRow(y, "THROTTLE", hand and hand.throttle or 0, 1, "I up  K down",
+            hand and C("warn") or C("dim"))
+    end)
+    p:row(function(y)
+        manualRow(y, "YAW", hand and hand.yaw or 0, 1, "J left  L rt",
+            hand and C("warn") or C("dim"))
+    end)
 
     -- The balloon is not a fraction of anything, it is a strength from nothing
     -- to fifteen, so it gets a plain bar and its own number.
     local level = (hand and hand.level) or (snap.info and snap.info.balloon)
-    at(1, y, string.rep(" ", W), C("hi"), C("bg"))
-    at(2, y, util.pad("BALLOON", MANUAL_KEYS_AT - 3), C("dim"), C("bg"))
-    at(MANUAL_KEYS_AT, y, util.pad("U up  O down", MANUAL_VALUE_AT - MANUAL_KEYS_AT - 1),
-        C("dim"), C("bg"))
-    at(MANUAL_VALUE_AT, y, level and string.format(" %2d/15", level) or "    --",
-        level and C("hi") or C("dim"), C("bg"))
-    if level then bar(W - 16, y, 15, level / 15, C("bar")) end
-    y = y + 1
+    p:row(function(y)
+        at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+        at(2, y, util.pad("BALLOON", MANUAL_KEYS_AT - 3), C("dim"), C("bg"))
+        at(MANUAL_KEYS_AT, y, util.pad("U up  O down", MANUAL_VALUE_AT - MANUAL_KEYS_AT - 1),
+            C("dim"), C("bg"))
+        at(MANUAL_VALUE_AT, y, level and string.format(" %2d/15", level) or "    --",
+            level and C("hi") or C("dim"), C("bg"))
+        if level then bar(W - 16, y, 15, level / 15, C("bar")) end
+    end)
 
-    rule(y, "WHAT THE SHIP IS DOING"); y = y + 1
+    p:gap(2)
+    p:rule("WHAT THE SHIP IS DOING")
     if state then
-        line(y, string.format(" SPD %5.2f m/s  YAW %+5.1f deg/s  PITCH %+5.1f",
+        p:text(string.format(" SPD %5.2f m/s  YAW %+5.1f deg/s  PITCH %+5.1f",
             state.speed, ship.yawRate() or 0, util.pitchOf(state.orientation)), C("hi"))
-        y = y + 1
-        line(y, string.format(" X %7.1f  Y %6.1f  Z %7.1f  HDG %5.1f %s",
+        p:text(string.format(" X %7.1f  Y %6.1f  Z %7.1f  HDG %5.1f %s",
             state.position.x, state.position.y, state.position.z,
             state.yaw, util.compass(state.yaw)), C("dim"))
-        y = y + 1
     else
-        line(y, " position unavailable: " .. tostring(snap.fault), C("bad")); y = y + 1
-        line(y, " by hand still flies with no pose. Nothing else does.", C("dim")); y = y + 1
+        p:text(" position unavailable: " .. tostring(snap.fault), C("bad"))
+        p:text(" by hand still flies with no pose. Nothing else does.", C("dim"))
     end
 
     -- The thing a pilot flying by hand most needs to know is that nothing is
-    -- watching the height for them except the loop that always runs.
-    if y <= H - 2 then
-        rule(y, "STILL AUTOMATIC"); y = y + 1
-        line(y, " the balloon holds its level. Nothing else is.",
-            C("dim")); y = y + 1
-    end
+    -- watching the height for them except the loop that always runs. It sits
+    -- at the foot of the tab, where the eye lands last.
+    p:gap(99)
+    p:rule("STILL AUTOMATIC")
+    p:text(" the balloon holds its level. Nothing else is.", C("dim"))
+    p:text(" space, or `manual off`, hands the ship back", C("accent"))
 
-    if y <= H - 2 then
-        line(y, " space, or `manual off`, hands the ship back", C("accent")); y = y + 1
-    end
-
-    while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
+    p:place()
 end
 
 -- == TAB: PROPS ==============================================
 
 local function drawProps(snap, reads)
-    local y = 2
+    local p = pane()
+
+    -- The passcode belongs on the tab the relays are on, because the fault it
+    -- explains looks like a relay fault: a relay that is powered, wired and
+    -- broadcasting, and deaf to every order this computer sends.
+    local pass = link and link.status()
+    if pass and pass.refused > 0 then
+        p:text(string.format(" %d message(s) refused, last from #%s. Passcodes differ.",
+            pass.refused, tostring(pass.refusedFrom)), C("bad"))
+        p:gap()
+    elseif pass and not pass.paired then
+        p:text(" no passcode set. Anything in range on this protocol is obeyed.",
+            C("warn"))
+        p:gap()
+    end
 
     -- The relay's stressometer watches the whole kinetic network, which is what
     -- every line on this tab is drawing from. It belongs above them, not on a
     -- tab of its own.
     local turbines = reads.turbines
     if turbines.link ~= "nomodem" then
-        -- The passcode belongs on the tab the relays are on, because the fault it
-    -- explains looks like a relay fault: a relay that is powered, wired and
-    -- broadcasting, and deaf to every order this computer sends.
-    local pass = link and link.status()
-    if pass and pass.refused > 0 then
-        line(y, string.format(" %d message(s) refused, last from #%s. Passcodes differ.",
-            pass.refused, tostring(pass.refusedFrom)), C("bad")); y = y + 1
-    elseif pass and not pass.paired then
-        line(y, " no passcode set. Anything in range on this protocol is obeyed.",
-            C("warn")); y = y + 1
-    end
-
-    rule(y, "KINETIC NETWORK"); y = y + 1
-        if turbines.link == "waiting" then
-            line(y, " turbine relay has not spoken yet", C("dim"))
-        elseif turbines.link == "stale" then
-            line(y, string.format(" turbine relay SILENT for %s, its turbines have stopped",
-                util.fmtETA(turbines.age)), C("bad"))
-        elseif turbines.overstressed then
-            line(y, " OVERSTRESSED. The kinetic network has stopped turning.", C("bad"))
-        elseif not turbines.stressOk then
-            line(y, " no stressometer on the relay", C("warn"))
-        else
-            at(1, y, string.format(" stress %.0f / %.0f su", turbines.stress, turbines.capacity),
-                stressColour(turbines.fraction), C("bg"))
-            at(W - 15, y, string.format("%3d%%", math.floor(turbines.fraction * 100 + 0.5)),
-                stressColour(turbines.fraction), C("bg"))
-            bar(W - 10, y, 10, turbines.fraction, stressColour(turbines.fraction), C("barBg"))
-        end
-        y = y + 1
+        p:rule("KINETIC NETWORK")
+        p:row(function(y)
+            if turbines.link == "waiting" then
+                line(y, " turbine relay has not spoken yet", C("dim"))
+            elseif turbines.link == "stale" then
+                line(y, string.format(" turbine relay SILENT for %s, its turbines have stopped",
+                    util.fmtETA(turbines.age)), C("bad"))
+            elseif turbines.overstressed then
+                line(y, " OVERSTRESSED. The kinetic network has stopped turning.", C("bad"))
+            elseif not turbines.stressOk then
+                line(y, " no stressometer on the relay", C("warn"))
+            else
+                at(1, y, string.format(" stress %.0f / %.0f su", turbines.stress, turbines.capacity),
+                    stressColour(turbines.fraction), C("bg"))
+                at(W - 15, y, string.format("%3d%%", math.floor(turbines.fraction * 100 + 0.5)),
+                    stressColour(turbines.fraction), C("bg"))
+                bar(W - 10, y, 10, turbines.fraction, stressColour(turbines.fraction), C("barBg"))
+            end
+        end)
     end
 
     -- Grouped by the computer that owns them, because that is the unit a
@@ -649,112 +743,126 @@ local function drawProps(snap, reads)
     end)
 
     if #ship.order == 0 then
-        rule(y, "PROPELLER LINES"); y = y + 1
-        line(y, " nothing on the network that takes a target speed", C("bad"))
-        y = y + 1
+        p:gap()
+        p:rule("PROPELLER LINES")
+        p:text(" nothing on the network that takes a target speed", C("bad"))
     end
 
     local maxRpm = config.get("maxRpm")
     local linkOf = {}
     for _, one in ipairs(turbines.relays or {}) do linkOf[one.relayId] = one end
 
-    for _, owner in ipairs(order) do
-        if y > H - 4 then break end
-        if owner == "wired" then
-            rule(y, "ON THIS COMPUTER")
-        else
-            local one = linkOf[owner]
-            local note = one and one.link or "waiting"
-            if one and one.hasBalloon then note = note .. ", holds the balloon" end
-            rule(y, string.format("RELAY #%d  %s", owner, note))
-            if one and one.link == "stale" then
-                at(W - 12, y, " NOT ANSWERING", C("ink"), C("bad"))
-            end
-        end
-        y = y + 1
+    -- Two rows held back for the bearings heading and its first line, so a
+    -- long list of propellers cannot push the section that follows it off the
+    -- bottom without saying it was there.
+    local RESERVE = 2
 
-        for _, name in ipairs(byRelay[owner]) do
-            if y > H - 4 then break end
-            local line_ = ship.lines[name]
-            local entry = cal.sideOf(name)
-            local label = entry and entry.side or "unfiled"
-            local rpm = snap.demands and snap.demands[name] or 0
-            local colour = entry and C("hi") or C("warn")
-            at(1, y, string.rep(" ", W), C("hi"), C("bg"))
-            -- Five columns for the name, not four: a relay id of ten or more
-            -- reads as #10.3 and the fourth column was where it overflowed.
-            at(1, y, string.format("%s%-5s %-6s %-3s %5d", line_.main and "*" or " ",
-                util.shortName(name), label,
-                entry and entry.reverse and "rev" or "", rpm), colour)
-            biBar(26, y, math.max(6, W - 40), rpm, maxRpm,
-                entry and C("bar") or C("warn"))
-            local tele = ship.readLineTelemetry(name)
-            if tele then
-                if tele.overstressed then
-                    at(W - 9, y, util.padLeft("STRESSED", 9), C("bad"), C("bg"))
-                elseif tele.thrust then
-                    at(W - 9, y, util.padLeft(string.format("%.0fpN", tele.thrust), 9), C("dim"), C("bg"))
-                elseif tele.speed then
-                    at(W - 9, y, util.padLeft(string.format("%.0frpm", tele.speed), 9), C("dim"), C("bg"))
+    for _, owner in ipairs(order) do
+        if p:left() <= RESERVE + 1 then break end
+        p:gap()
+        p:row(function(y)
+            if owner == "wired" then
+                rule(y, "ON THIS COMPUTER")
+            else
+                local one = linkOf[owner]
+                local note = one and one.link or "waiting"
+                if one and one.hasBalloon then note = note .. ", holds the balloon" end
+                rule(y, string.format("RELAY #%d  %s", owner, note))
+                if one and one.link == "stale" then
+                    at(W - 12, y, " NOT ANSWERING", C("ink"), C("bad"))
                 end
             end
-            y = y + 1
+        end)
+
+        for _, name in ipairs(byRelay[owner]) do
+            if p:left() <= RESERVE then break end
+            p:row(function(y)
+                local line_ = ship.lines[name]
+                local entry = cal.sideOf(name)
+                local label = entry and entry.side or "unfiled"
+                local rpm = snap.demands and snap.demands[name] or 0
+                local colour = entry and C("hi") or C("warn")
+                at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+                -- Five columns for the name, not four: a relay id of ten or more
+                -- reads as #10.3 and the fourth column was where it overflowed.
+                at(1, y, string.format("%s%-5s %-6s %-3s %5d", line_.main and "*" or " ",
+                    util.shortName(name), label,
+                    entry and entry.reverse and "rev" or "", rpm), colour)
+                biBar(26, y, math.max(6, W - 40), rpm, maxRpm,
+                    entry and C("bar") or C("warn"))
+                local tele = ship.readLineTelemetry(name)
+                if tele then
+                    if tele.overstressed then
+                        at(W - 9, y, util.padLeft("STRESSED", 9), C("bad"), C("bg"))
+                    elseif tele.thrust then
+                        at(W - 9, y, util.padLeft(string.format("%.0fpN", tele.thrust), 9), C("dim"), C("bg"))
+                    elseif tele.speed then
+                        at(W - 9, y, util.padLeft(string.format("%.0frpm", tele.speed), 9), C("dim"), C("bg"))
+                    end
+                end
+            end)
         end
     end
 
-    rule(y, "PROPELLER BEARINGS"); y = y + 1
+    p:gap(99)
+    p:rule("PROPELLER BEARINGS")
     if #ship.bearings == 0 then
-        line(y, " none found. Thrust and sail readouts are off.", C("dim")); y = y + 1
+        p:text(" none found. Thrust and sail readouts are off.", C("dim"))
     end
     for _, bearing in ipairs(ship.bearings) do
-        if y > H - 2 then break end
-        local bits = { util.pad(util.shortName(bearing.name), 5) }
-        local okAxis, axis = pcall(bearing.wrap.getAxis)
-        bits[#bits + 1] = util.pad(okAxis and tostring(axis) or "?", 8)
-        local okSail, sail = pcall(bearing.wrap.getSailPower)
-        bits[#bits + 1] = util.pad(okSail and string.format("sail %.0f", sail) or "", 10)
-        local okThrust, thrust = pcall(bearing.wrap.getThrust)
-        bits[#bits + 1] = util.pad(okThrust and string.format("%.0fpN", thrust) or "", 10)
-        bits[#bits + 1] = bearing.line and ("<- " .. util.shortName(bearing.line)) or "unlinked"
-        line(y, " " .. table.concat(bits, " "), C("dim"))
-        y = y + 1
+        if p:left() <= 0 then break end
+        p:row(function(y)
+            local bits = { util.pad(util.shortName(bearing.name), 5) }
+            local okAxis, axis = pcall(bearing.wrap.getAxis)
+            bits[#bits + 1] = util.pad(okAxis and tostring(axis) or "?", 8)
+            local okSail, sail = pcall(bearing.wrap.getSailPower)
+            bits[#bits + 1] = util.pad(okSail and string.format("sail %.0f", sail) or "", 10)
+            local okThrust, thrust = pcall(bearing.wrap.getThrust)
+            bits[#bits + 1] = util.pad(okThrust and string.format("%.0fpN", thrust) or "", 10)
+            bits[#bits + 1] = bearing.line and ("<- " .. util.shortName(bearing.line)) or "unlinked"
+            line(y, " " .. table.concat(bits, " "), C("dim"))
+        end)
     end
-    while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
+
+    p:place()
 end
 
 -- == TAB: NAV ================================================
 
 local function drawNav(snap)
-    local y = 2
-    rule(y, string.format("WAYPOINTS (%d)", #nav.points)); y = y + 1
+    local p = pane()
+    p:rule(string.format("WAYPOINTS (%d)", #nav.points))
     if #nav.points == 0 then
-        line(y, " none yet. `save <name>` pins where you are standing.", C("dim")); y = y + 1
+        p:text(" none yet. `save <name>` pins where you are standing.", C("dim"))
     end
     ui.sel.nav = util.clamp(ui.sel.nav, 1, math.max(1, #nav.points))
-    local room = H - 6 - y
-    local first = math.max(1, math.min(ui.sel.nav - math.floor(room / 2), #nav.points - room))
+    -- Three rows kept for the route panel that is pinned to the foot of the
+    -- tab, whatever the list does above it.
+    local room = p:left() - 3
+    local first = math.max(1, math.min(ui.sel.nav - math.floor(room / 2), #nav.points - room + 1))
     -- Remembered so a click knows which waypoint is under the cursor once the
     -- list has scrolled.
     ui.navFirst = first
-    ui.navTop = y
-    for index = first, math.min(#nav.points, first + room) do
+    for index = first, math.min(#nav.points, first + room - 1) do
         local wp = nav.points[index]
-        local selected = index == ui.sel.nav
-        local active = snap.targetName and snap.targetName:lower() == wp.name:lower()
-        local text = string.format("%s %-12s X %-7d %-7s Z %-7d",
-            active and ">" or " ", wp.name, util.round(wp.x),
-            wp.y and ("Y " .. util.round(wp.y)) or "Y any", util.round(wp.z))
-        line(y, text, selected and C("ink") or (active and C("good") or C("hi")),
-            selected and C("accent") or C("bg"))
-        y = y + 1
+        p:row(function(y)
+            if index == first then ui.navTop = y end
+            local selected = index == ui.sel.nav
+            local active = snap.targetName and snap.targetName:lower() == wp.name:lower()
+            local text = string.format("%s %-12s X %-7d %-7s Z %-7d",
+                active and ">" or " ", wp.name, util.round(wp.x),
+                wp.y and ("Y " .. util.round(wp.y)) or "Y any", util.round(wp.z))
+            line(y, text, selected and C("ink") or (active and C("good") or C("hi")),
+                selected and C("accent") or C("bg"))
+        end)
     end
 
-    while y < H - 4 do line(y, "", C("bg")); y = y + 1 end
-    rule(y, "ROUTE"); y = y + 1
-    line(y, #nav.route > 0 and (" " .. table.concat(nav.route, " > ")) or " empty",
-        #nav.route > 0 and C("warn") or C("dim")); y = y + 1
-    line(y, " up/down pick  enter fly  del remove  `route a b`", C("dim")); y = y + 1
-    while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
+    p:gap(99)
+    p:rule("ROUTE")
+    p:text(#nav.route > 0 and (" " .. table.concat(nav.route, " > ")) or " empty",
+        #nav.route > 0 and C("warn") or C("dim"))
+    p:text(" up/down pick  enter fly  del remove  `route a b`", C("dim"))
+    p:place()
 end
 
 -- == TAB: CAL ================================================
@@ -781,58 +889,66 @@ end
 -- One row per stage of the wizard, in the order the wizard runs them, because
 -- the thing a pilot wants off this tab is which stage still has to be done.
 local function drawCal(snap)
-    local y = 2
-    rule(y, "CALIBRATION"); y = y + 1
+    -- The last row is the hint line, which is always there and is drawn after
+    -- the pane rather than in it.
+    local p = pane(2, H - 3)
+    p:rule("CALIBRATION")
 
     for _, row in ipairs(cal.summary()) do
-        if y > H - 4 then break end
-        at(1, y, string.rep(" ", W), C("hi"), C("bg"))
-        -- What the stage measured is the sentence worth reading, so it gets the
-        -- room and the timestamp gets whatever is left. It was the other way
-        -- round until stage 7, which cut the detail mid word on a 51 column
-        -- screen: the date a stage was run is the less useful of the two.
-        local text = string.format(" %d %-8s %s", row.index, row.title, row.detail or "")
-        at(1, y, text:sub(1, W - 1), row.done and C("good") or C("warn"), C("bg"))
-        if row.at and #text + #row.at + 2 <= W then
-            at(W - #row.at - 1, y, row.at, C("dim"), C("bg"))
-        end
-        y = y + 1
+        if p:left() <= 3 then break end
+        p:row(function(y)
+            at(1, y, string.rep(" ", W), C("hi"), C("bg"))
+            -- What the stage measured is the sentence worth reading, so it gets
+            -- the room and the timestamp gets whatever is left. It was the other
+            -- way round until stage 7, which cut the detail mid word on a 51
+            -- column screen: the date a stage was run is the less useful of the two.
+            local text = string.format(" %d %-8s %s", row.index, row.title, row.detail or "")
+            at(1, y, text:sub(1, W - 1), row.done and C("good") or C("warn"), C("bg"))
+            if row.at and #text + #row.at + 2 <= W then
+                at(W - #row.at - 1, y, row.at, C("dim"), C("bg"))
+            end
+        end)
     end
 
     -- The two ladders worth a picture. Yaw and forward are what the controller
     -- spends every tick reading, and a kink in either is visible here and
-    -- nowhere else.
+    -- nowhere else. Each ladder is its own group: two rows about yaw sitting
+    -- against two rows about forward read as one block of four numbers.
     for _, entry in ipairs({
         { label = "YAW", curve = cal.yawCurve and cal.yawCurve.pos, unit = "deg/s" },
         { label = "FWD", curve = cal.fwdCurve and cal.fwdCurve.pos, unit = "m/s" },
     }) do
-        if y + 1 > H - 3 then break end
+        if p:left() < 3 then break end
         local curve = entry.curve
-        local top = util.curveTopSpeed(curve)
-        at(1, y, string.format(" %-4s top %s", entry.label,
-            top and string.format("%.2f %s", top, entry.unit) or "unmeasured"),
-            top and C("hi") or C("dim"), C("bg"))
-        at(W - 24, y, string.rep(" ", 24), C("hi"), C("bg"))
-        drawCurve(W - 24, y, 24, 1, curve, C("bar"))
-        y = y + 1
-        if curve and #curve > 0 then
-            local lo, hi = curve[1], curve[#curve]
-            at(1, y, string.format("    %d rpm %.2f  ->  %d rpm %.2f",
-                lo.rpm, lo.speed, hi.rpm, hi.speed), C("dim"), C("bg"))
-        else
-            at(1, y, "    no samples", C("dim"), C("bg"))
-        end
-        y = y + 1
+        p:gap()
+        p:row(function(y)
+            local top = util.curveTopSpeed(curve)
+            at(1, y, string.format(" %-4s top %s", entry.label,
+                top and string.format("%.2f %s", top, entry.unit) or "unmeasured"),
+                top and C("hi") or C("dim"), C("bg"))
+            at(W - 24, y, string.rep(" ", 24), C("hi"), C("bg"))
+            drawCurve(W - 24, y, 24, 1, curve, C("bar"))
+        end)
+        p:row(function(y)
+            if curve and #curve > 0 then
+                local lo, hi = curve[1], curve[#curve]
+                at(1, y, string.format("    %d rpm %.2f  ->  %d rpm %.2f",
+                    lo.rpm, lo.speed, hi.rpm, hi.speed), C("dim"), C("bg"))
+            else
+                at(1, y, "    no samples", C("dim"), C("bg"))
+            end
+        end)
     end
 
-    if y <= H - 3 and cal.inventory then
+    if cal.inventory and p:left() > 1 then
         local ok, items = cal.inventoryCheck()
         if not ok and #items > 0 then
-            line(y, " " .. items[1].text, kindColour(items[1].kind)); y = y + 1
+            p:gap()
+            p:text(" " .. items[1].text, kindColour(items[1].kind))
         end
     end
 
-    while y <= H - 3 do line(y, "", C("bg")); y = y + 1 end
+    p:place()
     line(H - 2, " `cal` all five   `cal yaw` one   `forget <stage>`", C("dim"))
     local _ = snap
 end
@@ -983,24 +1099,21 @@ end
 
 -- Advice wraps rather than being cut off, and a wrapped line is indented so it
 -- reads as a continuation and not as a second, shorter warning.
-local function drawAdvice(status, snap, y, turbines)
+local function drawAdvice(p, status, snap, turbines)
     local items = fuel.advice(status, snap)
     -- The turbine relay's advice goes in the same panel. A captain does not care
     -- which computer noticed the problem.
     for _, item in ipairs(turbine.advice(turbines)) do items[#items + 1] = item end
     for _, item in ipairs(items) do
         for index, part in ipairs(wrapText(item.text, W - 3)) do
-            if y > H - 2 then break end
-            line(y, (index == 1 and " " or "   ") .. part, kindColour(item.kind))
-            y = y + 1
+            if p:left() <= 0 then break end
+            p:text((index == 1 and " " or "   ") .. part, kindColour(item.kind))
         end
     end
-    while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
-    return y
 end
 
 local function drawFuel(snap, reads)
-    local y = 2
+    local p = pane()
     local status = reads.fuel
 
     -- The link line first. Every number under it is worth exactly what the link
@@ -1019,62 +1132,70 @@ local function drawFuel(snap, reads)
             status.relayId or -1, status.age or 0, fuel.messages)
         linkColour = C("good")
     end
-    rule(y, "LINK"); y = y + 1
-    line(y, " " .. linkText, linkColour); y = y + 1
+    p:rule("LINK")
+    p:text(" " .. linkText, linkColour)
 
     if not status.snap then
-        line(y, "", C("bg")); y = y + 1
-        rule(y, "ADVICE"); y = y + 1
-        y = drawAdvice(status, snap, y, reads.turbines)
-        while y <= H - 2 do line(y, "", C("bg")); y = y + 1 end
+        p:gap(99)
+        p:rule("ADVICE")
+        drawAdvice(p, status, snap, reads.turbines)
+        p:place()
         return
     end
 
-    rule(y, "TOTAL"); y = y + 1
-    local headline = string.format(" %s / %s mB", comma(status.total), comma(status.capacity))
-    at(1, y, headline, fuelColour(status.fraction), C("bg"))
-    at(W - 10, y, string.format("%7d%%", math.floor(status.fraction * 100 + 0.5)),
-        fuelColour(status.fraction), C("bg"))
-    y = y + 1
-    bar(2, y, W - 2, status.fraction, fuelColour(status.fraction), C("barBg"))
-    y = y + 1
+    p:gap()
+    p:rule("TOTAL")
+    p:row(function(y)
+        local headline = string.format(" %s / %s mB", comma(status.total), comma(status.capacity))
+        at(1, y, headline, fuelColour(status.fraction), C("bg"))
+        at(W - 10, y, string.format("%7d%%", math.floor(status.fraction * 100 + 0.5)),
+            fuelColour(status.fraction), C("bg"))
+    end)
+    p:row(function(y)
+        bar(2, y, W - 2, status.fraction, fuelColour(status.fraction), C("barBg"))
+    end)
 
-    rule(y, "TANKS"); y = y + 1
+    p:gap()
+    p:rule("TANKS")
     for _, tank in ipairs(status.tanks) do
-        if y > H - 6 then break end
-        local fraction = (tank.capacity or 0) > 0 and tank.amount / tank.capacity or 0
-        if tank.ok == false then
-            line(y, string.format(" %-6s OFFLINE  %s", tank.side, tostring(tank.err)), C("bad"))
-        else
-            -- The mod prefix is dropped: the captain knows what dimension he is
-            -- in, and `lava` reads faster than `minecraft:lava` in six columns.
-            local fluidName = (tank.fluid or "empty"):gsub("^.*:", "")
-            at(1, y, string.format(" %-6s %-9s %6s/%-6s", tank.side, fluidName:sub(1, 9),
-                comma(tank.amount), comma(tank.capacity)), C("hi"), C("bg"))
-            -- A tilde is the difference between a maximum that was read off the
-            -- tank and one the relay assumed. It is small on purpose and it is
-            -- never left off.
-            at(W - 16, y, tank.capSource ~= "reported" and "~" or " ", C("dim"), C("bg"))
-            at(W - 15, y, string.format("%3d%%", math.floor(fraction * 100 + 0.5)),
-                fuelColour(fraction), C("bg"))
-            bar(W - 10, y, 10, fraction, fuelColour(fraction), C("barBg"))
-        end
-        y = y + 1
+        -- Four rows held back: the flow heading and its line, and the advice
+        -- heading and its first line. A ship with many tanks still gets told
+        -- what to do about them.
+        if p:left() <= 4 then break end
+        p:row(function(y)
+            local fraction = (tank.capacity or 0) > 0 and tank.amount / tank.capacity or 0
+            if tank.ok == false then
+                line(y, string.format(" %-6s OFFLINE  %s", tank.side, tostring(tank.err)), C("bad"))
+            else
+                -- The mod prefix is dropped: the captain knows what dimension he is
+                -- in, and `lava` reads faster than `minecraft:lava` in six columns.
+                local fluidName = (tank.fluid or "empty"):gsub("^.*:", "")
+                at(1, y, string.format(" %-6s %-9s %6s/%-6s", tank.side, fluidName:sub(1, 9),
+                    comma(tank.amount), comma(tank.capacity)), C("hi"), C("bg"))
+                -- A tilde is the difference between a maximum that was read off the
+                -- tank and one the relay assumed. It is small on purpose and it is
+                -- never left off.
+                at(W - 16, y, tank.capSource ~= "reported" and "~" or " ", C("dim"), C("bg"))
+                at(W - 15, y, string.format("%3d%%", math.floor(fraction * 100 + 0.5)),
+                    fuelColour(fraction), C("bg"))
+                bar(W - 10, y, 10, fraction, fuelColour(fraction), C("barBg"))
+            end
+        end)
     end
 
-    rule(y, "FLOW"); y = y + 1
+    p:gap()
+    p:rule("FLOW")
     if status.filling then
-        line(y, string.format(" filling %+.1f mB/s   full in %s",
+        p:text(string.format(" filling %+.1f mB/s   full in %s",
             status.filling, util.fmtETA(status.fullIn)), C("good"))
     elseif status.burn > 0 then
-        line(y, string.format(" burn %.1f mB/s   res %s   dry %s",
+        p:text(string.format(" burn %.1f mB/s   res %s   dry %s",
             status.burn, util.fmtETA(status.endurance), util.fmtETA(status.dry)),
             status.endurance and status.endurance < 120 and C("bad") or C("hi"))
     else
-        line(y, " no flow measured", C("dim"))
+        p:text(" no flow measured", C("dim"))
     end
-    y = y + 1
-    if y <= H - 2 then
+    if p:left() > 2 then
         local rangeText
         if status.range then
             rangeText = string.format(" range %.0f blk at %.1f m/s", status.range, status.speed)
@@ -1086,11 +1207,13 @@ local function drawFuel(snap, reads)
         else
             rangeText = " range needs a burn rate and a speed"
         end
-        line(y, rangeText, C("dim")); y = y + 1
+        p:text(rangeText, C("dim"))
     end
 
-    rule(y, "ADVICE"); y = y + 1
-    y = drawAdvice(status, snap, y, reads.turbines)
+    p:gap()
+    p:rule("ADVICE")
+    drawAdvice(p, status, snap, reads.turbines)
+    p:place()
 end
 
 -- == TAB: LOG ================================================

@@ -39,6 +39,18 @@ local STAMP = "starcatcher_version.txt"
 -- prompt and what is written into link.peers are the same word.
 local PEER_ROLES = { "fuel", "turbine", "cruise" }
 
+-- What each of them hosts on rednet. This is the one question that can be put
+-- to a computer whose program is too old to answer a pairing ping: rednet's
+-- own lookup is answered by CC: Tweaked itself and not by anything in this
+-- repository, so a relay that is running answers it whatever version it is
+-- carrying. That is what tells a relay that is switched off apart from a relay
+-- that is switched on and deaf, and those two have different fixes.
+local PEER_PROTOCOL = {
+    fuel = "starcatcher-fuel",
+    turbine = "starcatcher-turbine",
+    cruise = "starcatcher-turbine",
+}
+
 local ARGS = { ... }
 
 local function die(...)
@@ -283,24 +295,92 @@ local function pairCommand(link, modem)
     print("Pinging. This waits until all three answer. Ctrl and T to give up.")
     print("")
     local _, top = term.getCursorPos()
-    for _ = 1, #PEER_ROLES + 1 do print("") end
+    local NOTE_LINES = 3
+    for _ = 1, #PEER_ROLES + NOTE_LINES do print("") end
 
     local answered = {}
+    local reasons = {}          -- why a peer is still silent, in its own words
+
     local function redraw(note)
         for i, role in ipairs(PEER_ROLES) do
             term.setCursorPos(1, top + i - 1)
             term.clearLine()
             local said = answered[role]
-            write(string.format("  %-8s #%-4d %s", role, peers[role],
-                said and ("here, says it is the " .. said) or "waiting"))
+            local state = said and ("here, says it is the " .. said)
+                or (reasons[role] and reasons[role].tag or "waiting")
+            write(string.format("  %-8s #%-4d %s", role, peers[role], state))
         end
-        term.setCursorPos(1, top + #PEER_ROLES)
-        term.clearLine()
-        if note then write("  " .. note) end
-        term.setCursorPos(1, top + #PEER_ROLES + 1)
+        -- The note area says the whole of one fault rather than the first
+        -- forty characters of it. A sentence that tells the pilot to reinstall
+        -- a computer is worthless cut off at the word "reinstall".
+        local said = note
+        if not said then
+            for _, role in ipairs(PEER_ROLES) do
+                if not answered[role] and reasons[role] then
+                    said = reasons[role].say
+                    break
+                end
+            end
+        end
+        local wrapped = {}
+        for word in tostring(said or ""):gmatch("%S+") do
+            local last = wrapped[#wrapped]
+            if last and #last + #word + 1 <= 48 then
+                wrapped[#wrapped] = last .. " " .. word
+            else
+                wrapped[#wrapped + 1] = word
+            end
+        end
+        for offset = 0, NOTE_LINES - 1 do
+            term.setCursorPos(1, top + #PEER_ROLES + offset)
+            term.clearLine()
+            if wrapped[offset + 1] then write("  " .. wrapped[offset + 1]) end
+        end
+        term.setCursorPos(1, top + #PEER_ROLES + NOTE_LINES)
     end
     redraw()
 
+    -- A peer that says nothing looks the same whatever is wrong with it, and
+    -- this screen used to sit saying "waiting" at all three until somebody
+    -- walked away. So after a few fruitless sweeps it asks rednet who is out
+    -- there at all, which separates a relay that is off or out of range from
+    -- one that is running a program older than the pairing responder. The
+    -- second of those answers no ping ever, however long the wizard waits.
+    local function diagnose()
+        local seen, asked = {}, {}
+        for _, role in ipairs(PEER_ROLES) do
+            local protocol = PEER_PROTOCOL[role]
+            if not answered[role] and protocol and not asked[protocol] then
+                asked[protocol] = true
+                for _, id in ipairs({ rednet.lookup(protocol) }) do seen[id] = true end
+            end
+        end
+        for _, role in ipairs(PEER_ROLES) do
+            local id = peers[role]
+            if answered[role] then
+                reasons[role] = nil
+            elseif seen[id] then
+                reasons[role] = {
+                    tag = "running, but deaf",
+                    say = string.format(
+                        "#%d is running and hosting %s, so it is powered and in range, "
+                        .. "and it did not answer the ping. Its program is older than the "
+                        .. "pairing responder. Run the installer on #%d again.",
+                        id, PEER_PROTOCOL[role], id),
+                }
+            else
+                reasons[role] = {
+                    tag = "nothing heard",
+                    say = string.format(
+                        "#%d has said nothing at all. It is switched off, out of modem "
+                        .. "range, or sitting at a shell rather than running its own "
+                        .. "program. It answers from that program, so reboot it.", id),
+                }
+            end
+        end
+    end
+
+    local rounds = 0
     while true do
         local asking = {}
         for _, role in ipairs(PEER_ROLES) do
@@ -314,6 +394,7 @@ local function pairCommand(link, modem)
             local id = peers[role]
             if replies[id] then
                 answered[role] = replies[id]
+                reasons[role] = nil
                 -- Worth saying rather than swallowing. A computer that answers
                 -- to the cruise slot calling itself the turbine relay is a
                 -- redstone relay on the wrong computer, and it is far cheaper
@@ -323,9 +404,18 @@ local function pairCommand(link, modem)
                         id, role, replies[id])
                 end
             elseif refusals[id] then
-                note = refusals[id]
+                -- A refusal is the one fault the ping itself can name, and it
+                -- beats anything the lookup could work out, so it wins the row.
+                reasons[role] = { tag = "refused the ping", say = refusals[id] }
             end
         end
+
+        rounds = rounds + 1
+        -- Two sweeps first, because a relay that is mid reboot answers the
+        -- third, and telling a pilot to reinstall a computer that was about to
+        -- answer is worse than four seconds of "waiting". Then every tenth, so
+        -- a diagnosis that has gone stale is replaced rather than left up.
+        if rounds == 2 or rounds % 10 == 0 then diagnose() end
         redraw(note)
     end
 

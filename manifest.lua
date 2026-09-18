@@ -19,8 +19,8 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.9.4",
-    note = "stage 9: the installer knows a relay from the flight computer again",
+    version = "0.9.5",
+    note = "stage 9: a silent relay is named rather than waited on for ever",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths
