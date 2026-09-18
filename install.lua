@@ -258,9 +258,9 @@ end
 local function pairCommand(link, modem)
     local peers, taken = {}, {}
     print("")
-    print("Now the other three. Install them first. They answer a ping from their")
-    print("waiting screen and they go on answering once they have rebooted, so the")
-    print("order they were installed in does not matter.")
+    print("Now the other three. Install them first and let them reboot: each one")
+    print("answers from its own program, so the order does not matter and no")
+    print("screen has to be left up anywhere.")
     print("")
     for _, role in ipairs(PEER_ROLES) do
         peers[role] = askPeerId(role, taken)
@@ -324,48 +324,39 @@ local function pairCommand(link, modem)
     print("All three answered to the same passcode. The ship is paired.")
 end
 
--- Every other computer's half, and it is the same responder the relay program
--- itself runs from now on. The wizard's screen is no longer the only window in
--- which a relay can be found: leaving this screen up is polite, not required.
-local function pairRelay(link, modem, role)
-    rednet.open(modem)
-    print("")
-    print("Waiting to be pinged by the flight computer. This relay answers from")
-    print("here and goes on answering once it has rebooted, so press Enter")
-    print("whenever you like.")
-    print("")
-
-    parallel.waitForAny(
-        function()
-            link.respond(role, function(kind, id, why)
-                if kind == "answered" then
-                    print("  answered the flight computer, #" .. id)
-                else
-                    print("  refused a ping from #" .. id .. ": " .. tostring(why))
-                end
-            end)
-        end,
-        function() read() end)
-    rednet.close(modem)
-end
-
+-- A relay has nothing to wait for. It answers the flight computer's ping from
+-- its own program, for as long as it runs, so the passcode is the whole of its
+-- half of the pairing and the sooner it reboots into that program the sooner it
+-- can be found. This used to hold a screen open until somebody pressed Enter,
+-- which was the wizard being the only window a relay could be seen through.
 local function pair(link, spec, role)
     local word = askPasscode(link)
+
+    if role ~= "command" then
+        if word then
+            print("")
+            print("Paired. This relay answers the flight computer from its own")
+            print("program once it has rebooted, so there is nothing to wait for.")
+        end
+        if word and not wirelessModem() then
+            printError("")
+            printError("No wireless modem on this computer, so nothing can reach it.")
+            printError("Bolt one on and reboot. The passcode is already saved.")
+        end
+        return
+    end
+
     if not word then return end
     local modem = wirelessModem()
     if not modem then
         printError("")
-        printError("No wireless modem on this computer, so it cannot be paired now.")
+        printError("No wireless modem on this computer, so it cannot ping anybody.")
         printError("Bolt one on, then set the same word on each computer by hand:")
         printError("  flight computer: passcode <word>")
         printError("  either relay: fuel_relay --passcode <word>")
         return
     end
-    if role == "command" then
-        pairCommand(link, modem)
-    else
-        pairRelay(link, modem, role)
-    end
+    pairCommand(link, modem)
 end
 
 -- == RUN =====================================================
@@ -481,6 +472,11 @@ else
     pair(link, spec, role)
 end
 
+-- It reboots itself rather than asking. An installed computer that is sitting
+-- at a shell prompt is a computer that is not doing its job, and on a ship that
+-- means a relay nobody can reach or an autopilot nobody is flying. The pause is
+-- long enough to read the screen and to interrupt.
 print("")
-write("Reboot now? [Y/n] ")
-if (read():lower() or "") ~= "n" then os.reboot() end
+print("Rebooting in 3 seconds. Ctrl and T now for the shell instead.")
+sleep(3)
+os.reboot()
