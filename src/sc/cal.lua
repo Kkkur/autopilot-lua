@@ -275,6 +275,35 @@ function cal.swapSides()
     return swapped
 end
 
+-- Every line turned round, which is what a ship that answers full ahead by
+-- going astern is asking for.
+--
+-- The reverse flag is decided in the sides stage from the sign of one speed
+-- reading, and one reading is enough to get it backwards on a hull that had
+-- not begun to move, or on a line read while the physics engine was reporting
+-- nothing. It is one mistake made once, because every line was read the same
+-- way, and the forward ladder is where it shows.
+--
+-- The sides are swapped as well, and that is not tidiness. `mix` negates a
+-- reversed line after the differential has been added to it, so flipping the
+-- flag alone would invert the turn along with the thrust and throw away a yaw
+-- ladder that was right. Swapping the two sides puts the differential back
+-- where it was: a left line at c + d becomes a right line at -(c - d), which
+-- is the same d and the opposite c. Thrust reverses, handedness does not.
+function cal.flipThrust()
+    local flipped = 0
+    for _, entry in pairs(cal.sides) do
+        entry.reverse = not entry.reverse
+        flipped = flipped + 1
+    end
+    cal.swapSides()
+    -- The nose offset was read off the main's drift with the thrust turned the
+    -- way the flag said it pointed. The flag now says the other way, so the
+    -- offset is half a circle out.
+    if cal.noseOffset then cal.noseOffset = util.wrapAngle(cal.noseOffset + 180) end
+    return flipped
+end
+
 -- Lines the ship has that calibration has never seen.
 function cal.missingLines()
     local out = {}
@@ -1174,6 +1203,11 @@ local function stageForward(ctx)
     local total = #ladder * #ways
     local index = 0
     cal.fwdCurve = cal.fwdCurve or {}
+    -- Offered once, and only while the ladder has kept nothing, for the same
+    -- reason the yaw stage's swap is: it is about how the lines were filed and
+    -- not about this rung, and turning the ship round underneath a half
+    -- measured ladder leaves half of it measured the other way round.
+    local kept, offeredFlip = 0, false
 
     for _, sign in ipairs(ways) do
         local way = sign > 0 and "pos" or "neg"
@@ -1182,46 +1216,79 @@ local function stageForward(ctx)
             if ctx.aborted() then break end
             index = index + 1
 
-            local speed, reason = track(ctx, {
-                apply = function()
-                    ship.flush(flight.mix(rpm * sign, 0, ship.order, cal, cfg()))
-                end,
-                read = forwardSpeed,
-                wantSign = sign,
-                floor = config.get("calMinDrift"),
-                live = function(live)
-                    live.rungIndex = index
-                    live.rungTotal = total
-                    live.rungLabel = string.format("throttle %+d", rpm * sign)
-                    live.valueLabel = "speed"
-                    live.unit = "m/s"
-                    live.samples = samples
-                    ctx.panel(live)
-                end,
-            })
+            local again = true
+            while again do
+                again = false
+                local speed, reason = track(ctx, {
+                    apply = function()
+                        ship.flush(flight.mix(rpm * sign, 0, ship.order, cal, cfg()))
+                    end,
+                    read = forwardSpeed,
+                    wantSign = sign,
+                    floor = config.get("calMinDrift"),
+                    live = function(live)
+                        live.rungIndex = index
+                        live.rungTotal = total
+                        live.rungLabel = string.format("throttle %+d", rpm * sign)
+                        live.valueLabel = "speed"
+                        live.unit = "m/s"
+                        live.samples = samples
+                        ctx.panel(live)
+                    end,
+                })
 
-            if ctx.aborted() then break end
-            if speed and not reason then
-                samples[#samples + 1] = { rpm = rpm, speed = math.abs(speed) }
-                ctx.note(string.format("%+4d rpm -> %s m/s", rpm * sign,
-                    fine(math.abs(speed))), "good")
-                log.infof("cal: forward way=%s rpm=%d speed=%.3f %s", way, rpm, speed,
-                    reason or "settled")
-                if rpm == ladder[#ladder] then
-                    local stress = stressNow()
-                    if stress then
-                        cal.stressAtCruise = stress
-                        ctx.note(string.format("full cruise draws %.0f su", stress))
+                if not ctx.aborted() then
+                    -- A ship asked for full ahead that goes astern is not a bad
+                    -- rung. Every line is filed the wrong way round, every rung
+                    -- after this one reads the same, and the ladder ends empty
+                    -- without the stage ever saying why.
+                    if reason == "went the wrong way" and kept == 0 and not offeredFlip then
+                        offeredFlip = true
+                        ctx.note(string.format("asked for %+d and the ship made %s m/s, the other way",
+                            rpm * sign, fine(speed or 0)), "bad")
+                        ctx.note("that is every line filed the wrong way round, not a bad reading", "warn")
+                        if ctx.yesno("Turn every line round and measure this rung again?", true) then
+                            local flipped = cal.flipThrust()
+                            cal.save()
+                            ctx.note(string.format(
+                                "%d lines turned round, sides swapped with them so the turn is unchanged",
+                                flipped), "good")
+                            log.infof("cal: forward flipped %d lines, rung %+d read %.3f",
+                                flipped, rpm * sign, speed or 0)
+                            cooldown(ctx, function() return forwardSpeed() or 0 end, "speed")
+                            again = not ctx.aborted()
+                        else
+                            ctx.note("left as it is, so the ladder runs backwards all the way up", "warn")
+                        end
                     end
                 end
-            else
-                ctx.note(string.format("%+4d rpm -> nothing kept: %s", rpm * sign,
-                    tostring(reason or "no reading")), "bad")
-            end
 
-            cal.fwdCurve[way] = util.tidyCurve(samples)
-            cal.save()
-            cooldown(ctx, function() return forwardSpeed() or 0 end, "speed")
+                if not again and not ctx.aborted() then
+                    if speed and not reason then
+                        samples[#samples + 1] = { rpm = rpm, speed = math.abs(speed) }
+                        kept = kept + 1
+                        ctx.note(string.format("%+4d rpm -> %s m/s", rpm * sign,
+                            fine(math.abs(speed))), "good")
+                        log.infof("cal: forward way=%s rpm=%d speed=%.3f %s", way, rpm, speed,
+                            reason or "settled")
+                        if rpm == ladder[#ladder] then
+                            local stress = stressNow()
+                            if stress then
+                                cal.stressAtCruise = stress
+                                ctx.note(string.format("full cruise draws %.0f su", stress))
+                            end
+                        end
+                    else
+                        ctx.note(string.format("%+4d rpm -> nothing kept: %s", rpm * sign,
+                            tostring(reason or "no reading")), "bad")
+                    end
+
+                    cal.fwdCurve[way] = util.tidyCurve(samples)
+                    cal.save()
+                    cooldown(ctx, function() return forwardSpeed() or 0 end, "speed")
+                end
+            end
+            if ctx.aborted() then break end
         end
         if ctx.aborted() then break end
     end

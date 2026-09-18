@@ -230,6 +230,40 @@ function tests.run()
     near(cal.yawAuth.right, 0.02, "both ways")
     cal.sides, cal.yawAuth = savedSides, savedAuth
 
+    -- == every line turned round ==
+    -- What the forward stage offers when the ship answers full ahead by going
+    -- astern. Thrust has to reverse and the turn has to stay where it was, or
+    -- the fix for one ladder breaks the one measured before it.
+    config.values = config.defaults()
+    savedSides, savedAuth = cal.sides, cal.yawAuth
+    local savedNose = cal.noseOffset
+    cal.sides = {
+        l = { side = "left" }, r = { side = "right" },
+        m = { side = "main" }, rev = { side = "left", reverse = true },
+    }
+    cal.yawAuth = { left = 0.06, right = 0.06 }
+    cal.noseOffset = 30
+    local lines = { "l", "r", "m", "rev" }
+    local pushBefore = flight.mix(100, 0, lines, cal, config.values)
+    local turnBefore = flight.mix(0, 64, lines, cal, config.values)
+    local flipped = cal.flipThrust()
+    check(flipped == 4, "every filed line is turned round, the main included")
+    near(cal.noseOffset, -150, "and the nose offset comes round half a circle")
+
+    local pushAfter = flight.mix(100, 0, lines, cal, config.values)
+    for _, name in ipairs(lines) do
+        near(pushAfter[name], -pushBefore[name], name .. " pushes the other way now")
+    end
+
+    -- The differential is added before a reversed line is negated, so flipping
+    -- the flag alone would invert the turn as well. Swapping the sides is what
+    -- puts it back, and this is the check that says it did.
+    local turnAfter = flight.mix(0, 64, lines, cal, config.values)
+    for _, name in ipairs(lines) do
+        near(turnAfter[name], turnBefore[name], name .. " turns the ship exactly as it did")
+    end
+    cal.sides, cal.yawAuth, cal.noseOffset = savedSides, savedAuth, savedNose
+
     -- == a yaw rate the engine has stopped reporting ==
     -- getAngularVelocity is the last figure the physics engine published, and a
     -- hull creeping round slowly enough is close enough to still for it to stop
