@@ -940,7 +940,7 @@ local function stageSides(ctx)
                 apply = function() ship.driveOnly(name, config.get("calRpm")) end,
                 read = forwardSpeed,
                 live = function(live)
-                    yawRate = windowMean(yawHistory, ship.yawRate() or 0, os.clock())
+                    yawRate = windowMean(yawHistory, ship.yawRateHeading() or 0, os.clock())
                     drift = ship.bodyVelocity()
                     live.step = index
                     live.total = #names
@@ -1190,7 +1190,7 @@ local function stageYaw(ctx)
                     apply = function()
                         ship.flush(flight.mix(0, diff * sign, ship.order, cal, cfg()))
                     end,
-                    read = ship.yawRate,
+                    read = ship.yawRateHeading,
                     stable = config.get("calYawStable"),
                     wantSign = sign,
                     -- Not calMinYaw. That number answers the sides stage's
@@ -1228,7 +1228,7 @@ local function stageYaw(ctx)
                                 "%d lines swapped over, and the authorities with them", moved), "good")
                             log.infof("cal: yaw swapped %d lines, rung %+d read %.3f",
                                 moved, diff * sign, rate or 0)
-                            cooldown(ctx, function() return ship.yawRate() or 0 end, "yaw")
+                            cooldown(ctx, function() return ship.yawRateHeading() or 0 end, "yaw")
                             again = not ctx.aborted()
                         else
                             ctx.note("left as it is, so the ladder turns the wrong way all the way up", "warn")
@@ -1253,7 +1253,13 @@ local function stageYaw(ctx)
                         end
                         ctx.note(string.format("%+4d rpm -> %s deg/s", diff * sign,
                             fine(math.abs(rate))), "good")
-                        log.infof("cal: yaw way=%s rpm=%d rate=%.2f %s", way, diff, rate, reason or "settled")
+                        -- The engine's own figure alongside the one being written down. They
+                        -- disagreed by three times on this ship and nothing said so,
+                        -- because only one of the two was ever read.
+                        log.infof("cal: yaw way=%s rpm=%d rate=%.2f engine=%s %s",
+                            way, diff, rate,
+                            ship.yawRate() and string.format("%.2f", ship.yawRate()) or "none",
+                            reason or "settled")
                         -- The stress of a full turn is read at the top rung, while the
                         -- ship is actually doing it. Read after the stop and it is the
                         -- stress of nothing happening.
@@ -1276,7 +1282,7 @@ local function stageYaw(ctx)
 
                     cal.yawCurve[way] = util.tidyCurve(samples)
                     cal.save()
-                    cooldown(ctx, function() return ship.yawRate() or 0 end, "yaw")
+                    cooldown(ctx, function() return ship.yawRateHeading() or 0 end, "yaw")
                 end
             end
             if ctx.aborted() then break end

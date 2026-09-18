@@ -301,6 +301,28 @@ function ship.yawRate()
     return reported
 end
 
+-- The same rate, measured off the heading and never off the physics engine.
+--
+-- Calibration writes its answer to disk and every later flight is priced off
+-- it, so the one number it must not take on trust is the one it is measuring.
+-- `ship.yawRate` hands back `getAngularVelocity` whenever that is above
+-- `yawAsleep`, which on a yaw rung is always, so the heading is never consulted
+-- and the pose is never even read: a whole ladder can be written down while the
+-- hull's heading has not moved at all, and nothing in the stage would know.
+-- That is not a hypothetical. It is what the last two ladders on this ship did.
+--
+-- The trail needs a span before it can answer, so the first sample or two of a
+-- rung still come back off the engine. A rung runs for twenty seconds and the
+-- window is one second, so what gets averaged is the heading.
+function ship.yawRateHeading()
+    -- Unconditionally, because this is the call that feeds the trail. Without
+    -- it the trail holds whatever some other loop happened to leave there.
+    ship.readState()
+    local turned = yawRateFromTrail()
+    if turned then return turned end
+    return ship.yawRate()
+end
+
 -- Which way north is, as a heading in the same convention everything else here
 -- speaks. CC: Sable keeps it per dimension rather than per world, and a
 -- datapack can move it, so it is asked for rather than written down as 180.

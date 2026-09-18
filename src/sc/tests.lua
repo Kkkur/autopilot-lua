@@ -563,6 +563,23 @@ function tests.run()
     ship.noteYaw(13)
     check(#ship.yawTrail == 2, "a heading that is not a number is not written down")
     check(ship.yawTrail[#ship.yawTrail].yaw == 13, "and the newest one is kept")
+    -- == what calibration measures, against what the engine claims ==
+    -- The two are not the same number and a ladder that takes the engine's word
+    -- for it writes a ship down wrong. getAngularVelocity reported 2.5 deg/s
+    -- through a whole yaw ladder on this ship while the heading did not move at
+    -- all, because nothing in the rung ever read the pose. So the stages that
+    -- write to disk differentiate the heading and let the engine be the
+    -- fallback, which is the other way round from the control loop.
+    ship.yawTrail = { { t = now - 1, yaw = 10 }, { t = now, yaw = 18 } }
+    reportedY = -math.rad(2.5)
+    near(ship.yawRate(), 2.5, "the control loop takes the engine's figure when it has one")
+    near(ship.yawRateHeading(), 8, "calibration takes the heading, which disagrees")
+
+    -- Before the trail has a span to divide by there is nothing to prefer, and
+    -- the first sample or two of a rung still come back off the engine.
+    ship.yawTrail = { { t = now, yaw = 10 } }
+    near(ship.yawRateHeading(), 2.5, "too short a trail falls back on the engine")
+
     ship.yawTrail = {}
     sublevel = savedSublevel
 

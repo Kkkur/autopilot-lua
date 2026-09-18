@@ -19,7 +19,7 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.12.1",
+    version = "0.13.0",
     note = "stage 11: the rose is walked on the front, not on the hull",
 
     roles = {
