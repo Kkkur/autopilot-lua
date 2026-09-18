@@ -64,7 +64,7 @@ cal.STAGES = {
     {
         id = "sides", title = "SIDES", meta = "sidesAt",
         what = "Spins each propeller on its own and reads which side of the hull it sits on.",
-        room = "A few blocks of drift in every direction. The ship moves a little on each line.",
+        room = "Off the ground, and a few blocks of drift in every direction. A propeller read against the ground is read against friction.",
     },
     {
         id = "balloon", title = "BALLOON", meta = "balloonAt",
@@ -74,17 +74,17 @@ cal.STAGES = {
     {
         id = "yaw", title = "YAW", meta = "yawAt",
         what = "Drives one side against the other and writes down how fast the hull comes round.",
-        room = "Room to spin on the spot, both ways.",
+        room = "Off the ground, with room to spin on the spot both ways.",
     },
     {
         id = "forward", title = "FORWARD", meta = "forwardAt",
         what = "Runs the ship up at each throttle step and writes down the speed it settles at.",
-        room = "A long run ahead and behind. This is the stage that covers ground.",
+        room = "Off the ground, with a long run ahead and behind. This is the stage that covers ground.",
     },
     {
         id = "brake", title = "BRAKING", meta = "brakeAt",
         what = "Runs up to speed and reverses, on the main alone and then on all five.",
-        room = "A long run ahead, four times over, with room to overshoot.",
+        room = "Off the ground, with a long run ahead four times over and room to overshoot.",
     },
 }
 
@@ -666,18 +666,54 @@ local function cooldown(ctx, read, label, floor)
     ship.allStop()
 end
 
--- The balloon is held where calibration last found it holds, for every stage
--- that measures something horizontal. A stage that let the ship sink while it
--- measured a speed would be measuring a dive.
-local function holdAltitude(ctx)
-    if not turbine or not turbine.hasBalloon or not turbine.hasBalloon() then return end
-    local level = cal.altHover
-    if not level then
-        ctx.note("balloon not measured yet, so it is left where it is", "warn")
+-- Nothing is measured on the ground. A hull sitting on blocks answers a
+-- propeller with friction rather than with thrust, and friction is not in any
+-- of the models the ladders feed: it is why the first run of this wizard filed
+-- a line as pushing nothing, and why a yaw rung at 128 rpm came out slower
+-- than the same ladder's 64.
+--
+-- So every stage that reads motion lifts the ship clear first, at
+-- calFlyStrength, which is full by default. Whether the ship is clear is not
+-- something this program can see. It can see the height going up, and the
+-- pilot can see the ground, so it shows the one and waits for the other.
+local function flyClear(ctx, why)
+    if not turbine or not turbine.hasBalloon or not turbine.hasBalloon() then
+        ctx.note("no relay is holding the balloon, so this measures the ship where it sits", "warn")
         return
     end
+    local level = util.clamp(math.floor(config.get("calFlyStrength") + 0.5), 0, 15)
     pcall(turbine.setBalloon, level)
-    ctx.note(string.format("balloon held at %d while this runs", level))
+    ctx.note(string.format("balloon to %d. %s needs the ship off the ground.", level, why), "warn")
+
+    local function watch()
+        while true do
+            local state = ship.readState()
+            ctx.panel({
+                value = state and state.velocity.y or 0,
+                valueLabel = "climb", unit = "m/s",
+                slope = 0, elapsed = 0, steady = false, moving = true,
+                rungLabel = state and string.format("height %.1f", state.position.y)
+                    or "no pose",
+                keepPrompt = "[Enter] when it is clear of the ground   q stops",
+            })
+            sleep(config.get("calSample"))
+        end
+    end
+    parallel.waitForAny(watch, ctx.waitEnter)
+    ctx.panel({ keepPrompt = false, rungLabel = false })
+end
+
+-- What the balloon is put back to when a stage that flew is done. Left at full
+-- the ship climbs until something stops it, and the thing that usually stops
+-- it is the build limit.
+local function settleBack(ctx)
+    if not turbine or not turbine.hasBalloon or not turbine.hasBalloon() then return end
+    if not cal.altHover then
+        ctx.note("balloon left at full: no hover strength has been measured yet", "warn")
+        return
+    end
+    pcall(turbine.setBalloon, cal.altHover)
+    ctx.note(string.format("balloon back to %d, where it holds level", cal.altHover))
 end
 
 -- == STAGE: SIDES ============================================
@@ -694,6 +730,9 @@ local function stageSides(ctx)
     end
 
     ctx.note(string.format("%d lines, one at a time. Give the ship clear air.", #names))
+    -- A propeller read against the ground is read against friction, and the
+    -- line that came out of that was filed as pushing nothing at all.
+    flyClear(ctx, "reading which side a line is on")
     local auth = { left = 0, right = 0 }
     local measured = { left = false, right = false }
     local done, skipped = 0, 0
@@ -811,6 +850,7 @@ local function stageSides(ctx)
     end
 
     ship.allStop()
+    settleBack(ctx)
     -- A side with no reading this run keeps what it had. Half a run is still
     -- worth keeping, and a zero here would divide the mixer by nothing.
     for _, side in ipairs({ "left", "right" }) do
@@ -875,6 +915,10 @@ local function stageBalloon(ctx)
         return climb
     end
 
+    -- The sweep starts at zero, and zero on the ground is a ship that does not
+    -- sink because it is already resting on something. Every strength then
+    -- reads no climb, which is exactly what the first run of this wrote down.
+    flyClear(ctx, "the balloon sweep")
     ctx.note(string.format("sweeping %d strengths. The ship will sink and climb, and each "
         .. "strength is kept when you press Enter.", #levels), "warn")
     for index, level in ipairs(levels) do
@@ -937,7 +981,7 @@ local function stageYaw(ctx)
         ctx.note("no line on one of the two sides, so there is nothing to turn against. Run sides first.", "bad")
         return false
     end
-    holdAltitude(ctx)
+    flyClear(ctx, "the yaw ladder")
 
     local ladder = cal.rpmLadder()
     local ways = config.get("calBothWays") and { 1, -1 } or { 1 }
@@ -1002,6 +1046,7 @@ local function stageYaw(ctx)
     end
 
     ship.allStop()
+    settleBack(ctx)
     cal.meta.yawAt = stamp()
     cal.save()
     return true
@@ -1014,7 +1059,7 @@ local function stageForward(ctx)
         ctx.note("no propeller lines on the network, wired or on a relay", "bad")
         return false
     end
-    holdAltitude(ctx)
+    flyClear(ctx, "the forward ladder")
 
     local ladder = cal.rpmLadder()
     local ways = config.get("calBothWays") and { 1, -1 } or { 1 }
@@ -1073,6 +1118,7 @@ local function stageForward(ctx)
     end
 
     ship.allStop()
+    settleBack(ctx)
     cal.meta.forwardAt = stamp()
     cal.save()
     return true
@@ -1174,7 +1220,7 @@ local function stageBrake(ctx)
         ctx.note("no line is filed as the main, so there is no main to stop on. Run sides first.", "bad")
         return false
     end
-    holdAltitude(ctx)
+    flyClear(ctx, "the brake runs")
 
     local full = config.get("brakeRpmMax")
     local rungs = { util.round(full / 2), full }
@@ -1214,6 +1260,7 @@ local function stageBrake(ctx)
     end
 
     ship.allStop()
+    settleBack(ctx)
     cal.meta.brakeAt = stamp()
     cal.save()
     return true
