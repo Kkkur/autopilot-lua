@@ -59,7 +59,9 @@ cal.frontConfirmed = nil -- the pilot has looked at the ship and said the front 
 cal.yawAuth = {}      -- { left, right }, deg/s per RPM
 cal.yawCurve = nil    -- { pos, neg }, differential RPM against yaw rate
 cal.fwdCurve = nil    -- { pos, neg }, common RPM against settled speed
-cal.brakeCurve = nil  -- { main, all }, reverse RPM against deceleration
+cal.brakeCurve = nil  -- { main, all }, reverse RPM against deceleration, from forward motion
+cal.brakeResponse = nil -- { pos, neg }, the same split by which way the ship was going
+cal.fwdResponse = nil -- { pos = { tau, accel }, neg = ... }, how the speed gets there
 cal.balloonCurve = nil
 cal.altHover = nil
 cal.yawAccel = nil     -- deg/s/s, how fast the hull gets into a turn and out of one
@@ -201,6 +203,44 @@ function cal.parseBrake(data)
     return out
 end
 
+-- The same ladders split by which way the ship was travelling when it stopped.
+-- The brake stage runs up forwards and reverses, so it only ever measures the
+-- positive side, and `cal.brakeCurve` stays where that reading goes. This is
+-- where a measurement of stopping from backward motion would go, and until
+-- something measures one, flight.lua says so rather than cloning the forward
+-- ladder across and calling it measured.
+function cal.parseDirected(data)
+    if type(data) ~= "table" then return nil end
+    local out = {}
+    for _, way in ipairs({ "pos", "neg" }) do
+        local side = cal.parseBrake(data[way])
+        if side then out[way] = side end
+    end
+    if not out.pos and not out.neg then return nil end
+    return out
+end
+
+-- The forward response, one entry each way: `tau` seconds and `accel` m/s/s.
+-- Nothing measures these yet either. They exist so a pilot who has worked the
+-- numbers out from a flight can type them in, and so the assumed figures in
+-- config are labelled as assumed everywhere rather than quietly standing in.
+function cal.parseResponse(data)
+    if type(data) ~= "table" then return nil end
+    local out = {}
+    for _, way in ipairs({ "pos", "neg" }) do
+        local entry = data[way]
+        if type(entry) == "table" then
+            local tau, accel = tonumber(entry.tau), tonumber(entry.accel)
+            if (tau and tau > 0) or (accel and accel > 0) then
+                out[way] = { tau = tau and tau > 0 and tau or nil,
+                             accel = accel and accel > 0 and accel or nil }
+            end
+        end
+    end
+    if not out.pos and not out.neg then return nil end
+    return out
+end
+
 -- util.tidyCurve takes magnitudes, which would fold the sinking half of this
 -- ladder onto the climbing half, so the balloon is read straight instead.
 function cal.parseBalloon(data)
@@ -220,6 +260,7 @@ end
 function cal.load()
     cal.sides, cal.yawAuth, cal.meta = {}, {}, {}
     cal.noseOffset, cal.yawCurve, cal.fwdCurve, cal.brakeCurve = nil, nil, nil, nil
+    cal.brakeResponse, cal.fwdResponse = nil, nil
     cal.balloonCurve, cal.altHover, cal.inventory = nil, nil, nil
     cal.stressAtTurn, cal.stressAtCruise = nil, nil
     cal.yawAccel = nil
@@ -247,6 +288,8 @@ function cal.load()
     cal.yawCurve = cal.parsePair(data.yawCurve)
     cal.fwdCurve = cal.parsePair(data.fwdCurve)
     cal.brakeCurve = cal.parseBrake(data.brakeCurve)
+    cal.brakeResponse = cal.parseDirected(data.brakeResponse)
+    cal.fwdResponse = cal.parseResponse(data.fwdResponse)
     cal.balloonCurve = cal.parseBalloon(data.balloonCurve)
     cal.altHover = tonumber(data.altHover)
     cal.stressAtTurn = tonumber(data.stressAtTurn)
@@ -270,7 +313,8 @@ function cal.save()
         frontOffset = cal.frontOffset, alignSpread = cal.alignSpread,
         alignPoints = cal.alignPoints, frontConfirmed = cal.frontConfirmed,
         yawCurve = cal.yawCurve, fwdCurve = cal.fwdCurve,
-        brakeCurve = cal.brakeCurve, balloonCurve = cal.balloonCurve,
+        brakeCurve = cal.brakeCurve, brakeResponse = cal.brakeResponse,
+        fwdResponse = cal.fwdResponse, balloonCurve = cal.balloonCurve,
         altHover = cal.altHover, inventory = cal.inventory,
         stressAtTurn = cal.stressAtTurn, stressAtCruise = cal.stressAtCruise,
         yawAccel = cal.yawAccel,

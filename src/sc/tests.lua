@@ -940,8 +940,17 @@ function tests.run()
         yawFineBand = 0.25, yawStepFraction = 0.5, yawAccelAssumed = 1.0, tick = 0.1,
         yawApproachMin = 0.5, yawBrakeSafety = 0.6, yawRateKp = 2.0,
         cruiseSpeed = 12, cruiseRampTime = 7.0, yawTrimThresh = 0.5, yawTrimRpm = 128,
+        cruiseMaxRpm = 256, cruiseMinRpm = 16, cruiseYawRateMax = 6.0,
+        fwdAccelAssumed = 0.8, fwdBrakeSafety = 0.6, fwdRateKp = 2.0,
+        fwdStepFraction = 0.5, fwdAssumeResponse = false,
+        fwdTrimKi = 0.15, fwdTrimMax = 2.0,
         arriveDist = 1.0, brakeMargin = 1.3, brakeRpmMax = 256, pitchLimit = 12,
-        lateralCorrect = 4.0,
+        brakeAccelAssumed = 0.8, brakeAssume = true, actuatorLag = 0.5,
+        brakeYaw = true, brakeYawRecruit = false,
+        brakeSlew = 16, brakeSlewRate = 64.0,
+        lateralCorrect = 4.0, creepSpeed = 1.5, creepTries = 3,
+        arriveSpeed = 0.3, arriveDrift = 0.5,
+        rpmSlew = 64, rpmSlewRate = 256.0, slewTimed = false, yawHeadroom = true,
         maxRpm = 256, minRpm = 16, mainShare = 1.0, turbineShare = 1.0,
         altDeadband = 2.0, altKp = 0.5, altKd = 0.8, climbRateMax = 3, sinkRateMax = 3,
         balloonFloor = 2,
@@ -1002,10 +1011,49 @@ function tests.run()
     check(demand.left == 0 and demand.right == 0,
         "a demand under tankRpmMin buzzes without turning, so it is dropped")
 
-    near(flight.yawTrim(0.2, cfg), 0, "inside the threshold there is nothing to trim")
-    near(flight.yawTrim(25, cfg), 128, "at the reentry angle the trim is at its ceiling")
-    near(flight.yawTrim(-25, cfg), -128, "and it is signed")
-    near(flight.yawTrim(12.5, cfg), 64, "and proportional in between")
+    -- The running correction replaces the held proportional trim. These state
+    -- the new contract: it is worked out fresh from the measured rate, it has
+    -- its own smaller ceilings, and it has a terminal state exactly as the turn
+    -- does. The old assertions were about a number that was recomputed once
+    -- every three seconds and held in between, which at cruise speed is a
+    -- command about a ship thirty six blocks back.
+    -- The measured hull, because a correction is a small demand and whether it
+    -- survives the mixer is the question. The synthetic fixture's ladder and
+    -- assumed acceleration put every running correction under the mixer's
+    -- minimum, which is a real answer about that ship and a useless test.
+    local trimPID = util.newPID(4, 0, 0, -1000, 1000)
+    local trim = flight.cruiseYawDemand(0.2, trimPID, measured, cfg, 0.2, 0)
+    check(trim.diff == 0 and trim.settled, "inside the band there is nothing to correct")
+    trimPID:reset()
+    trim = flight.cruiseYawDemand(20, trimPID, measured, cfg, 0.2, 0)
+    check(trim.diff > 0 and math.abs(trim.diff) <= cfg.yawTrimRpm,
+        "a right hand error corrects to the right, inside the correction ceiling")
+    check(trim.rate <= cfg.cruiseYawRateMax,
+        "and never asks for more rate than a running correction is allowed")
+    trimPID:reset()
+    local mirror = flight.cruiseYawDemand(-20, trimPID, measured, cfg, 0.2, 0)
+    check(mirror.diff < 0, "and the other way round the other way")
+    trimPID:reset()
+    -- The whole point of measuring the rate: a hull already swinging back onto
+    -- the heading must not be pushed further the same way.
+    local swinging = flight.cruiseYawDemand(3, trimPID, measured, cfg, 0.2, 4)
+    check(swinging.diff <= 0, "a rate already closing the error is not added to")
+    trimPID:reset()
+    local blindTrim = flight.cruiseYawDemand(0.2, trimPID, measured, cfg, 0.2, nil)
+    check(not blindTrim.settled, "and a missing rate cannot certify a held heading")
+    trimPID:reset()
+    -- Tank authority does not leak into a correction. Both are the same core
+    -- with different ceilings, and the ceilings are what keeps them apart.
+    local tankSame = flight.tankDemand(20, freshPID(), measured, cfg, 0.2, 0)
+    local trimSame = flight.cruiseYawDemand(20, trimPID, measured, cfg, 0.2, 0)
+    check(math.abs(trimSame.diff) <= math.abs(tankSame.diff),
+        "a correction never asks for more than the turn would at the same error")
+    trimPID:reset()
+    -- And there is no tank minimum pulse here. On a hull whose correction comes
+    -- out under the mixer's minimum, nothing is sent, because the ship is under
+    -- thrust and moving rather than stopped just outside its band.
+    check(flight.cruiseYawDemand(20, trimPID, calShip, cfg, 0.2, 0).diff == 0,
+        "a correction the mixer could not send is not promoted to one it can")
 
     near(flight.throttleFraction(0, 7), 0, "thrust starts at nothing")
     near(flight.throttleFraction(7, 7), 1 - math.exp(-1), "and is 63 percent after one tau")
@@ -1027,44 +1075,151 @@ function tests.run()
         > flight.maxDecel(calShip, cfg) / cfg.brakeMargin,
         "the main can supply what the margin asks for, so gentle stops exist")
 
-    near(flight.speedLimitForDistance(100, 4, 1.3), math.sqrt(2 * 4 * 100 / 1.3), "stopping distance")
-    near(flight.speedLimitForDistance(0, 4, 1.3), 0, "on top of it, stopped")
-    check(flight.speedLimitForDistance(100, nil, 1.3) == math.huge,
-        "with no measurement there is no limit to impose")
+    -- The envelope prices the delay between deciding a command and the
+    -- propellers turning at it, so it is lower than the bare braking sum and
+    -- the two agree once the delay is nothing.
+    near(flight.speedLimitForDistance(100, 4, 1.3, 0), math.sqrt(2 * 4 * 100 / 1.3),
+        "with no delay this is the braking sum")
+    check(flight.speedLimitForDistance(100, 4, 1.3, 0.5)
+        < flight.speedLimitForDistance(100, 4, 1.3, 0),
+        "and a ship that keeps travelling while reverse comes on may go slower")
+    near(flight.speedLimitForDistance(0, 4, 1.3, 0.5), 0, "on top of it, stopped")
+    -- This replaces the fail open contract. Infinity removed the constraint
+    -- entirely, which is the opposite of what not knowing means.
+    check(flight.speedLimitForDistance(100, nil, 1.3, 0.5) == nil,
+        "with no deceleration there is no envelope, which is not the same as no limit")
 
-    -- Far away and long since up to speed, so cruiseSpeed is what is left after
-    -- both the ramp and the stopping distance have had their say.
-    near(flight.wantSpeed(5000, 600, cfg, calShip), 12, "a long leg asks for cruise speed")
-    check(flight.wantSpeed(5000, 0.5, cfg, calShip) < 2, "a leg that just began ramps up")
-    check(flight.wantSpeed(4, 600, cfg, calShip) < 12, "and close in, the distance caps it")
+    -- And the named bound the callers actually ask for, which says where the
+    -- number came from rather than only what it is.
+    local bound, source = flight.brakeBound(calShip, cfg, "all", 1)
+    check(bound == 4.0 and source == "measured", "forward braking is measured on this ship")
+    bound, source = flight.brakeBound(calShip, cfg, "all", -1)
+    check(bound == cfg.brakeAccelAssumed and source == "assumed",
+        "and backward braking is assumed, because the brake stage only ever runs up forwards")
+    bound, source = flight.brakeBound({}, { pitchLimit = 12, brakeAssume = false,
+        brakeAccelAssumed = 0.8 }, "all", 1)
+    check(bound == nil and source == "unavailable",
+        "with assumption refused, an unmeasured ship reports no bound at all")
+    -- A ladder every rung of which noses the hull over is measured and useless.
+    check(flight.brakeLadder(calShip, { pitchLimit = 1 }, "all", 1) == nil,
+        "a ladder the pitch limit empties leaves no usable rungs")
+    local usable = flight.brakeLadder(calShip, cfg, "all", 1)
+    check(#usable == 1 and usable[1].speed == 4.0,
+        "and interpolation only ever sees the rungs that kept the nose up")
 
-    local spd = util.newPID(0, 0, 0, -1000, 1000)
-    near(flight.thrustRpm(7, 7, calShip.fwdCurve, spd, 0.2), 128,
-        "at speed the feed forward is the whole answer")
-    spd:reset()
-    near(flight.thrustRpm(-7, -7, calShip.fwdCurve, spd, 0.2), -128, "and reverse is signed")
-    spd:reset()
-    near(flight.thrustRpm(7, 7, calShip.fwdCurve, spd, 0.2, 64), 64, "the cap is obeyed")
-    spd = util.newPID(10, 0, 0, -1000, 1000)
-    check(flight.thrustRpm(7, 5, calShip.fwdCurve, spd, 0.2) > 128,
-        "and falling short of the wanted speed adds trim on top")
+    -- The reference ramp is now the ramp and nothing else. The distance cap
+    -- moved into motionPlan, which is the one place the envelope is applied, so
+    -- creep and cruise cannot get different answers from it.
+    near(flight.wantSpeed(600, cfg, calShip), 12, "a long leg asks for cruise speed")
+    check(flight.wantSpeed(0.5, cfg, calShip) < 2, "a leg that just began ramps up")
 
-    -- Braking, which is the part that ends flights when it is got wrong.
-    local plan, why = flight.brakePlan(2, 500, 0, calShip, cfg)
-    check(plan.main == 0 and plan.turbines == 0, "nothing to do a long way out")
-    check(why:find("inside") ~= nil, "and it says why")
+    -- The signed governor. A leg far out runs at the reference; close in the
+    -- envelope is what decides, whatever the ramp asked for.
+    local mem = {}
+    local far = flight.motionPlan({ requested = 12, remaining = 5000, v = 12 },
+        calShip, cfg, 0.3, mem)
+    near(far.vRef, 12, "a long way out the reference is the speed that was asked for")
+    mem = {}
+    local close = flight.motionPlan({ requested = 12, remaining = 6, v = 6 },
+        calShip, cfg, 0.3, mem)
+    check(close.vRef < 6 and close.vRef == close.allowed,
+        "close in the envelope is the reference, not the ramp")
+    -- Creep is not a way round the envelope. Asked for the creep speed at the
+    -- same distance, it gets the same ceiling.
+    mem = {}
+    local creep = flight.motionPlan({ requested = cfg.creepSpeed, remaining = 0.9, v = 0.4 },
+        calShip, cfg, 0.3, mem)
+    check(creep.vRef <= creep.allowed + 1e-9,
+        "creeping obeys the same stopping envelope every other speed does")
+    -- A commanded zero is a zero. No floor below may turn it into a push.
+    mem = {}
+    check(flight.motionPlan({ requested = 0, remaining = 500, v = 0 },
+        calShip, cfg, 0.3, mem).vRef == 0, "a commanded zero stays zero")
 
-    plan, why = flight.brakePlan(8.8, 12, 0, calShip, cfg)
-    check(plan.main < 0 and plan.turbines == 0, "a gentle stop is the main alone")
-    check(why:find("main alone") ~= nil, "and it says so")
+    -- The sign error. A ship travelling backwards past its stopping limit used
+    -- to compare a negative speed against a limit that is never negative and
+    -- conclude it was inside it.
+    mem = {}
+    local back = flight.motionPlan({ requested = 0, remaining = 3, v = -8 },
+        calShip, cfg, 0.3, mem)
+    local backDemand = flight.longitudinalDemand(back, calShip, cfg, 0.3, mem)
+    check(backDemand.mode == "brake" and backDemand.main > 0,
+        "backward motion is braked with forward thrust")
+    mem = {}
+    local fwd = flight.motionPlan({ requested = 0, remaining = 3, v = 8 },
+        calShip, cfg, 0.3, mem)
+    local fwdDemand = flight.longitudinalDemand(fwd, calShip, cfg, 0.3, mem)
+    check(fwdDemand.mode == "brake" and fwdDemand.main < 0,
+        "and forward motion with reverse thrust, which is the direction of the motion deciding")
+    check(fwdDemand.which == "all", "a stop three blocks out at eight metres a second is a hard one")
+    mem = {}
+    local gentle = flight.motionPlan({ requested = 12, remaining = 30, v = 12 },
+        calShip, cfg, 0.3, mem)
+    local gentleDemand = flight.longitudinalDemand(gentle, calShip, cfg, 0.3, mem)
+    check(gentleDemand.mode == "brake" and gentleDemand.which == "main"
+        and gentleDemand.turbines == 0, "a gentle stop is still the main alone")
+    -- And a ship with room to spare is not braking at all. Coming off the
+    -- thrust is what slows a leg down; reverse is for the stop.
+    mem = {}
+    local roomy = flight.motionPlan({ requested = 12, remaining = 400, v = 3 },
+        calShip, cfg, 0.3, mem)
+    check(flight.longitudinalDemand(roomy, calShip, cfg, 0.3, mem).mode == "drive",
+        "with four hundred blocks of room there is nothing to stop for yet")
 
-    plan, why = flight.brakePlan(13, 12, 0, calShip, cfg)
-    check(plan.main < 0 and plan.turbines < 0, "a hard stop recruits the turbines")
-    check(why:find("all five") ~= nil, "and it says so in different words")
+    -- A held reverse must not turn a completed stop into a backward launch.
+    mem = {}
+    local lastBit = flight.motionPlan({ requested = 0, remaining = 2, v = 0.4 },
+        calShip, cfg, 1.2, mem)
+    local pulse = flight.longitudinalDemand(lastBit, calShip, cfg, 1.2, mem)
+    check(pulse.aReq == nil or pulse.aReq <= math.abs(lastBit.v) / (1.2 + lastBit.lag) + 1e-9,
+        "the last braking demand is cut to the one that lands on zero")
 
-    plan, why = flight.brakePlan(13, 12, 17, calShip, cfg)
-    check(plan.main == 0 and plan.turbines == 0, "already tipping, so it stops adding reverse")
-    check(why:find("pitch") ~= nil, "and names the pitch rather than a general message")
+    -- A small position error with fast motion still gets braking. Being nearly
+    -- there is not a reason to stop stopping.
+    mem = {}
+    local fast = flight.motionPlan({ requested = 0, remaining = 0.5, v = 9 },
+        calShip, cfg, 0.3, mem)
+    local fastDemand = flight.longitudinalDemand(fast, calShip, cfg, 0.3, mem)
+    check(not fast.settled, "a ship crossing the arrival band at nine metres a second has not arrived")
+    check(fastDemand.main < 0, "and it is still braking")
+
+    -- The terminal state, and every way of failing to reach it.
+    mem = {}
+    local rest = { requested = 0, remaining = 0.4, v = 0.05, horizontal = 0.05, lateral = 0 }
+    check(flight.motionPlan(rest, calShip, cfg, 0.3, mem).settled,
+        "inside the band, barely moving, and coasting to a stop inside it")
+    mem = {}
+    rest.vValid = false
+    check(not flight.motionPlan(rest, calShip, cfg, 0.3, mem).settled,
+        "a failed velocity read cannot certify a stop, because it looks exactly like one")
+    mem = {}
+    rest.vValid, rest.horizontal = true, 4
+    check(not flight.motionPlan(rest, calShip, cfg, 0.3, mem).settled,
+        "nor can a ship sliding sideways over the point")
+    mem = {}
+    rest.horizontal, rest.lateral = 0.05, 40
+    check(not flight.motionPlan(rest, calShip, cfg, 0.3, mem).settled,
+        "nor one parked a long way off the line")
+    mem = {}
+    local frozen = flight.motionPlan({ requested = 0, remaining = 0.4, v = 0.05,
+        horizontal = 0.05, lateral = 0 }, calShip, cfg, 0.3, mem)
+    local held = flight.longitudinalDemand(frozen, calShip, cfg, 0.3, mem)
+    check(held.main == 0 and held.turbines == 0 and held.mode == "hold",
+        "and an arrival freezes propulsion rather than leaving a trickle on")
+
+    -- Unknown is not stationary and not infinitely stoppable. With assumption
+    -- refused, the governor holds the ship rather than flying a leg it cannot
+    -- plan an end to.
+    local refuse = { pitchLimit = 12, brakeAssume = false, brakeAccelAssumed = 0.8,
+        tick = 0.1, arriveDist = 1.0, brakeMargin = 1.3, actuatorLag = 0.5,
+        cruiseSpeed = 12, fwdAccelAssumed = 0.8, fwdBrakeSafety = 0.6,
+        fwdStepFraction = 0.5, fwdTrimKi = 0.15, fwdTrimMax = 2.0,
+        arriveSpeed = 0.3, arriveDrift = 0.5, lateralCorrect = 4.0 }
+    mem = {}
+    local blindPlan = flight.motionPlan({ requested = 12, remaining = 500, v = 0 },
+        {}, refuse, 0.3, mem)
+    check(blindPlan.vRef == 0 and blindPlan.envelope == "unavailable",
+        "with no braking bound at all the governor asks for nothing and names why")
 
     -- Mixing, where the differential is split and a backwards propeller is a
     -- flag in a file rather than a special case in the code.
@@ -1092,6 +1247,48 @@ function tests.run()
     near(slewed.mn, 104, "and a small change arrives whole")
     slewed = flight.applySlew({}, { mn = 8 }, 16)
     near(slewed.mn, 8, "a line nobody has driven yet starts from zero")
+
+    -- The slew used to be RPM per call with no idea how long a call was, so the
+    -- same setting was a different ramp at every loop period. These state the
+    -- timed contract and that the per update one is still exactly what it was.
+    near(flight.slewLimit(cfg, false, 1.2), cfg.rpmSlew,
+        "with slewTimed off the limit is per update, whatever the period")
+    local timed = { slewTimed = true, rpmSlewRate = 256, brakeSlewRate = 64 }
+    near(flight.slewLimit(timed, false, 0.25), 64, "and timed, a quarter second buys a quarter of the rate")
+    near(flight.slewLimit(timed, true, 1.0), 64, "braking has its own rate")
+    check(flight.slewLimit(timed, false, 1.2) > flight.slewLimit(timed, false, 0.3),
+        "a longer period allows a larger step, which is what per update could never say")
+
+    -- Relays take integers, so a slew under half an RPM an update rounds to
+    -- nothing and the line never moves at all. The carry is what stops that.
+    local carry, creeping = {}, { mn = 0 }
+    for _ = 1, 4 do creeping = flight.applySlew(creeping, { mn = 40 }, 0.3, carry) end
+    check(creeping.mn > 0, "a slew smaller than one rpm still moves the line eventually")
+    for _, rpm in pairs(creeping) do
+        near(rpm, util.round(rpm), "and what leaves here is a whole number")
+    end
+
+    -- Allocation, which is where a differential that does not fit is dealt with
+    -- rather than quietly clipped on the one side that ran out.
+    local roomy = flight.allocateMotion(0, 100, 50, calShip, cfg, false)
+    near(roomy.differential, 50, "with range to spare the correction arrives whole")
+    near(roomy.turbines, 100, "and the thrust is untouched")
+    local tight = flight.allocateMotion(0, 256, 60, calShip, cfg, false)
+    check(tight.saturated and math.abs(tight.differential) < 60,
+        "at full thrust there is no headroom left on one side, and it says so")
+    near(tight.turbines, 256, "and without reserving, the thrust is what it was")
+    local reserved = flight.allocateMotion(0, 256, 60, calShip, cfg, true)
+    near(reserved.differential, 60, "reserving headroom gets the correction that was asked for")
+    check(reserved.turbines < 256 and reserved.held ~= 0,
+        "by holding the turbines back, which is what it gives up to steer")
+    -- Neither line may leave the allocation past its own limit.
+    local edge = flight.mix(0, 0, { "ta", "tc" }, calShip, cfg)
+    check(edge.ta == 0 and edge.tc == 0, "nothing commanded is nothing sent")
+    local worst = flight.allocateMotion(0, 256, 400, calShip, cfg, true)
+    local sides = flight.mixParts(worst.main, worst.turbines, worst.differential,
+        { "ta", "tc" }, calShip, cfg)
+    check(math.abs(sides.ta) <= cfg.maxRpm and math.abs(sides.tc) <= cfg.maxRpm,
+        "and an impossible demand still leaves both sides inside the line limit")
 
     -- The balloon ladder crosses zero, which is the one thing util's curve
     -- family cannot read, so it has its own walk and its own tests.
@@ -1217,6 +1414,12 @@ function tests.run()
             -- false means never measured, which a Lua and/or cannot say.
             noseOffset = (opts.noseOffset ~= false) and (opts.noseOffset or 0) or nil,
             frontOffset = (opts.frontOffset ~= false) and (opts.frontOffset or 0) or nil,
+            -- A whole ship has run the brake stage, so the gate has a measured
+            -- stopping distance to quote rather than an assumed one.
+            brakeCurve = (opts.brakeCurve ~= false) and {
+                main = { { rpm = 128, speed = 1.7, pitch = 3 } },
+                all = { { rpm = 128, speed = 4.0, pitch = 8 } },
+            } or nil,
             linesOfSide = function(side)
                 if side == "left" then return opts.left or { "2:a" } end
                 if side == "right" then return opts.right or { "2:b" } end
@@ -1268,7 +1471,8 @@ function tests.run()
             return nil
         end,
         values = { cruiseSpeed = 12, yawRateMax = 30, fuelMargin = 1.25,
-            requireStressBudget = true, brakeMargin = 3.0, brakeRpmMax = 256 },
+            requireStressBudget = true, brakeMargin = 3.0, brakeRpmMax = 256,
+            pitchLimit = 12, brakeAssume = true, brakeAccelAssumed = 0.8 },
     }
 
     local whole = function() return preflight.check(fakeShip(true), fakeCal(),
@@ -1279,6 +1483,25 @@ function tests.run()
     check(report.byId.steer.ok, "with a side each way it can steer")
     check(report.byId.balloon.ok, "and something is holding the balloon")
     check(#preflight.failures(report) == 0, "and there is nothing to report")
+    check(report.byId.stopping.ok and report.byId.stopping.text:find("measured"),
+        "and the gate says what the stop will be planned against")
+
+    -- Where a stop comes from is its own question, and it is not the same as
+    -- whether the brake stage has been run: a ladder the pitch limit has
+    -- emptied is measured and useless.
+    local guessing = preflight.check(fakeShip(true), fakeCal({ brakeCurve = false }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), fakeConfig)
+    check(guessing.ok, "a ship with no braking ladder still flies")
+    check(not guessing.byId.stopping.ok and guessing.byId.stopping.kind == "warn"
+        and guessing.byId.stopping.text:find("assumed"),
+        "but it is warned that every stop is planned on a guess")
+    local refusing = { get = fakeConfig.get, values = {} }
+    for key, value in pairs(fakeConfig.values) do refusing.values[key] = value end
+    refusing.values.brakeAssume = false
+    local grounded = preflight.check(fakeShip(true), fakeCal({ brakeCurve = false }),
+        fakeFuel("live", 0.5, 3600), fakeTurbines(), refusing)
+    check(not grounded.ok and grounded.byId.stopping.kind == "bad",
+        "and with the guess refused it is not flown at all")
 
     -- Which end is the front. A ship nobody has confirmed still flies, and one
     -- whose thrust points out of its stern does not.
@@ -1368,7 +1591,8 @@ function tests.run()
     check(leg.ok, "no stressometer is a warning rather than a refusal")
 
     plan.cfg = { cruiseSpeed = 12, yawRateMax = 30, fuelMargin = 1.25,
-        requireStressBudget = false, brakeMargin = 3.0, brakeRpmMax = 256 }
+        requireStressBudget = false, brakeMargin = 3.0, brakeRpmMax = 256,
+        pitchLimit = 12, brakeAssume = true, brakeAccelAssumed = 0.8 }
     leg = preflight.forLeg(fit, { endurance = 3600 },
         { stressOk = true, capacity = 100, stress = 90 }, plan)
     check(leg.ok, "and so is the captain turning the budget off")

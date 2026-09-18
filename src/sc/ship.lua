@@ -207,14 +207,22 @@ function ship.readState()
     local orientation = util.toQuat(pose.orientation)
     if not orientation then return nil, "ORIENTATION SHAPE " .. util.keyList(pose.orientation) end
 
-    local velocity = { x = 0, y = 0, z = 0 }
+    -- A failed velocity read leaves zeroes while the pose still succeeds, and a
+    -- zero velocity is exactly what a ship at rest looks like. So whether the
+    -- read worked travels with the state: a controller that cannot tell the two
+    -- apart will call a moving ship stopped and freeze its thrust.
+    local velocity, velocityOk = { x = 0, y = 0, z = 0 }, false
     local okVel, raw = pcall(sublevel.getLinearVelocity)
-    if okVel then velocity = util.toVec(raw) or velocity end
+    if okVel then
+        local read = util.toVec(raw)
+        if read then velocity, velocityOk = read, true end
+    end
 
     local state = {
         position = position,
         orientation = orientation,
         velocity = velocity,
+        velocityOk = velocityOk,
         yaw = util.yawOf(orientation),
         speed = util.len3(velocity.x, velocity.y, velocity.z),
     }

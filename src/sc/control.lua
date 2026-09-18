@@ -40,6 +40,12 @@ control.info = {
     err = nil, bearing = nil, yawRate = nil, pitch = nil,
     want = nil, have = nil, lateral = nil,
     common = nil, differential = nil, balloon = nil,
+    -- What the motion controller decided and on what. Every one of these is
+    -- written to telemetry, because the alternative is reading a stop off a
+    -- distance and a speed and guessing at everything in between.
+    dt = nil, remaining = nil, vValid = nil, response = nil, envelope = nil,
+    brakeMode = nil, stopDist = nil, aDemand = nil, saturated = nil,
+    wantDiff = nil, terminal = nil, motionWhy = nil, yawWhy = nil,
 }
 
 -- Seconds the ship has been inside the padding band and no longer swinging.
@@ -48,16 +54,29 @@ control.info = {
 local alignedFor = 0
 local legBegan = 0
 local creepTries = 0
-local lastTrim = 0
 local lastTick = nil
 
-local yawPID, spdPID, altPID
+-- The controller's own state, owned here rather than inside flight.lua, which
+-- stays pure. `motion` carries the last speed reference, the approach direction
+-- across a zero crossing and the speed trim; `slewCarry` is the fraction of RPM
+-- rounding threw away on each line.
+local motion = {}
+local slewCarry = {}
+
+-- The axis the leg was committed to, unit, in world XZ. A signed distance along
+-- it is what tells being short of the point from having gone past it, which a
+-- radial distance cannot say and which every stopping decision below rests on.
+local axis = nil
+
+local yawPID, cruisePID, altPID
 
 local function makePIDs()
     yawPID = util.newPID(config.get("yawKp"), config.get("yawKi"), config.get("yawKd"),
         -1e6, 1e6, 50)
-    spdPID = util.newPID(config.get("spdKp"), config.get("spdKi"), config.get("spdKd"),
-        -config.get("cruiseMaxRpm"), config.get("cruiseMaxRpm"), config.get("spdILimit"))
+    -- A separate integral for the running correction. Sharing the turn's would
+    -- carry a wound up turn into the first second of a cruise.
+    cruisePID = util.newPID(config.get("yawKp"), config.get("yawKi"), config.get("yawKd"),
+        -1e6, 1e6, 50)
     altPID = util.newPID(config.get("altKp"), config.get("altKi"), config.get("altKd"),
         -1e6, 1e6, 50)
 end
@@ -68,9 +87,7 @@ end
 function control.refreshGains()
     if not yawPID then return end
     yawPID:setGains(config.get("yawKp"), config.get("yawKi"), config.get("yawKd"))
-    spdPID:setGains(config.get("spdKp"), config.get("spdKi"), config.get("spdKd"))
-    spdPID:setLimits(-config.get("cruiseMaxRpm"), config.get("cruiseMaxRpm"),
-        config.get("spdILimit"))
+    cruisePID:setGains(config.get("yawKp"), config.get("yawKi"), config.get("yawKd"))
     altPID:setGains(config.get("altKp"), config.get("altKi"), config.get("altKd"))
 end
 
@@ -80,17 +97,37 @@ function control.init()
     return control
 end
 
+-- Everything a new leg, a stop, an abort or an incompatible phase change has to
+-- forget. A speed trim or an approach direction that leaked from the last leg
+-- into this one is a command nobody asked for.
+function control.resetMotion()
+    motion = {}
+    slewCarry = {}
+    axis = nil
+end
+
 function control.resetPIDs()
-    if yawPID then yawPID:reset(); spdPID:reset(); altPID:reset() end
+    if yawPID then yawPID:reset(); cruisePID:reset(); altPID:reset() end
+    control.resetMotion()
     alignedFor = 0
     lastTick = nil
 end
 
 -- == COMMANDS ================================================
 
+-- Cruise and braking are one longitudinal problem, so the reference and the
+-- trim carry across between them. Everything else is a different problem, and
+-- carrying a reference into it would command the ship on a number that was
+-- decided about something that is no longer happening.
+local function keepsMotion(from, to)
+    local longitudinal = { cruise = true, brake = true }
+    return longitudinal[from] and longitudinal[to]
+end
+
 local function enterPhase(phase, why)
     if control.phase ~= phase then
         local from = control.phase
+        if not keepsMotion(from, phase) then control.resetMotion() end
         control.phase = phase
         alignedFor = 0
         log.infof("phase %s: %s", phase, tostring(why))
@@ -325,6 +362,16 @@ local function flyLeg(state, goal, dt)
     local v = forwardSpeed(state)
     local lateral = flight.lateralError(p, goal, state.yaw)
 
+    -- The travel axis is committed once, on the way in, and a signed distance
+    -- is measured along it from then on. Recomputing it every update turns the
+    -- moment the ship passes the point into a bearing that flips a half turn,
+    -- and a steering order out of that flip halfway through a stop.
+    if not axis then
+        local len = math.sqrt(dx * dx + dz * dz)
+        axis = len > 1e-6 and { x = dx / len, z = dz / len } or { x = 0, z = 1 }
+    end
+    local remaining = dx * axis.x + dz * axis.z
+
     control.dist = d
     control.info.bearing = bearing
     control.info.err = err
@@ -332,6 +379,9 @@ local function flyLeg(state, goal, dt)
     control.info.pitch = pitch
     control.info.have = v
     control.info.lateral = lateral
+    control.info.dt = dt
+    control.info.remaining = remaining
+    control.info.vValid = state.velocityOk ~= false
 
     -- The memory the phase machine insists on: not just lined up, but lined up
     -- and no longer swinging, for long enough to believe.
@@ -341,9 +391,13 @@ local function flyLeg(state, goal, dt)
         alignedFor = 0
     end
 
-    local stopped = math.abs(v) < 0.3 and math.abs(state.speed or 0) < 0.5
+    -- An apparent zero speed is only a stop when the velocity read worked. Both
+    -- thresholds are the pilot's now; they were two numbers written into this
+    -- line and reachable from nowhere.
+    local stopped = state.velocityOk ~= false
+        and math.abs(v) < cfg.arriveSpeed and math.abs(state.speed or 0) < cfg.arriveDrift
     local nextPhase, why = flight.phaseNext(control.phase, {
-        err = err, yawRate = yawRate, d = d, v = v,
+        err = err, yawRate = yawRate, d = d, remaining = remaining, v = v,
         lateral = lateral, alignedFor = alignedFor, stopped = stopped,
     }, cfg, cal)
 
@@ -386,44 +440,78 @@ local function flyLeg(state, goal, dt)
         return 0, 0, demand.diff, d
     end
 
-    -- Cruise: run at it, trimming the heading rather than turning.
-    if control.phase == "cruise" then
+    -- Cruise and brake are the same longitudinal problem read at two ends of
+    -- one governor, so they share every line below. The phase decides what the
+    -- pilot is told and what the yaw policy is, not how the speed is worked out.
+    if control.phase == "cruise" or control.phase == "brake" then
+        local braking = control.phase == "brake"
         local elapsed = os.clock() - legBegan
-        -- Creeping is the same run at a speed the pilot would call walking, so
-        -- it shares this whole path rather than being a fourth phase.
-        local want = creepTries > 0 and cfg.creepSpeed
-            or flight.wantSpeed(d, elapsed, cfg, cal)
-        local common = flight.thrustRpm(want, v, cal.fwdCurve, spdPID, dt, cfg.cruiseMaxRpm)
-        if math.abs(common) < cfg.cruiseMinRpm then common = 0 end
+        -- Creeping is the same run at a speed the pilot would call walking, and
+        -- it goes through the same stopping and period governor. Handing it
+        -- straight to the actuators was how the last approach onto a point
+        -- ignored the envelope every other approach obeyed.
+        -- Braking does not ask for zero. It asks for the same thing cruise
+        -- does and lets the stopping envelope bring it down, so the two phases
+        -- cannot disagree about where the ship should be slowing and by how
+        -- much. A stop that demanded zero would ask for the hardest brake the
+        -- ladder allows from the first update of every stop, however much room
+        -- there was left.
+        local requested = flight.wantSpeed(elapsed, cfg, cal)
+        if creepTries > 0 then requested = math.min(cfg.creepSpeed, requested) end
 
-        -- The trim is on its own clock. Nudging the heading every tick fights
-        -- the hull's own swing and costs stress for nothing.
-        local now = os.clock()
-        if now - lastTrim >= cfg.yawTrimInterval then
-            lastTrim = now
-            control.trim = flight.yawTrim(err, cfg)
+        local plan = flight.motionPlan({
+            requested = requested, remaining = remaining, v = v,
+            vValid = state.velocityOk ~= false,
+            horizontal = math.abs(state.speed or 0), lateral = lateral,
+        }, cal, cfg, dt, motion)
+
+        -- Already past the tip limit. More reverse is what put it there, so the
+        -- demand is dropped and the pitch is named rather than a general word.
+        local demand
+        if braking and math.abs(pitch) > cfg.pitchLimit then
+            demand = { main = 0, turbines = 0, mode = "pitch",
+                reason = string.format("pitch %.0f deg, past the %g limit",
+                    pitch, cfg.pitchLimit) }
+        else
+            demand = flight.longitudinalDemand(plan, cal, cfg, dt, motion)
         end
 
-        control.info.want = want
-        control.info.common = common
-        control.info.differential = control.trim or 0
-        setStatus(string.format("RUN %.0f blk  %.1f m/s", d, v), "good")
-        return common, common, control.trim or 0, d
-    end
+        -- The heading correction is worked out fresh here, every update, in
+        -- both phases. Reusing the one cruise last sent is a remembered
+        -- actuator demand, and during a stop it is a remembered demand about a
+        -- ship that was doing something else.
+        local wantDiff, yawWhy = 0, nil
+        if braking and not cfg.brakeYaw then
+            yawWhy = "the heading is left alone during a stop by setting"
+        elseif braking and demand.turbines == 0 and not cfg.brakeYawRecruit then
+            yawWhy = "the stop is on the main alone, so there is nothing to steer with"
+        else
+            local yaw = flight.cruiseYawDemand(err, cruisePID, cal, cfg, dt, sensedRate)
+            wantDiff = yaw.diff
+            yawWhy = yaw.settled and "on the heading" or
+                string.format("%+.1f deg, wanting %+.1f deg/s", err, yaw.rate)
+        end
 
-    -- Brake: reverse, graduated, heading still trimmed.
-    if control.phase == "brake" then
-        local plan, reason = flight.brakePlan(v, d, pitch, cal, cfg)
-        control.reason = reason
-        control.info.want = 0
-        control.info.common = plan.main
-        control.info.differential = control.trim or 0
-        control.brakePlan = plan
-        setStatus(string.format("STOP %.0f blk  %.1f m/s", d, v), "warn")
-        -- The turbines hold back whatever the heading trim is asking for, so the
-        -- ship never loses its nose in the middle of a stop.
-        return plan.main, plan.turbines,
-            plan.turbines ~= 0 and (control.trim or 0) or 0, d
+        control.reason = demand.reason
+        control.info.want = plan.vRef
+        control.info.common = demand.main
+        control.info.wantDiff = wantDiff
+        control.info.response = plan.response
+        control.info.envelope = plan.envelope
+        control.info.brakeMode = demand.mode
+        control.info.stopDist = plan.needed
+        control.info.aDemand = demand.aReq
+        control.info.saturated = demand.saturated
+        control.info.terminal = plan.settled
+        control.info.motionWhy = demand.reason
+        control.info.yawWhy = yawWhy
+
+        if braking then
+            setStatus(string.format("STOP %.0f blk  %.1f m/s", math.abs(remaining), v), "warn")
+        else
+            setStatus(string.format("RUN %.0f blk  %.1f m/s", math.abs(remaining), v), "good")
+        end
+        return demand.main, demand.turbines, wantDiff, d
     end
 
     return 0, 0, 0, d
@@ -474,7 +562,8 @@ function control.tick()
         end
         local zeros = {}
         for _, name in ipairs(ship.order) do zeros[name] = 0 end
-        control.demands = flight.applySlew(control.demands, zeros, cfg.rpmSlew)
+        control.demands = flight.applySlew(control.demands, zeros,
+            flight.slewLimit(cfg, false, dt), slewCarry)
         ship.flush(control.demands)
         return
     end
@@ -517,13 +606,26 @@ function control.tick()
         setStatus("NO TARGET", "dim")
     end
 
+    -- What the two sides can actually be told. A differential that does not fit
+    -- alongside the common thrust is not silently clipped on one side: while
+    -- running, the turbines are held back to leave room for it, and a stop
+    -- never gives up braking to steer. The caller is told what it got.
+    local alloc = flight.allocateMotion(mainCommon, turbineCommon, differential,
+        cal, cfg, cfg.yawHeadroom and control.phase == "cruise")
+    control.alloc = alloc
+    control.info.differential = alloc.differential
+    control.info.common = alloc.main
+    -- The speed controller and the stopping prediction see the thrust that was
+    -- actually allocated, not the one that was asked for.
+    if alloc.held ~= 0 then motion.saturated = true end
+
     -- Braking has its own slew, because how fast reverse comes on is what tips
     -- the hull, and it is not the same number as the one that softens a launch.
-    local slew = control.phase == "brake" and cfg.brakeSlew or cfg.rpmSlew
+    local slew = flight.slewLimit(cfg, control.phase == "brake", dt)
 
-    local wanted = flight.mixParts(mainCommon, turbineCommon, differential,
+    local wanted = flight.mixParts(alloc.main, alloc.turbines, alloc.differential,
         ship.order, cal, cfg)
-    control.demands = flight.applySlew(control.demands, wanted, slew)
+    control.demands = flight.applySlew(control.demands, wanted, slew, slewCarry)
     ship.flush(control.demands)
 end
 

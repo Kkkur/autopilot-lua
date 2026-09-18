@@ -488,7 +488,7 @@ define("forget", {
             cal.yawCurve, cal.stressAtTurn, cal.yawAccel = nil, nil, nil
             cal.meta.yawAt = nil
         elseif what == "forward" then
-            cal.fwdCurve, cal.stressAtCruise = nil, nil
+            cal.fwdCurve, cal.stressAtCruise, cal.fwdResponse = nil, nil, nil
             cal.meta.forwardAt = nil
         elseif what == "align" then
             cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
@@ -501,12 +501,13 @@ define("forget", {
             cal.frontConfirmed = nil
             cal.meta.cruiseAt = nil
         elseif what == "brake" then
-            cal.brakeCurve = nil
+            cal.brakeCurve, cal.brakeResponse = nil, nil
             cal.meta.brakeAt = nil
         elseif what == "all" then
             cal.sides, cal.yawAuth, cal.meta = {}, {}, {}
             cal.noseOffset, cal.yawCurve, cal.fwdCurve = nil, nil, nil
             cal.brakeCurve, cal.balloonCurve, cal.altHover = nil, nil, nil
+            cal.brakeResponse, cal.fwdResponse = nil, nil
             cal.stressAtTurn, cal.stressAtCruise, cal.inventory = nil, nil, nil
             cal.yawAccel = nil
             cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil

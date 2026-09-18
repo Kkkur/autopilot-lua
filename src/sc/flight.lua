@@ -206,17 +206,28 @@ function flight.yawResponse(cal, cfg)
     return tau, accel
 end
 
-function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
+-- The sampled turn, with its ceilings handed in rather than read out of `cfg`.
+--
+-- Two callers with different authority share this arithmetic. A tank turn has
+-- the whole differential and a hull that is not otherwise being pushed. A
+-- running correction has a ceiling, a much slower rate, and a bearing that is
+-- moving under it, so it cannot simply be given the tank result: the tank
+-- minimum pulse exists to rescue a hull stopped dead outside the band, and a
+-- ship at cruise speed is not stopped.
+--
+-- `limits` carries rpmMax, rpmMin, rateMax, fineBand and pulse, where pulse is
+-- whether a demand under the minimum may be promoted to one minimum pulse.
+function flight.yawCore(err, pid, cal, cfg, dt, haveRate, limits)
     dt = math.max(dt or 0, cfg.tick)
     local tau, accel = flight.yawResponse(cal, cfg)
-    local floor = math.min(cfg.yawApproachMin, cfg.yawFineBand / dt)
+    local floor = math.min(cfg.yawApproachMin, limits.fineBand / dt)
     local approach = flight.approachRate(err, accel, cfg.yawBrakeSafety, floor)
     -- Half the remaining error over a sample plus the hull response time gives
     -- two real, positive poles with the default rate gain in the linear model. The
     -- extra tau matters: err/dt alone ignores the motion while rate is changing.
     local stepCap = cfg.yawStepFraction * math.abs(err) / (dt + tau)
-    local cap = math.min(cfg.yawRateMax, approach, stepCap)
-    local raw = flight.wantYawRate(err, pid, cfg.yawRateMax, dt)
+    local cap = math.min(limits.rateMax, approach, stepCap)
+    local raw = flight.wantYawRate(err, pid, limits.rateMax, dt)
     local want = util.sign(err) * util.clamp(raw * util.sign(err), 0, cap)
 
     -- Invert the response over the period for which the command will be held:
@@ -229,18 +240,18 @@ function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
     local equilibrium = want
     local rateGain = math.min(cfg.yawRateKp, decay / (1 - decay))
     if haveRate then equilibrium = want + rateGain * (want - haveRate) end
-    local diff = flight.yawDifferential(equilibrium, cal.yawCurve, cfg.tankRpmMax)
+    local diff = flight.yawDifferential(equilibrium, cal.yawCurve, limits.rpmMax)
     if not diff then
-        diff = util.clamp(equilibrium / cfg.yawRateMax, -1, 1) * cfg.tankRpmMax
+        diff = util.clamp(equilibrium / limits.rateMax, -1, 1) * limits.rpmMax
     end
 
     -- With zero thrust the model still travels rate * tau degrees. Both the
     -- current heading and that resting heading must fit before calling it done.
     -- No rate reading means no claim that the ship has stopped.
     local coast = haveRate and err - haveRate * tau or err
-    local settleRate = cfg.yawFineBand / (dt + tau)
-    local settled = haveRate ~= nil and math.abs(err) <= cfg.yawFineBand
-        and math.abs(coast) <= cfg.yawFineBand and math.abs(haveRate) <= settleRate
+    local settleRate = limits.fineBand / (dt + tau)
+    local settled = haveRate ~= nil and math.abs(err) <= limits.fineBand
+        and math.abs(coast) <= limits.fineBand and math.abs(haveRate) <= settleRate
     if settled then
         diff, want = 0, 0
         pid:reset()
@@ -249,10 +260,11 @@ function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
         -- disappears downstream. One minimum pulse rescues a hull stopped just
         -- outside the band, only toward both the current and resting heading.
         -- Promoting a tiny correction away from the heading restarts the swing.
-        local minimum = math.max(cfg.tankRpmMin, cfg.minRpm)
+        local minimum = math.max(limits.rpmMin, cfg.minRpm)
         if math.abs(diff) < minimum then
-            if math.abs(coast) > cfg.yawFineBand and diff * coast > 0 and diff * err > 0 then
-                diff = util.sign(diff) * math.min(minimum, cfg.tankRpmMax)
+            if limits.pulse and math.abs(coast) > limits.fineBand
+                    and diff * coast > 0 and diff * err > 0 then
+                diff = util.sign(diff) * math.min(minimum, limits.rpmMax)
             else
                 diff = 0
             end
@@ -269,16 +281,31 @@ function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
     }
 end
 
--- Cruise holds its heading with a much smaller differential than a turn uses,
--- because the point is to stop the drift rather than to swing the hull. The
--- error is scaled against the angle that would send it back to the tank phase,
--- so a trim reaches its own ceiling exactly where trimming stops being enough.
+-- The tank turn: the whole differential, the whole rate, and the minimum pulse.
+-- This wrapper is the behaviour the owner validated on the ship and the
+-- baseline the regressions hold; the ceilings below are what it has always used.
+function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
+    return flight.yawCore(err, pid, cal, cfg, dt, haveRate, {
+        rpmMax = cfg.tankRpmMax, rpmMin = cfg.tankRpmMin,
+        rateMax = cfg.yawRateMax, fineBand = cfg.yawFineBand, pulse = true,
+    })
+end
+
+-- Holding a heading while running. Worked out fresh on every control update,
+-- off the measured rate, because a correction decided three seconds and thirty
+-- six blocks ago is not feedback, it is a remembered actuator demand.
+--
+-- No minimum pulse: the hull is already being pushed along its own axis, so a
+-- correction too small for the mixer to send is a correction not worth sending
+-- rather than a ship stuck outside its band.
 --
 -- The side scales are not applied here. This returns a differential, and `mix`
 -- is the one place a differential is split across the two sides.
-function flight.yawTrim(err, cfg)
-    if math.abs(err) < cfg.yawTrimThresh then return 0 end
-    return util.clamp(err / cfg.tankReentry, -1, 1) * cfg.yawTrimRpm
+function flight.cruiseYawDemand(err, pid, cal, cfg, dt, haveRate)
+    return flight.yawCore(err, pid, cal, cfg, dt, haveRate, {
+        rpmMax = cfg.yawTrimRpm, rpmMin = cfg.minRpm,
+        rateMax = cfg.cruiseYawRateMax, fineBand = cfg.yawTrimThresh, pulse = false,
+    })
 end
 
 -- == SPEED ===================================================
@@ -295,92 +322,445 @@ end
 -- The fastest this ship may be going and still be able to stop in the distance
 -- it has left. This replaces slowRadius entirely: a fixed radius is a guess
 -- about the ship, and this is a measurement of it.
-function flight.speedLimitForDistance(d, aMax, margin)
-    if not aMax or aMax <= 0 then return math.huge end
+--
+-- `lag` is the seconds between deciding a command and the propellers turning at
+-- it, during which the ship keeps going at the speed it already had. Solving
+-- `w*L + w*w/(2a) = d` for w is where the first term under the root comes from.
+-- Without it a stop is planned as though reverse were instantaneous, which is
+-- the arithmetic that lands a ship past the point having braked on time.
+--
+-- The margin is applied here, once, as a derate of the deceleration. Everything
+-- that asks about stopping asks this function, so it is applied in one place
+-- and no caller has to remember to divide by it again.
+--
+-- Returns nil, not infinity, when there is no deceleration to plan against. An
+-- unmeasured direction is unknown, and unknown is not infinitely stoppable. The
+-- caller names the unavailable case; it does not silently drop the constraint.
+function flight.speedLimitForDistance(d, aMax, margin, lag)
+    if not aMax or aMax <= 0 then return nil end
     if d <= 0 then return 0 end
-    return math.sqrt(2 * aMax * d / (margin or 1))
+    local a = aMax / math.max(margin or 1, 1e-9)
+    local L = math.max(lag or 0, 0)
+    return math.sqrt(a * L * a * L + 2 * a * d) - a * L
 end
 
--- How hard this ship can stop without tipping, off the measured brake ladder.
--- The cap is the last rung that kept pitch inside the limit, so a hull that
--- noses over at full reverse is never asked to plan around full reverse.
-function flight.maxDecel(cal, cfg, which)
-    local ladder = cal.brakeCurve and cal.brakeCurve[which or "all"]
-    if not ladder or #ladder == 0 then return nil end
-    local best = nil
-    for _, rung in ipairs(ladder) do
+-- The braking rungs that are actually usable, in the direction the ship is
+-- travelling. Rungs past the pitch limit are dropped before anything reads the
+-- ladder, because a safe maximum on its own does not make every RPM under it
+-- safe: interpolating the original ladder for a gentle stop can still land on a
+-- rung the hull noses over at.
+--
+-- `cal.brakeResponse` is the directional shape, and `cal.brakeCurve` is the
+-- legacy one. The brake stage runs up forwards and reverses, so the legacy
+-- ladder is a measurement of stopping forward motion and nothing else. It is
+-- read as the positive side only. Cloning it onto the negative side would be
+-- calling a guess a measurement.
+function flight.brakeLadder(cal, cfg, which, sign)
+    which = which or "all"
+    local way = (sign or 1) >= 0 and "pos" or "neg"
+    local raw = nil
+    if cal.brakeResponse and cal.brakeResponse[way] then
+        raw = cal.brakeResponse[way][which]
+    end
+    if not raw and way == "pos" then
+        raw = cal.brakeCurve and cal.brakeCurve[which]
+    end
+    if not raw or #raw == 0 then return nil end
+
+    local kept = {}
+    for _, rung in ipairs(raw) do
         if rung.pitch == nil or math.abs(rung.pitch) <= cfg.pitchLimit then
-            if best == nil or rung.speed > best then best = rung.speed end
+            kept[#kept + 1] = rung
         end
     end
-    return best
+    if #kept == 0 then return nil end
+    return kept
 end
 
-function flight.wantSpeed(d, elapsed, cfg, cal)
-    local want = cfg.cruiseSpeed * flight.throttleFraction(elapsed, cfg.cruiseRampTime)
-    local limit = flight.speedLimitForDistance(d, flight.maxDecel(cal, cfg), cfg.brakeMargin)
-    if limit < want then want = limit end
-    -- Never ask for more than the ship has ever been seen to do. Asking politely
-    -- does not make a saturated propeller faster, it only winds the integral up.
-    local top = cal.fwdCurve and util.curveTopSpeed(cal.fwdCurve.pos)
-    if top and top > 0 and want > top then want = top end
-    return want
+-- How hard this ship can stop without tipping, off the usable rungs.
+function flight.maxDecel(cal, cfg, which, sign)
+    local ladder = flight.brakeLadder(cal, cfg, which, sign)
+    if not ladder then return nil end
+    return util.curveTopSpeed(ladder)
 end
 
--- Feed forward off the measured ladder, trimmed by a PID on what the ship is
--- actually doing. The ladder is what gets it roughly right on the first tick;
--- the trim is what covers everything the ladder did not know about, a headwind
--- or a heavier hull than the day it was measured.
-function flight.thrustRpm(want, have, fwdCurve, pid, dt, cap)
-    local ladder = nil
-    if fwdCurve then ladder = want >= 0 and fwdCurve.pos or fwdCurve.neg end
-    local feed = util.curveRpmFor(ladder, math.abs(want))
-    local rpm = (feed or 0) * util.sign(want)
-    rpm = rpm + pid:update(want - have, dt)
-    if cap then rpm = util.clamp(rpm, -cap, cap) end
-    return rpm
+-- The deceleration a stop is planned against, and where the number came from.
+-- Three answers and they are three because they mean three different things:
+-- "measured" is the brake stage's ladder, "assumed" is brakeAccelAssumed with
+-- nothing behind it, and "unavailable" is a direction with no bound at all.
+-- Every screen and every row of telemetry carries which one it was.
+function flight.brakeBound(cal, cfg, which, sign)
+    local measured = flight.maxDecel(cal, cfg, which, sign)
+    if measured and measured > 0 then return measured, "measured" end
+    if cfg.brakeAssume and cfg.brakeAccelAssumed > 0 then
+        return cfg.brakeAccelAssumed, "assumed"
+    end
+    return nil, "unavailable"
 end
 
--- == BRAKING =================================================
+-- The fastest this ship has ever been measured travelling the way it is being
+-- asked to travel. Asking politely does not make a saturated propeller faster.
+function flight.fwdTop(cal, cfg, sign)
+    local ladder = cal.fwdCurve and cal.fwdCurve[(sign or 1) >= 0 and "pos" or "neg"]
+    local top = ladder and util.curveTopSpeed(ladder)
+    if top and top > 0 then return top end
+    return cfg.cruiseSpeed
+end
 
--- Full reverse on all five can tip the hull nose over, so how much of the ship
--- brakes depends on how much braking is actually needed. The main propeller is
--- tried first and the turbines are recruited only when the main cannot supply
--- what the distance demands.
+-- The longitudinal response model: `dv/dt = (u - v) / tau`, where u is the
+-- speed a held thrust command settles at. Exactly the shape the turn uses, and
+-- exactly as much of an assumption: the ladder measures where the ship ends up,
+-- never how it got there.
 --
--- Returns the plan and, always, the reason for it. Two different reasons get two
--- different strings, because "braking" on a screen tells a pilot nothing.
-function flight.brakePlan(v, d, pitch, cal, cfg)
-    local aMax = flight.maxDecel(cal, cfg)
-    local vLimit = flight.speedLimitForDistance(d, aMax, cfg.brakeMargin)
+-- Nothing on this ship has measured a forward response yet. So unless
+-- `cal.fwdResponse` has been filled in by hand, this is the assumed
+-- acceleration, said to be assumed, and the safety fraction lengthens tau
+-- because a longer modelled response asks for less per sample.
+function flight.fwdResponse(cal, cfg, sign)
+    local way = (sign or 1) >= 0 and "pos" or "neg"
+    local measured = cal.fwdResponse and cal.fwdResponse[way]
+    local top = flight.fwdTop(cal, cfg, sign)
 
-    if v <= vLimit then
-        return { main = 0, turbines = 0 }, "inside the stopping distance"
+    local accel = measured and measured.accel
+    local source = "measured"
+    if cfg.fwdAssumeResponse or not accel or accel <= 0 then
+        accel, source = cfg.fwdAccelAssumed, "assumed"
+    end
+    if accel <= 0 then accel = 0.05 end
+
+    local tau = source == "measured" and measured.tau or nil
+    if not tau or tau <= 0 then
+        tau = top / (accel * util.clamp(cfg.fwdBrakeSafety, 0.05, 1))
+    end
+    return math.max(tau, cfg.tick), accel, source
+end
+
+-- Everything between deciding a command and the propellers turning at it: the
+-- slew, the radio, the relay's own loop. It is not measured either, which is
+-- why it is one named setting rather than three guesses in three files.
+function flight.actuatorLag(cfg)
+    return math.max(cfg.actuatorLag or 0, 0)
+end
+
+-- What a held command does over a period, under the response model above.
+-- Returns the speed at the end of the hold and the distance covered getting
+-- there. Both the governor and the terminal check are written in terms of this
+-- rather than of a step, because a command is held for a whole period and the
+-- motion during that period is the thing that overshoots.
+function flight.holdMotion(v, u, tau, h)
+    if h <= 0 then return v, 0 end
+    local b = math.exp(-h / tau)
+    return b * v + (1 - b) * u, u * h + (v - u) * tau * (1 - b)
+end
+
+-- The reference ramp. Thrust comes on over cruiseRampTime rather than all at
+-- once, because five propellers going from nothing to full in one tick is a
+-- shove that costs more stress than it buys speed.
+--
+-- This is the requested speed and nothing more. It used to cap itself on the
+-- stopping distance, which put the envelope in one of the two places that need
+-- it; `motionPlan` is the other, and is now the only one.
+function flight.wantSpeed(elapsed, cfg, cal)
+    local want = cfg.cruiseSpeed * flight.throttleFraction(elapsed, cfg.cruiseRampTime)
+    return math.min(want, flight.fwdTop(cal, cfg, 1))
+end
+
+-- == THE SIGNED SPEED GOVERNOR ===============================
+--
+-- `req` is what the caller wants and what the ship is doing:
+--
+--   requested   signed speed asked for, m/s. Negative is travel astern.
+--   remaining   signed blocks left along the committed travel axis. Negative
+--               means the ship has gone past the point, which a radial
+--               distance cannot say and which decides everything below.
+--   v           signed speed along the hull, m/s
+--   vValid      false when the velocity read failed. A zero velocity from a
+--               failed read is not a ship at rest.
+--   horizontal  speed through the air, m/s, for the terminal check
+--   lateral     blocks off the committed line
+--   allowAway   the caller has a reason to travel away from the point
+--
+-- `memory` is the caller's, not this file's. It carries the last reference, the
+-- approach direction across a zero crossing, and the speed trim.
+--
+-- The governor's order is requested speed, reachable range, acceleration bounds
+-- over the period, then the stopping envelope last so nothing can undo it.
+function flight.motionPlan(req, cal, cfg, dt, memory)
+    dt = math.max(dt or 0, cfg.tick)
+    memory = memory or {}
+    local v = req.v or 0
+    local valid = req.vValid ~= false
+    local remaining = req.remaining or 0
+    local requested = req.requested or 0
+
+    -- Which way the point lies. At zero it is whichever way the ship came in,
+    -- kept in the caller's memory, because a sign read off a distance that is
+    -- crossing zero chatters between the two answers every update.
+    local toward = util.sign(remaining)
+    if toward == 0 then toward = memory.approach or 1 end
+    memory.approach = toward
+
+    -- Braking opposes the motion the ship actually has, never the travel the
+    -- pilot wants. At rest the approach direction stands in for it.
+    local moveSign = util.sign(v)
+    if moveSign == 0 then moveSign = toward end
+
+    local tau, accel, response = flight.fwdResponse(cal, cfg, requested ~= 0 and requested or moveSign)
+    local aMax, envelope = flight.brakeBound(cal, cfg, "all", moveSign)
+    local lag = flight.actuatorLag(cfg)
+
+    -- The arrival band is reserved before anything else is allowed to spend the
+    -- distance, so a stop is planned to end at the edge of the band rather than
+    -- on the point with the band as an afterthought.
+    local available = math.max(0, math.abs(remaining) - cfg.arriveDist)
+    local allowed = flight.speedLimitForDistance(available, aMax, cfg.brakeMargin, lag)
+    local needed = aMax and (math.abs(v) * lag
+        + v * v * cfg.brakeMargin / (2 * aMax)) or nil
+
+    local reason
+    local vRef = util.clamp(requested,
+        -flight.fwdTop(cal, cfg, -1), flight.fwdTop(cal, cfg, 1))
+
+    if requested == 0 then
+        -- A commanded zero is a zero. Nothing below may floor it into a push.
+        vRef, reason = 0, "asked for nothing"
+    elseif vRef * toward < 0 and not req.allowAway then
+        vRef, reason = 0, "the point is behind the way it is being asked to go"
+    else
+        -- Bound the reference by what the hull can actually do over this period,
+        -- measured from the reference it was last given rather than from the
+        -- speed it has, so a lagging ship does not drag the reference down with
+        -- it and stall the leg.
+        local previous = memory.vRef or v
+        local up = accel * dt * cfg.fwdStepFraction
+        local down = (aMax or accel) * dt
+        vRef = util.clamp(vRef, previous - down, previous + up)
+
+        -- The trim covers a headwind or a heavier hull than the day the ladder
+        -- was measured, and nothing faster than that. It is frozen while the
+        -- propellers are saturated, so it cannot wind up against a ship that is
+        -- already doing its best.
+        if valid and not memory.saturated then
+            local trim = (memory.trim or 0) + (requested - v) * cfg.fwdTrimKi * dt
+            memory.trim = util.clamp(trim, -cfg.fwdTrimMax, cfg.fwdTrimMax)
+        end
+        vRef = vRef + (memory.trim or 0) * util.sign(vRef)
+
+        -- The envelope last, so no earlier stage and no later floor can put the
+        -- reference above what the remaining distance allows.
+        if allowed then
+            if math.abs(vRef) > allowed then vRef = util.sign(vRef) * allowed end
+            reason = string.format("%.1f m/s allowed with %.0f blk of room", allowed, available)
+        else
+            vRef = 0
+            reason = "nothing has measured or assumed a stop in this direction"
+        end
     end
 
-    if pitch and math.abs(pitch) > cfg.pitchLimit then
-        -- Already past the tip limit. More reverse is what put it there.
-        return { main = 0, turbines = 0 },
-            string.format("pitch %.0f deg, past the %g limit", pitch, cfg.pitchLimit)
+    -- The terminal state. Every one of these, because each rules out a
+    -- different way of looking stopped without being stopped: a failed velocity
+    -- read, a hull sliding through the band, sideways drift a hull that cannot
+    -- strafe has no way to null, and a coast that leaves the band after thrust
+    -- ends.
+    local coast = select(2, flight.holdMotion(v, 0, tau, dt + lag))
+    local settled = valid
+        and math.abs(remaining) <= cfg.arriveDist
+        and math.abs(v) <= cfg.arriveSpeed
+        and (req.horizontal or 0) <= cfg.arriveDrift
+        and math.abs(req.lateral or 0) <= cfg.lateralCorrect
+        and math.abs(remaining - coast) <= cfg.arriveDist
+    if settled then
+        vRef, reason = 0, "stopped inside the band and coasting to a stop inside it"
+        memory.trim = 0
     end
 
-    local aReq = d > 0 and (v * v) / (2 * d) or math.huge
-    if aMax and aReq > aMax then aReq = aMax end
+    memory.vRef = vRef
+    return {
+        vRef = vRef, v = v, valid = valid, remaining = remaining, toward = toward,
+        allowed = allowed, available = available, envelope = envelope,
+        aBrake = aMax, lag = lag, tau = tau, accel = accel, response = response,
+        needed = needed, coast = coast, settled = settled, reason = reason,
+        trim = memory.trim or 0,
+    }
+end
 
-    local mainMax = flight.maxDecel(cal, cfg, "main")
-    local mainLadder = cal.brakeCurve and cal.brakeCurve.main
-    local allLadder = cal.brakeCurve and cal.brakeCurve.all
+-- The plan into commands for the main and for the turbines, both signed RPM.
+--
+-- One path for cruising, creeping and stopping. Which of those it is falls out
+-- of the arithmetic rather than being decided beforehand: an equilibrium speed
+-- opposite to the motion the ship has is a brake, and the brake ladders are the
+-- measured data for that case, so it is read off them instead of off the
+-- forward ladder.
+function flight.longitudinalDemand(plan, cal, cfg, dt, memory)
+    dt = math.max(dt or 0, cfg.tick)
+    memory = memory or {}
+    local v, vRef = plan.v, plan.vRef
 
-    if mainMax and aReq <= mainMax then
-        local rpm = util.curveRpmFor(mainLadder, aReq) or cfg.brakeRpmMax
-        return { main = -util.clamp(rpm, 0, cfg.brakeRpmMax), turbines = 0 },
-            string.format("main alone, %.1f m/s/s", aReq)
+    if plan.settled then
+        memory.saturated = false
+        return { main = 0, turbines = 0, mode = "hold", u = 0,
+            reason = plan.reason or "stopped" }
     end
 
-    local rpm = util.curveRpmFor(allLadder, aReq) or cfg.brakeRpmMax
-    rpm = util.clamp(rpm, 0, cfg.brakeRpmMax)
-    return { main = -rpm, turbines = -rpm },
-        string.format("all five, %.1f m/s/s", aReq)
+    -- The equilibrium speed a held command has to settle at for the ship to
+    -- arrive at vRef by the end of the hold. The gain is the inverse of the
+    -- model over that horizon, bounded by fwdRateKp, because an assumed
+    -- response may be badly wrong about a hull and an unbounded inverse would
+    -- amplify that error rather than correct for it.
+    local horizon = dt + plan.lag
+    local decay = math.exp(-horizon / plan.tau)
+    local gain = math.min(cfg.fwdRateKp, decay / math.max(1 - decay, 1e-9))
+    local u = vRef
+    if plan.valid then u = vRef + gain * (vRef - v) end
+
+    -- Braking is the same envelope the phase machine and the governor use, and
+    -- it is read against the speed magnitude. That is the sign error that let a
+    -- ship moving backwards past its stopping limit sail on: the old check
+    -- compared a signed speed against a limit that is never negative.
+    --
+    -- Above the envelope the brake ladders are the measured data and this is a
+    -- stop. Under it, a slower reference is met by asking the propellers for
+    -- less, which is what the forward ladder measures and is gentler than
+    -- reversing for a speed the distance never demanded reversing for.
+    -- A ship at rest reads a velocity of a thousandth of a metre a second with
+    -- whatever sign the physics engine last had, and asking that sign whether
+    -- the ship is going the wrong way turns the first update of every leg into
+    -- a stop. Below the speed that counts as stopped there is nothing to brake.
+    local moving = math.abs(v) > cfg.arriveSpeed
+    local over = plan.allowed ~= nil and math.abs(v) > plan.allowed and moving
+    local braking = over or (moving and (u * v < 0 or vRef == 0))
+    if not braking then
+        local ladder = cal.fwdCurve and cal.fwdCurve[u >= 0 and "pos" or "neg"]
+        local feed = util.curveRpmFor(ladder, math.abs(u))
+        local rpm = (feed or math.abs(u) / math.max(flight.fwdTop(cal, cfg, u), 1e-9)
+            * cfg.cruiseMaxRpm) * util.sign(u)
+        rpm = util.clamp(rpm, -cfg.cruiseMaxRpm, cfg.cruiseMaxRpm)
+        memory.saturated = math.abs(rpm) >= cfg.cruiseMaxRpm - 1e-9
+
+        local resolution = nil
+        if rpm ~= 0 and math.abs(rpm) < cfg.cruiseMinRpm then
+            -- Not silently dropped. A creep the mixer cannot send is a
+            -- resolution limit of this ship, and the pilot is told which one.
+            resolution = string.format("%.1f m/s needs under the %d rpm the mixer sends",
+                math.abs(vRef), cfg.cruiseMinRpm)
+            rpm = 0
+        end
+        return { main = rpm, turbines = rpm, mode = "drive", u = u,
+            resolution = resolution, saturated = memory.saturated,
+            reason = resolution or string.format("holding %.1f m/s", vRef) }
+    end
+
+    -- How hard it has to stop: enough to fit inside the distance that is left,
+    -- and enough to be back under the envelope by the end of the hold,
+    -- whichever is more, and never more than the ladder says is safe. The
+    -- margin is in the distance term and nowhere else, so it is applied once.
+    local moveSign = util.sign(v)
+    local aRoom = plan.available > 0
+        and (v * v * cfg.brakeMargin) / (2 * plan.available) or math.huge
+    local aBack = plan.allowed
+        and (math.abs(v) - plan.allowed) / horizon or math.abs(v) / horizon
+    local aReq = math.max(aRoom, aBack, 0)
+    if plan.aBrake then aReq = math.min(aReq, plan.aBrake) end
+
+    -- Do not turn a completed stop into a backward launch. The command is held
+    -- for a whole period plus its own delay, and a demand that would carry the
+    -- speed through zero is cut to the one that arrives at zero.
+    local toZero = math.abs(v) / horizon
+    local clipped = false
+    if aReq > toZero then aReq, clipped = toZero, true end
+
+    local mainMax = flight.maxDecel(cal, cfg, "main", moveSign)
+    local which = (mainMax and aReq <= mainMax) and "main" or "all"
+    local ladder = flight.brakeLadder(cal, cfg, which, moveSign)
+    local rpm
+    if ladder then
+        rpm = util.curveRpmFor(ladder, aReq)
+    else
+        -- No usable rungs in this direction. The demand is still real, so it is
+        -- scaled off the assumed bound rather than dropped: a lack of data is
+        -- not a reason to ask for no brake at all.
+        local bound = plan.aBrake or cfg.brakeAccelAssumed
+        rpm = cfg.brakeRpmMax * util.clamp(aReq / math.max(bound, 1e-9), 0, 1)
+    end
+    rpm = util.clamp(rpm or 0, 0, cfg.brakeRpmMax) * -moveSign
+    memory.saturated = math.abs(rpm) >= cfg.brakeRpmMax - 1e-9
+
+    local resolution = nil
+    if rpm ~= 0 and math.abs(rpm) < cfg.minRpm then
+        resolution = string.format("%.2f m/s/s needs under the %d rpm the mixer sends",
+            aReq, cfg.minRpm)
+        rpm = 0
+    end
+
+    local reason
+    if resolution then
+        reason = resolution
+    elseif clipped then
+        reason = string.format("%s, cut to land on zero", which == "main"
+            and "main alone" or "all five")
+    else
+        reason = string.format("%s, %.1f m/s/s", which == "main" and "main alone" or "all five", aReq)
+    end
+
+    return {
+        main = rpm, turbines = which == "all" and rpm or 0,
+        mode = "brake", which = which, u = u, aReq = aReq,
+        clipped = clipped, resolution = resolution, saturated = memory.saturated,
+        reason = reason,
+    }
+end
+
+-- == ALLOCATION ==============================================
+--
+-- What the two sides can actually be told, before rounding. For a turbine base
+-- command c after its share, side scales l and r, and a per line limit R, the
+-- differential d has to satisfy both sides at once:
+--
+--     (-R-c)/l <= d <= (R-c)/l        the left line
+--     (c-R)/r  <= d <= (c+R)/r        the right line
+--
+-- At c = R there is no positive headroom on the left at all. Clipping the one
+-- side that ran out changes the common thrust as well as losing the steering,
+-- which is a stop that quietly becomes a turn. So when `reserve` is set the
+-- common thrust is held back instead, and the caller is told what it actually
+-- got rather than what it asked for.
+function flight.allocateMotion(mainCommon, turbineCommon, differential, cal, cfg, reserve)
+    local scaleL, scaleR = flight.sideScales(
+        cal.yawAuth and cal.yawAuth.left, cal.yawAuth and cal.yawAuth.right)
+    local share = cfg.turbineShare
+    local R = cfg.maxRpm
+    local c = turbineCommon * share
+
+    local function room(base)
+        return math.max((-R - base) / scaleL, (base - R) / scaleR),
+               math.min((R - base) / scaleL, (base + R) / scaleR)
+    end
+
+    local lo, hi = room(c)
+    local given = util.clamp(differential, lo, hi)
+    local held = 0
+
+    if reserve and math.abs(given) < math.abs(differential) - 1e-9 then
+        -- Hold the turbines back to exactly the thrust that leaves room for the
+        -- differential that was asked for, and no further.
+        local need = math.abs(differential) * math.max(scaleL, scaleR)
+        local ceiling = math.max(R - need, 0)
+        local wanted = util.clamp(c, -ceiling, ceiling)
+        held = c - wanted
+        c = wanted
+        lo, hi = room(c)
+        given = util.clamp(differential, lo, hi)
+    end
+
+    return {
+        main = mainCommon,
+        turbines = share > 1e-9 and c / share or 0,
+        differential = given,
+        requested = differential,
+        held = held,
+        lo = lo, hi = hi,
+        saturated = math.abs(given) < math.abs(differential) - 1e-9,
+    }
 end
 
 -- == MIXING ==================================================
@@ -424,15 +804,36 @@ function flight.mixParts(mainCommon, turbineCommon, differential, lines, cal, cf
     return out
 end
 
+-- How much a line may change on this update. The per update figure is what the
+-- turn was validated with and is what `slewTimed` off keeps. The timed figure
+-- is the honest one on a loop whose period moves: sixteen RPM an update is a
+-- different ramp at dt 0.3 than at dt 1.2, and the stopping planner prices
+-- neither.
+function flight.slewLimit(cfg, braking, dt)
+    if cfg.slewTimed then
+        local rate = braking and cfg.brakeSlewRate or cfg.rpmSlewRate
+        return rate * math.max(dt or 0, 0)
+    end
+    return braking and cfg.brakeSlew or cfg.rpmSlew
+end
+
 -- How fast a line may change. Suddenness is what tips the hull and what spikes
 -- the stress, and neither shows up in a steady state test.
-function flight.applySlew(previous, wanted, slew)
+--
+-- `carry`, when the caller keeps one, is the fraction of RPM that rounding
+-- threw away last time. Relays take integers only, so without it a slew of
+-- under half an RPM an update rounds to nothing for ever and the line never
+-- moves at all.
+function flight.applySlew(previous, wanted, slew, carry)
     local out = {}
     for name, want in pairs(wanted) do
-        local was = previous[name] or 0
+        local was = (previous[name] or 0) + (carry and carry[name] or 0)
         local step = want - was
         if step > slew then step = slew elseif step < -slew then step = -slew end
-        out[name] = util.round(was + step)
+        local exact = was + step
+        local rounded = util.round(exact)
+        if carry then carry[name] = exact - rounded end
+        out[name] = rounded
     end
     return out
 end
@@ -534,6 +935,8 @@ end
 --   err        heading error, deg
 --   yawRate    deg/s, measured
 --   d          distance to the target, blocks
+--   remaining  signed blocks along the committed travel axis. Defaults to d,
+--              which is the same thing until the ship has gone past the point.
 --   v          speed along the hull, m/s
 --   lateral    blocks off the bearing
 --   alignedFor seconds the ship has been inside the padding and steady
@@ -559,10 +962,23 @@ function flight.phaseNext(phase, state, cfg, cal)
         if math.abs(state.err) > cfg.tankReentry then
             return "tank", string.format("%.0f deg off, turning again", state.err)
         end
-        local vLimit = flight.speedLimitForDistance(
-            state.d, flight.maxDecel(cal, cfg), cfg.brakeMargin)
-        if state.v > vLimit then
-            return "brake", string.format("%.1f m/s with %.0f blk left", state.v, state.d)
+        -- The same envelope the speed governor uses, on the same reserved
+        -- distance, against the speed magnitude rather than the signed speed.
+        -- Comparing a signed speed to a limit that is never negative is how a
+        -- ship travelling backwards past the point never entered a stop at all.
+        local remaining = state.remaining or state.d
+        local moveSign = util.sign(state.v)
+        if moveSign == 0 then moveSign = util.sign(remaining) end
+        local aMax, envelope = flight.brakeBound(cal, cfg, "all", moveSign)
+        local available = math.max(0, math.abs(remaining) - cfg.arriveDist)
+        local vLimit = flight.speedLimitForDistance(available, aMax, cfg.brakeMargin,
+            flight.actuatorLag(cfg))
+        if not vLimit then
+            return "brake", "no stopping distance is known in this direction"
+        end
+        if math.abs(state.v) > vLimit then
+            return "brake", string.format("%.1f m/s with %.0f blk left, %s",
+                math.abs(state.v), math.abs(remaining), envelope)
         end
         return "cruise", "running"
     end

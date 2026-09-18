@@ -19,8 +19,8 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.14.1",
-    note = "Minecraft compass rose order and wrapped calibration prompts",
+    version = "0.15.0",
+    note = "sampled longitudinal control, signed braking and live cruise yaw",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths

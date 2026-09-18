@@ -166,6 +166,26 @@ function preflight.check(ship, cal, fuel, turbine, config, link)
         add(report, "passcode", true, "bad", "paired")
     end
 
+    -- What the stopping envelope is planned against, which is not the same
+    -- question as whether the brake stage has been run. A ladder the pitch
+    -- limit has emptied is measured and useless, and a direction nothing
+    -- measured is planned on an assumed figure with nothing behind it. Neither
+    -- shows up under "never measured", and both decide where the ship stops.
+    local aMax, envelope = flight.brakeBound(cal, config.values, "all", 1)
+    if envelope == "measured" then
+        add(report, "stopping", true, "warn",
+            string.format("stops are planned on %.1f m/s/s the brake stage measured", aMax))
+    elseif envelope == "assumed" then
+        add(report, "stopping", false, "warn",
+            string.format("no usable braking rungs, so stops are planned on the assumed %.1f m/s/s",
+                aMax),
+            "the ship stops where a guess says it will, which is not where the brake stage would have")
+    else
+        add(report, "stopping", false, "bad",
+            "nothing measures or assumes a stop in the direction of travel",
+            "the speed governor holds the ship at zero rather than fly a leg it cannot plan an end to")
+    end
+
     local unmeasured = {}
     for _, row in ipairs(cal.summary()) do
         if not row.done then unmeasured[#unmeasured + 1] = row.title:lower() end

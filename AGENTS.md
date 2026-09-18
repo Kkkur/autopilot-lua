@@ -133,10 +133,23 @@ Two rules fall out of that and are easy to break by accident:
 in `cfg`, which is the config module's values, and everything measured arrives
 in `cal`.
 
-The order inside `flight.tankDemand` is heading PID, stopping and sample limits,
+The order inside `flight.yawCore` is heading PID, stopping and sample limits,
 period aware rate feedback, measured ladder inversion, the terminal coast
 check, and the actuator minimum. No later stage may replace that result with a
-fixed push. Both navigation and alignment call this function.
+fixed push. `flight.tankDemand` is the tank wrapper, with the whole
+differential and the minimum pulse, and is what navigation and alignment call.
+`flight.cruiseYawDemand` is the running correction, with its own smaller
+ceilings and no pulse, and it runs on every control update rather than on a
+clock of its own.
+
+The order inside `flight.motionPlan` is the requested signed speed, the
+reachable range, the acceleration bounds over the period, the speed trim, then
+the stopping envelope last, so nothing earlier and no later floor can put the
+reference above what the distance left allows. A commanded zero stays zero.
+`flight.longitudinalDemand` follows, and cruise, creep and braking all go
+through both of them: which one is happening falls out of the envelope rather
+than being decided beforehand. Braking opposes the motion the ship has, never
+the travel that was asked for.
 
 The response model is `rate' = (equilibriumRate - rate) / tau`, with `tau`
 derived from the top measured rate and the acceleration after the safety
