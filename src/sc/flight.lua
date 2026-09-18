@@ -189,164 +189,83 @@ function flight.hullHeadingFor(want, frontOffset)
     return util.wrapAngle(want - (frontOffset or 0))
 end
 
--- == CLOSE IN ================================================
+-- The sampled turn: heading PID, stopping and sample limits, rate response,
+-- ladder inversion, terminal coast check, then actuator minimum. Nothing may
+-- replace the result with a fixed close-in push after these limits.
 --
--- The profile above is a good statement about a wide turn and a bad one about
--- the last few degrees of it. Near the heading the ladder prices a third of a
--- degree at most of the differential the ship owns, the hull arrives carrying
--- speed it then spends the next swing undoing, and the swing after that undoes
--- the undoing. The measurement is not wrong. Asking a measurement of a turn
--- what to do when there is almost no turn left is.
---
--- So inside yawNearBand the push is a flat step in RPM rather than anything
--- derived: what the pilot watches on the PROPS tab is what the pilot set on the
--- TUNE tab. Inside yawFineBand there is no push at all, because the ship has
--- arrived. Past the band the profile has the say again, floored at yawMidRpm so
--- a hull five degrees out is not left crawling by a deceleration nobody
--- measured.
---
--- `pushed` is what the loop above arrived at, and it is only ever raised to the
--- floor, never lowered to it.
-function flight.nearRpm(err, pushed, cfg)
-    local e = math.abs(err)
-    if e < cfg.yawFineBand then return 0 end
-    if e < cfg.yawNearBand then return cfg.yawNearRpm end
-    return math.max(pushed, cfg.yawMidRpm)
+-- Model the measured hull as rate' = (equilibriumRate - rate) / tau.
+-- The ladder supplies equilibriumRate and topRate / acceleration supplies tau.
+-- This is a model, not a measurement of transient drag; the safety fraction
+-- lengthens tau to leave room for a heavier hull.
+function flight.yawResponse(cal, cfg)
+    local slope = flight.rpmPerRate(cal, cfg)
+    local top = slope > 0 and cfg.tankRpmMax / slope or cfg.yawRateMax
+    local accel = cal.yawAccel
+    if not accel or accel <= 0 then accel = cfg.yawAccelAssumed end
+    local tau = top / (accel * cfg.yawBrakeSafety)
+    return tau, accel
 end
 
--- A turn that remembers the push that threw it past the heading.
---
--- A hull crosses the bearing on the differential it was carrying when it got
--- there. The correction that follows is aimed the other way with the same
--- authority the controller has always had, which is how one overshoot becomes
--- four: nothing in the loop knows that the last push was too much, only that
--- the error changed sign. This writes down what the crossing cost and holds the
--- next push under it.
---
--- The ceiling recovers at yawOvershootRecover a second while the hull stays on
--- one side of the heading, because a ship that has settled should not still be
--- flying on a limit it earned two swings ago. It never falls under yawNearRpm,
--- which is the flat close-in push and the slowest thing that still turns a hull.
---
--- `swing` is a plain table the caller owns, the way the PID is, so that two
--- turns in one run cannot inherit each other's mistakes.
-function flight.newSwing() return {} end
+function flight.tankDemand(err, pid, cal, cfg, dt, haveRate)
+    dt = math.max(dt or 0, cfg.tick)
+    local tau, accel = flight.yawResponse(cal, cfg)
+    local floor = math.min(cfg.yawApproachMin, cfg.yawFineBand / dt)
+    local approach = flight.approachRate(err, accel, cfg.yawBrakeSafety, floor)
+    -- Half the remaining error over a sample plus the hull response time gives
+    -- two real, positive poles with the default rate gain in the linear model. The
+    -- extra tau matters: err/dt alone ignores the motion while rate is changing.
+    local stepCap = cfg.yawStepFraction * math.abs(err) / (dt + tau)
+    local cap = math.min(cfg.yawRateMax, approach, stepCap)
+    local raw = flight.wantYawRate(err, pid, cfg.yawRateMax, dt)
+    local want = util.sign(err) * util.clamp(raw * util.sign(err), 0, cap)
 
-function flight.markCrossing(err, cfg, swing)
-    if not swing then return end
-    local side = util.sign(err)
-    if side ~= 0 and swing.side and side ~= swing.side and swing.push then
-        local cost = swing.push * util.clamp(cfg.yawOvershootEase, 0.05, 1)
-        swing.ceiling = math.max(cfg.yawNearRpm,
-            math.min(swing.ceiling or cost, cost))
-    end
-    if side ~= 0 then swing.side = side end
-end
-
-function flight.easeSwing(dt, cfg, swing)
-    if not swing or not swing.ceiling then return end
-    swing.ceiling = math.min(cfg.tankRpmMax,
-        swing.ceiling + cfg.yawOvershootRecover * (dt or 0))
-end
-
--- The whole tank phase in one call: rotate, do not translate.
---
--- The pid is an argument rather than something this module keeps, because a
--- module that keeps state is a module that cannot be tested twice in one run.
---
--- `haveRate` is what the hull is actually doing, and without it this is a turn
--- flown blind. The ladder says what differential holds a rate once the hull has
--- settled at it, which is a fine thing to ask for and no way to stop: a hull
--- asked for a slower turn simply gets less push, and coasts through the heading
--- on the momentum it already had. Nothing in that loop can ever command the
--- other way. That is the overshoot, and no gain fixes it, because the number
--- that says to reverse is one this function was never given.
---
--- So the demand is the ladder's feed forward plus the error between the rate
--- wanted and the rate there is. When the hull is turning faster than the
--- approach allows, that term goes negative and the propellers push the other
--- way, which is what stopping is.
-function flight.tankDemand(err, pid, cal, cfg, dt, haveRate, swing)
-    -- The crossing is read before anything is commanded, because what it is
-    -- about to cost is decided by the push the hull was already carrying.
-    flight.markCrossing(err, cfg, swing)
-    flight.easeSwing(dt, cfg, swing)
-
-    local wantRate = flight.wantYawRate(err, pid, cfg.yawRateMax, dt)
-
-    -- Held down to what can still be stopped in the error that is left, and
-    -- only when the demand is driving the hull towards the heading. A demand
-    -- pointing the other way is the controller braking an overshoot out, and
-    -- limiting that would be limiting the recovery by how small the mistake
-    -- is: the tighter the overshoot the weaker the correction allowed, which
-    -- is backwards and was measured as such.
-    --
-    -- A ship whose acceleration was never measured is not a ship that can stop
-    -- instantly, but that is what no profile at all amounts to: the cap never
-    -- applies and every turn runs at whatever the gain asks for. So an
-    -- unmeasured hull is flown on yawAccelAssumed, which is low on purpose,
-    -- because guessing low brakes early and guessing high sails past.
-    local limit = flight.approachRate(err, cal.yawAccel or cfg.yawAccelAssumed,
-        cfg.yawBrakeSafety, cfg.yawApproachMin)
-    if limit and wantRate * err > 0 and math.abs(wantRate) > limit then
-        wantRate = util.sign(wantRate) * limit
-    end
-
-    local diff = flight.yawDifferential(wantRate, cal.yawCurve, cfg.tankRpmMax)
-
+    -- Invert the response over the period for which the command will be held:
+    -- nextRate = decay * haveRate + (1 - decay) * equilibriumRate.
+    -- An unbounded proportional rate correction can stop the current swing
+    -- and start the opposite one before the next sample. Bound the inverse by
+    -- yawRateKp too: an assumed slow hull may actually respond much faster.
+    -- Full reverse remains available when stopping a fast swing requires it.
+    local decay = math.exp(-dt / tau)
+    local equilibrium = want
+    local rateGain = math.min(cfg.yawRateKp, decay / (1 - decay))
+    if haveRate then equilibrium = want + rateGain * (want - haveRate) end
+    local diff = flight.yawDifferential(equilibrium, cal.yawCurve, cfg.tankRpmMax)
     if not diff then
-        -- No ladder yet, so the best available statement is that a full rate
-        -- deserves full RPM. Calibration replaces this with the truth.
-        diff = cfg.tankRpmMax * util.clamp(wantRate / cfg.yawRateMax, -1, 1)
+        diff = util.clamp(equilibrium / cfg.yawRateMax, -1, 1) * cfg.tankRpmMax
     end
 
-    -- The inner loop: what the hull is doing against what it was asked for.
-    -- Feed forward alone holds a rate; this is what changes one, and it is the
-    -- only term in the whole turn that can put the propellers into reverse.
-    if haveRate and (cfg.yawRateKp or 0) > 0 then
-        local slope = flight.rpmPerRate(cal, cfg)
-        diff = diff + (wantRate - haveRate) * slope * cfg.yawRateKp
-        diff = util.clamp(diff, -cfg.tankRpmMax, cfg.tankRpmMax)
-    end
-
-    -- Everything from here shapes the push that is driving the hull and nothing
-    -- else. The brake keeps the whole differential, because the term that stops
-    -- a swing must never end up the weaker of the two.
-    --
-    -- Which of the two a demand is cannot be read off the heading error. A nose
-    -- swinging left through a heading that is itself off to the left is being
-    -- braked by a demand pointing left, and by the error alone that is
-    -- indistinguishable from driving. What tells them apart is the rate: a
-    -- demand opposing the way the hull is already turning is a brake, whatever
-    -- the error is doing. A hull at rest, or one on a ship with no rate to read,
-    -- can only be being driven.
-    local braking = haveRate and math.abs(haveRate) > 0 and diff * haveRate < 0
-    local driving = not braking and diff * err > 0
-
-    if driving then
-        diff = util.sign(err) * flight.nearRpm(err, math.abs(diff), cfg)
-        if swing and swing.ceiling and math.abs(diff) > swing.ceiling then
-            diff = util.sign(diff) * swing.ceiling
+    -- With zero thrust the model still travels rate * tau degrees. Both the
+    -- current heading and that resting heading must fit before calling it done.
+    -- No rate reading means no claim that the ship has stopped.
+    local coast = haveRate and err - haveRate * tau or err
+    local settleRate = cfg.yawFineBand / (dt + tau)
+    local settled = haveRate ~= nil and math.abs(err) <= cfg.yawFineBand
+        and math.abs(coast) <= cfg.yawFineBand and math.abs(haveRate) <= settleRate
+    if settled then
+        diff, want = 0, 0
+        pid:reset()
+    else
+        -- Include the mixer's minimum, or a command the turn thinks it sent
+        -- disappears downstream. One minimum pulse rescues a hull stopped just
+        -- outside the band, only toward both the current and resting heading.
+        -- Promoting a tiny correction away from the heading restarts the swing.
+        local minimum = math.max(cfg.tankRpmMin, cfg.minRpm)
+        if math.abs(diff) < minimum then
+            if math.abs(coast) > cfg.yawFineBand and diff * coast > 0 and diff * err > 0 then
+                diff = util.sign(diff) * math.min(minimum, cfg.tankRpmMax)
+            else
+                diff = 0
+            end
         end
-        -- What the next crossing will be charged for. Written after the shaping
-        -- rather than before it, so what is remembered is what the ship was
-        -- actually given.
-        if swing then swing.push = math.abs(diff) end
     end
-
-    -- Below the minimum a speed controller buzzes without turning anything, so
-    -- a demand that small is worth nothing and costs stress.
-    if math.abs(diff) < cfg.tankRpmMin then diff = 0 end
 
     local scaleL, scaleR = flight.sideScales(
         cal.yawAuth and cal.yawAuth.left, cal.yawAuth and cal.yawAuth.right)
-
     return {
-        left  = util.clamp(diff * scaleL, -cfg.tankRpmMax, cfg.tankRpmMax),
-        right = util.clamp(-diff * scaleR, -cfg.tankRpmMax, cfg.tankRpmMax),
-        main  = 0,
-        rate  = wantRate,
-        diff  = diff,
+        left = diff * scaleL, right = -diff * scaleR, main = 0,
+        rate = want, diff = diff, cap = cap, stepCap = stepCap,
+        floor = floor, dt = dt, tau = tau, coast = coast,
+        settled = settled, settleRate = settleRate, rateGain = rateGain,
     }
 end
 

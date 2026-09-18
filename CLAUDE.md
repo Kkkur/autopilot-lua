@@ -133,32 +133,36 @@ Two rules fall out of that and are easy to break by accident:
 in `cfg`, which is the config module's values, and everything measured arrives
 in `cal`.
 
-The order inside `flight.tankDemand` is the order it has to stay in: heading
-error into a wanted rate, the wanted rate held down by the approach profile, the
-rate priced by the measured ladder, the inner rate loop, then the close in
-shaping, then the overshoot ceiling, then the minimum.
+The order inside `flight.tankDemand` is heading PID, stopping and sample limits,
+period aware rate feedback, measured ladder inversion, the terminal coast
+check, and the actuator minimum. No later stage may replace that result with a
+fixed push. Both navigation and alignment call this function.
 
-Four things about it that were each a bug first:
+The response model is `rate' = (equilibriumRate - rate) / tau`, with `tau`
+derived from the top measured rate and the acceleration after the safety
+fraction. This is an assumption about transients, not another measured curve.
+The self test uses the live ship's asymmetric ladder, independent physics
+steps, integer RPM, relay delay, varying periods, and the navigation slew.
+It checks that a turn stays inside the fine band and then holds zero thrust.
+A passing model still needs a turn on the real ship to validate its assumptions.
 
-- **A missing measurement must fail safe, not fail open.** `flight.approachRate`
-  returns nil without a deceleration, and for one version nil meant no limit at
-  all, which is the same command as a hull that stops instantly. A ship with no
-  `cal.yawAccel` now flies on `yawAccelAssumed`, which is low on purpose, because
-  guessing low brakes early and guessing high sails past.
-- **The heading error cannot tell a brake from a drive.** A nose swinging left
-  through a heading that is itself off to the left is being braked by a demand
-  pointing left, and by the error alone that is indistinguishable from driving.
-  The rate is what tells them apart. Nothing that shapes or caps a demand may
-  ever touch the brake: the term that stops a swing must not end up the weaker
-  of the two.
-- **Close in, a measurement of a turn is the wrong thing to ask.** Inside
-  `yawNearBand` the push is a flat step in RPM and inside `yawFineBand` there is
-  none, because the ladder prices a third of a degree at most of the differential
-  the ship owns.
-- **A turn has to remember the push that overshot.** Otherwise the correction
-  after a crossing is aimed the other way with the same authority, which is how
-  one overshoot becomes four. The memory is a table the caller owns, the way the
-  PID is, so two turns in one run cannot inherit each other's mistakes.
+- A missing or nonpositive acceleration uses `yawAccelAssumed`. The inner gain
+  is bounded by both the sampled response and `yawRateKp`, so an uncertain slow
+  response cannot amplify feedback without limit.
+- The wanted rate is bounded by `yawStepFraction * abs(error) / (dt + tau)`.
+  `yawApproachMin` floors a ceiling, not a command, and is bounded by the fine
+  band divided by the period. No RPM floor may undo the sample calculation
+  except the explicit minimum actuator pulse needed to avoid stopping short.
+- Braking is computed from the measured rate. A fast swing still gets full
+  reverse when needed, even inside the fine band. A demand held for a whole
+  sample must account for the swing it could start after stopping this one.
+- Zero thrust is terminal only when the heading, predicted coasting heading,
+  and rate all fit. The PID resets there. There is no fixed close push or
+  remembered overshoot ceiling anymore. Their old settings are ignored on load.
+
+The align trace runs at most once a second. Its timestamps are not the control
+period. It prints the actual `dt` and separates pose, rate, and send time.
+Remote lines still go out every tick, grouped by relay, to keep the deadman fed.
 
 ## The front and the hull
 

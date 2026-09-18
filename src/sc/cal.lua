@@ -1335,10 +1335,6 @@ local function turnTo(ctx, want, label)
     if ctx.aborted() then return nil, "stopped" end
     local pid = util.newPID(config.get("yawKp"), config.get("yawKi"),
         config.get("yawKd"), -1e6, 1e6, 50)
-    -- Each point of the rose is its own turn and gets its own memory of what
-    -- the last crossing cost. Carrying one across the whole stage would hold
-    -- the eighth point to a ceiling the first point earned.
-    local swing = flight.newSwing()
     local tol = config.get("calAlignTol")
     local started = os.clock()
     local last = started
@@ -1351,6 +1347,7 @@ local function turnTo(ctx, want, label)
 
     local function drive()
         while true do
+            local readAt = os.clock()
             local state = ship.readState()
             if not state then
                 ctx.note("lost the pose mid turn", "bad")
@@ -1366,26 +1363,21 @@ local function turnTo(ctx, want, label)
             -- The rate the hull is actually turning at, which is what lets the
             -- turn stop rather than coast through the heading.
             local rate = ship.yawRate()
-            local demand = flight.tankDemand(err, pid, cal, cfg(), dt, rate, swing)
+            local rateAt = os.clock()
+            local demand = flight.tankDemand(err, pid, cal, cfg(), dt, rate)
             ship.flush(flight.mix(0, demand.diff, ship.order, cal, cfg()))
+            local sentAt = os.clock()
 
-            -- What the turn is actually doing, which is the only place the
-            -- three numbers that decide it are visible together. A ship sitting
-            -- on a heading with a large differential on it is one whose
-            -- deceleration is wrong, and the accel below says whether that
-            -- number was measured at all or is the assumed one being flown on.
+            -- Trace cadence is not control cadence. Print dt explicitly and
+            -- time the reads and send so a world log can locate the delay.
             if now - lastTrace >= 1 then
                 lastTrace = now
-                local conf = cfg()
-                local accel = cal.yawAccel or conf.yawAccelAssumed
-                local cap = flight.approachRate(err, accel, conf.yawBrakeSafety,
-                    conf.yawApproachMin)
                 log.infof(
-                    "cal: align turn off=%+.1f rate=%s rpm=%+.0f want=%+.1f cap=%s accel=%.3f%s",
-                    err, rate and string.format("%+.2f", rate) or "none",
-                    demand.diff, demand.rate,
-                    cap and string.format("%.2f", cap) or "none",
-                    accel, cal.yawAccel and "" or " (assumed)")
+                    "cal: align turn off=%+.3f rate=%s rpm=%+.0f want=%+.3f cap=%.3f dt=%.3f tau=%.3f coast=%+.3f settled=%s gain=%.3f poseTime=%.3f rateTime=%.3f sendTime=%.3f",
+                    err, rate and string.format("%+.3f", rate) or "none",
+                    demand.diff, demand.rate, demand.cap, dt, demand.tau,
+                    demand.coast, tostring(demand.settled), demand.rateGain,
+                    now - readAt, rateAt - now, sentAt - rateAt)
             end
 
             ctx.panel({

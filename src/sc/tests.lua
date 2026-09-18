@@ -3,8 +3,8 @@
 -- Everything checked here is pure: quaternions, the flight maths, curve lookup,
 -- config coercion, calibration file parsing, and what the fuel relay's numbers
 -- mean.
--- No ship, no peripherals, no modem. If this passes on a bare computer, the
--- maths that flies the ship is sound and anything still wrong is wiring.
+-- No ship, no peripherals, no modem. These verify the stated model and
+-- contracts; the real hull still has to validate their assumptions.
 
 local util, config, cal, fuel, turbine, ship, flight, preflight, popup, link = ...
 
@@ -264,13 +264,18 @@ function tests.run()
         local cfg = config.values
         local pid = util.newPID(cfg.yawKp, cfg.yawKi, cfg.yawKd, -1e6, 1e6, 50)
         local yaw, rate, dt = 0, 0, 0.1
+        local quiet = 0
         -- How far past the heading it went, which is the fault being fixed.
         local past = 0
         -- When it first got there, which is what a profile flown on a guessed
         -- deceleration costs. Braking early is slower, and slower is the price
         -- worth paying.
         local arrived = nil
-        for step = 1, 1200 do
+        -- A missing acceleration now also lengthens the sampled response
+        -- horizon. Bound the run by that declared model, then require the fine
+        -- band and zero thrust for 30 seconds, not merely the cruise padding.
+        local horizon = flight.yawResponse(turnCal, cfg)
+        for step = 1, math.ceil((120 + 12 * horizon) / dt) do
             local err = util.wrapAngle(120 - yaw)
             local demand = flight.tankDemand(err, pid, turnCal, cfg, dt, rate)
             -- The hull answers a differential the way the simulator's does:
@@ -280,11 +285,17 @@ function tests.run()
             yaw = util.wrapAngle(yaw + rate * dt)
             local beyond = util.wrapAngle(yaw - 120)
             if beyond > past then past = beyond end
-            if not arrived and math.abs(util.wrapAngle(120 - yaw)) <= cfg.tankPadding then
+            if not arrived and math.abs(util.wrapAngle(120 - yaw)) <= cfg.yawFineBand then
                 arrived = step * dt
             end
+            if demand.diff == 0 and math.abs(util.wrapAngle(120 - yaw)) <= cfg.yawFineBand then
+                quiet = quiet + dt
+            else
+                quiet = 0
+            end
+            if quiet >= 30 then break end
         end
-        return util.wrapAngle(120 - yaw), rate, past, arrived
+        return util.wrapAngle(120 - yaw), rate, past, arrived, quiet
     end
 
     local ladder = { pos = { { rpm = 64, speed = 8 }, { rpm = 128, speed = 16 },
@@ -295,8 +306,8 @@ function tests.run()
     -- rise of a rung, so it is the number the profile is given here.
     local braked = { yawCurve = ladder, yawAuth = { left = 0.06, right = 0.06 },
                      sides = {}, yawAccel = 8 }
-    local leftErr, leftRate, leftPast, leftWhen = flyTurn(braked, 0.25)
-    check(math.abs(leftErr) <= config.get("tankPadding"),
+    local leftErr, leftRate, leftPast, leftWhen, leftQuiet = flyTurn(braked, 0.25)
+    check(math.abs(leftErr) <= config.get("yawFineBand"),
         string.format("a hull with a measured acceleration arrives, %.2f deg out", leftErr))
     check(math.abs(leftRate) <= config.get("tankHoldRate"),
         string.format("and is no longer swinging when it gets there, %.2f deg/s", leftRate))
@@ -307,9 +318,10 @@ function tests.run()
     -- ship every calibration starts as is allowed to be slow, and is not
     -- allowed to sail past.
     local plain = { yawCurve = ladder, yawAuth = { left = 0.06, right = 0.06 }, sides = {} }
-    local plainErr, _, plainPast, plainWhen = flyTurn(plain, 0.25)
-    check(math.abs(plainErr) <= config.get("tankPadding"),
+    local plainErr, _, plainPast, plainWhen, plainQuiet = flyTurn(plain, 0.25)
+    check(math.abs(plainErr) <= config.get("yawFineBand"),
         string.format("and one with nothing measured still arrives, %.2f deg out", plainErr))
+    check(leftQuiet >= 30 and plainQuiet >= 30, "both measured and assumed hulls finish at zero thrust")
     check(plainPast <= leftPast,
         string.format("a guessed deceleration brakes early rather than late, %.1f deg past against %.1f",
             plainPast, leftPast))
@@ -317,74 +329,118 @@ function tests.run()
         string.format("and pays for it in time, there in %.1fs measured against %.1fs guessed",
             leftWhen or -1, plainWhen or -1))
 
-    -- == what the last few degrees are worth ==
-    -- The bug this closes: the ladder and the approach between them priced a
-    -- third of a degree at the whole differential, so the align stage sat on
-    -- the heading calling for 256. Close in the push is a flat step instead.
+    -- == the measured hull must finish its turn ==
+    -- Read from computer 0's cal.cfg on 2026-09-18. The old synthetic ladder
+    -- topped out at 32 deg/s; this one barely reaches 2.6. That difference made
+    -- a small rate error cost almost the entire differential in the old loop.
+    local measured = {
+        yawAccel = 2.6263494266823795,
+        yawCurve = {
+            pos = { { rpm = 64, speed = 0.69046162220196561 },
+                    { rpm = 128, speed = 1.1628453108661974 },
+                    { rpm = 192, speed = 1.8918652257652466 },
+                    { rpm = 256, speed = 2.5110602793786714 } },
+            neg = { { rpm = 64, speed = 0.61033606106700145 },
+                    { rpm = 128, speed = 1.2651589843921371 },
+                    { rpm = 192, speed = 1.8606149814657091 },
+                    { rpm = 256, speed = 2.5977024951389889 } },
+        },
+        sides = { L = { side = "left" }, R = { side = "right" } },
+    }
     local function freshPID()
         return util.newPID(config.get("yawKp"), config.get("yawKi"),
             config.get("yawKd"), -1e6, 1e6, 50)
     end
-    local onHeading = flight.tankDemand(-0.3, freshPID(), plain, config.values, 0.15, 0)
-    near(math.abs(onHeading.diff), config.get("yawNearRpm"),
-        "a third of a degree out is worth the flat close in push, not the whole ship")
-    check(onHeading.diff < 0, "and it is pointed at the heading rather than away from it")
+    local cfg = config.values
+    for _, dt in ipairs({ 0.3, 0.6, 1.2 }) do
+        for _, err in ipairs({ -20, -0.4, 0, 0.4, 20 }) do
+            local d = flight.tankDemand(err, freshPID(), measured, cfg, dt, 0)
+            check(math.abs(d.rate) <= cfg.yawStepFraction * math.abs(err) / dt,
+                "a wanted rate cannot spend the error inside one sample")
+            check(d.floor <= cfg.yawFineBand / dt,
+                "the approach floor fits inside the fine band per sample")
+        end
+        for _, rate in ipairs({ -6, 6 }) do
+            local d = flight.tankDemand(0.1, freshPID(), measured, cfg, dt, rate)
+            check(d.diff * rate < 0 and math.abs(d.diff) == cfg.tankRpmMax,
+                "a fast swing through the fine band still gets full reverse")
+        end
+        for _, rate in ipairs({ -0.03, 0, 0.03 }) do
+            local resting = flight.tankDemand(0.1, freshPID(), measured, cfg, dt, rate)
+            check(resting.diff == 0 and resting.settled,
+                "a resting hull has a terminal state independent of drive or brake")
+        end
+        local escaping = flight.tankDemand(0.24, freshPID(), measured, cfg, dt, -0.12)
+        check(not escaping.settled and escaping.diff > 0,
+            "a slow hull coasting out of the fine band still gets a brake")
+        local blind = flight.tankDemand(0.1, freshPID(), measured, cfg, dt, nil)
+        check(not blind.settled, "a missing rate cannot certify a resting hull")
+    end
 
-    local arrived = flight.tankDemand(-0.1, freshPID(), plain, config.values, 0.15, 0)
-    check(arrived.diff == 0,
-        "inside the fine band the hull has arrived and is asked for nothing")
-
-    local nearer = flight.tankDemand(-4, freshPID(), plain, config.values, 0.15, 0)
-    near(math.abs(nearer.diff), config.get("yawNearRpm"),
-        "and four degrees out is worth exactly the same, because the band is flat")
-
-    local wider = flight.tankDemand(-20, freshPID(), plain, config.values, 0.15, 0)
-    check(math.abs(wider.diff) >= config.get("yawMidRpm"),
-        string.format("past the band the floor is yawMidRpm, %d rpm", math.abs(wider.diff)))
-
-    -- The shaping is on the push towards the heading and on nothing else. A
-    -- nose swinging through the fine band still gets the whole differential the
-    -- other way, or the band would be a place where the brakes come off.
-    local swinging = flight.tankDemand(-0.1, freshPID(), plain, config.values, 0.15, 6)
-    check(swinging.diff < 0,
-        "a nose swinging through the fine band is still given the propellers the other way")
-    check(math.abs(swinging.diff) > config.get("yawNearRpm"),
-        "and with more than the close in push, because stopping it is not a nudge")
-
-    -- == the push that overshot ==
-    -- One crossing of the bearing, and what it cost is what the next push is
-    -- held under. Without this the correction after an overshoot is aimed the
-    -- other way with the same authority, which is how one overshoot becomes four.
-    local swing = flight.newSwing()
-    local held = config.defaults()
-    held.yawOvershootRecover = 0
-    local pid = freshPID()
-    flight.tankDemand(20, pid, plain, held, 0.15, 0, swing)
-    local before = swing.push
-    check(before and before > 0, "the push on the way in is remembered")
-    flight.tankDemand(-20, pid, plain, held, 0.15, 0, swing)
-    check(swing.ceiling and swing.ceiling < before,
-        string.format("crossing the bearing writes down a ceiling under it, %.0f of %.0f",
-            swing.ceiling or -1, before or -1))
-    local after = flight.tankDemand(-20, pid, plain, held, 0.15, 0, swing)
-    near(math.abs(after.diff), swing.ceiling,
-        "and the push that follows is held to it")
-
-    -- The ceiling is not a punishment that lasts. It climbs back while the hull
-    -- stays on one side of the heading.
-    local low = swing.ceiling
-    for _ = 1, 20 do flight.easeSwing(1.0, config.values, swing) end
-    check(swing.ceiling > low, "a hull that has settled does not keep flying on it")
-    check(swing.ceiling <= config.get("tankRpmMax"), "and it never climbs past the maximum")
-
-    -- It never falls under the flat close in push, because that is the slowest
-    -- thing that still turns a hull.
-    local floored = flight.newSwing()
-    floored.side = 1
-    floored.push = 1
-    flight.markCrossing(-1, config.values, floored)
-    near(floored.ceiling, config.get("yawNearRpm"),
-        "a tiny push that overshot does not floor the ceiling at nothing")
+    -- These replace the flat near push and remembered crossing assertions.
+    -- A turn must reduce authority BEFORE a crossing and finish without needing
+    -- to earn a ceiling by overshooting first. Exercise the actual mixer,
+    -- integer RPM and its dead zone, not an ideal fractional actuator.
+    local function converge(period, initial, inertia, lag, variable, slew)
+        local pid = freshPID()
+        local err, rate, elapsed = initial, 0, 0
+        local first, quiet, stayed = nil, 0, true
+        local sent, pending, delay = 0, 0, 0
+        local top = 2.5977024951389889
+        local tau = top / measured.yawAccel * inertia
+        local previous, observedDt = {}, period
+        for step = 1, math.ceil(240 / period) do
+            local dt = variable and period * (step % 2 == 0 and 0.75 or 1.25) or period
+            local d = flight.tankDemand(err, pid, measured, cfg, observedDt, rate)
+            local mixed = flight.mix(0, d.diff, { "L", "R" }, measured, cfg)
+            if slew then mixed = flight.applySlew(previous, mixed, cfg.rpmSlew) end
+            observedDt = dt
+            previous = mixed
+            pending, delay = (mixed.L - mixed.R) / 2, lag
+            local remaining = dt
+            -- Small independent physics steps make delays and asymmetric
+            -- measured ladders visible without sharing the controller formula.
+            while remaining > 1e-9 do
+                local h = math.min(0.01, remaining)
+                if delay <= 0 then sent = pending end
+                delay = delay - h
+                local ladder = sent >= 0 and measured.yawCurve.pos or measured.yawCurve.neg
+                local target = util.curveSpeedAt(ladder, math.abs(sent)) * util.sign(sent)
+                local nextRate = rate + (target - rate) / tau * h
+                err = util.wrapAngle(err - (rate + nextRate) * h / 2)
+                rate = nextRate
+                remaining = remaining - h
+                if math.abs(err) <= cfg.yawFineBand then
+                    first = first or elapsed + dt - remaining
+                elseif first then
+                    stayed = false
+                end
+            end
+            elapsed = elapsed + dt
+            if mixed.L == 0 and mixed.R == 0 and math.abs(err) <= cfg.yawFineBand then
+                quiet = quiet + dt
+            else
+                quiet = 0
+            end
+            if quiet >= 30 then break end
+        end
+        local label = string.format("dt=%.1f start=%g inertia=%g lag=%.2f variable=%s slew=%s",
+            period, initial, inertia, lag, tostring(variable or false), tostring(slew or false))
+        check(first ~= nil, "measured hull reaches the fine band: " .. label)
+        check(stayed, "measured hull stays inside after entry: " .. label)
+        check(quiet >= 30, "mixed differential stays zero for 30 seconds: " .. label)
+        print(string.format("turn %s: entry %.2fs, quiet %.1fs, error %+.3f",
+            label, first or -1, quiet, err))
+    end
+    for _, dt in ipairs({ 0.3, 0.6, 1.2 }) do
+        converge(dt, 120, 1, 0)
+        converge(dt, -120, 1, 0)
+        converge(dt, 0.4, 1, 0)
+        converge(dt, -0.4, 1, 0)
+        converge(dt, 120, 1.5, 0.05)
+        converge(dt, 120, 1, 0.05, true)
+        converge(dt, 120, 1, 0.05, true, true)
+    end
 
     -- == pointing the front rather than the hull ==
     -- The align stage's whole job. A ship built back to front reads its own +Z
@@ -881,8 +937,7 @@ function tests.run()
     local cfg = {
         tankRpmMax = 256, tankRpmMin = 16, tankPadding = 2.0, tankHold = 2.0,
         tankHoldRate = 2.0, tankReentry = 25, yawRateMax = 30,
-        yawFineBand = 0.25, yawNearBand = 5.0, yawNearRpm = 64, yawMidRpm = 128,
-        yawOvershootEase = 0.6, yawOvershootRecover = 16, yawAccelAssumed = 1.0,
+        yawFineBand = 0.25, yawStepFraction = 0.5, yawAccelAssumed = 1.0, tick = 0.1,
         yawApproachMin = 0.5, yawBrakeSafety = 0.6, yawRateKp = 2.0,
         cruiseSpeed = 12, cruiseRampTime = 7.0, yawTrimThresh = 0.5, yawTrimRpm = 128,
         arriveDist = 1.0, brakeMargin = 1.3, brakeRpmMax = 256, pitchLimit = 12,
@@ -934,9 +989,9 @@ function tests.run()
     -- Not yawRateMax any more. Twenty degrees from the heading, on a ship with
     -- no measured deceleration, the approach profile is what decides the rate,
     -- and it decides on the assumption that stopping is slow.
-    near(demand.rate, flight.approachRate(20, cfg.yawAccelAssumed,
-        cfg.yawBrakeSafety, cfg.yawApproachMin),
-        "the wanted rate is what the approach profile allows at that error")
+    near(demand.rate, math.min(flight.approachRate(20, cfg.yawAccelAssumed,
+        cfg.yawBrakeSafety, cfg.yawApproachMin), demand.stepCap),
+        "the wanted rate obeys both the stopping profile and sample limit")
 
     pid:reset()
     demand = flight.tankDemand(-20, pid, calShip, cfg, 0.2)
