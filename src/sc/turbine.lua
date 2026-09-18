@@ -325,15 +325,19 @@ end
 --
 -- Thrust only. The balloon is what is holding the ship up and a stop is not a
 -- request to come down.
+--
+-- Stamped, like everything else on this protocol. It was not, for a while, and
+-- an unstamped stop is refused by a paired relay: the one message on the ship
+-- that must never be ignored was the one message that was.
 function turbine.stop()
     if not turbine.modem then return false end
     for name in pairs(turbine.demand) do turbine.demand[name] = 0 end
     if #turbine.order > 0 then
         for _, id in ipairs(turbine.order) do
-            rednet.send(id, { cmd = "stop" }, turbine.PROTOCOL)
+            rednet.send(id, link.stamp({ cmd = "stop" }), turbine.PROTOCOL)
         end
     else
-        rednet.broadcast({ cmd = "stop" }, turbine.PROTOCOL)
+        rednet.broadcast(link.stamp({ cmd = "stop" }), turbine.PROTOCOL)
     end
     turbine.sentAt = os.clock()
     return true
@@ -341,7 +345,7 @@ end
 
 function turbine.ping()
     if not turbine.modem then return false, "no modem on this computer" end
-    rednet.broadcast({ cmd = "ping" }, turbine.PROTOCOL)
+    rednet.broadcast(link.stamp({ cmd = "ping" }), turbine.PROTOCOL)
     return true
 end
 

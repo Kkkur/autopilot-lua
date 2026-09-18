@@ -522,6 +522,20 @@ local function screenLoop()
     end
 end
 
+-- Answering the installer's ping, for as long as this relay runs rather than
+-- only while the wizard is on its screen. See link.lua for why: a relay that
+-- stopped answering the moment it rebooted is a relay that is powered, running
+-- and deaf, and the pilot's only way back was reinstalling all four computers.
+local function pairLoop()
+    link.respond("fuel", function(kind, id, why)
+        if kind == "answered" then
+            log.debugf("pair ping from %d, answered", id)
+        else
+            log.warnf("pair ping from %d refused: %s", id, tostring(why))
+        end
+    end)
+end
+
 local function idleLoop()
     while true do sleep(60) end
 end
@@ -530,7 +544,8 @@ log.info("relay running")
 
 local ok, err = pcall(parallel.waitForAny, sampleLoop, screenLoop,
     modemSide and sendLoop or idleLoop,
-    modemSide and answerLoop or idleLoop)
+    modemSide and answerLoop or idleLoop,
+    modemSide and pairLoop or idleLoop)
 
 term.setBackgroundColour(colours.black)
 term.setTextColour(colours.white)

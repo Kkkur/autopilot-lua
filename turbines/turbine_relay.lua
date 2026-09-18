@@ -704,6 +704,24 @@ local function screenLoop()
     end
 end
 
+-- Answering the installer's ping, for as long as this relay runs rather than
+-- only while the wizard is on its screen. See link.lua for why: a relay that
+-- stopped answering the moment it rebooted is a relay that is powered, running
+-- and deaf, and the pilot's only way back was reinstalling all four computers.
+--
+-- The role reported is the one this relay worked out for itself from its own
+-- peripherals, so the checklist on the flight computer says what each computer
+-- believes it is rather than what somebody typed.
+local function pairLoop()
+    link.respond(balloonRelay and "cruise" or "turbine", function(kind, id, why)
+        if kind == "answered" then
+            log.debugf("pair ping from %d, answered", id)
+        else
+            log.warnf("pair ping from %d refused: %s", id, tostring(why))
+        end
+    end)
+end
+
 local function idleLoop()
     while true do sleep(60) end
 end
@@ -712,7 +730,8 @@ log.info("turbine relay running")
 
 local ok, err = pcall(parallel.waitForAny, screenLoop, eventLoop, deadmanLoop,
     modemSide and reportLoop or idleLoop,
-    modemSide and commandLoop or idleLoop)
+    modemSide and commandLoop or idleLoop,
+    modemSide and pairLoop or idleLoop)
 
 -- Ctrl+T raises Terminated again on the next yield, and setTargetSpeed yields,
 -- so the stop has to survive being interrupted or the turbines keep spinning

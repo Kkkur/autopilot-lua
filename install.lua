@@ -9,10 +9,14 @@
 --
 -- Then it pairs. The flight computer sets the passcode, takes the ids of the
 -- other three and pings each one until all three have answered. Every other
--- computer takes the same word, shows its own id and waits to be pinged. A
--- relay answers a ping only when its own passcode matches, which is what makes
--- the checklist mean that both ends typed the same word rather than that both
--- are powered.
+-- computer takes the same word, shows its own id and answers pings. A relay
+-- answers only when its own passcode matches, which is what makes the checklist
+-- mean that both ends typed the same word rather than that both are powered.
+--
+-- **The asking and the answering both live in sc/link.lua**, and the relay
+-- programs run the same responder for as long as they run. So the order the
+-- four computers are installed in does not matter and neither does which
+-- screen is up: a relay that has rebooted into its own program still answers.
 --
 -- **Pairing happens after the download, never before.** This file has no
 -- business carrying a second copy of the link.cfg format. It installs
@@ -29,10 +33,6 @@
 local OWNER, REPO, BRANCH = "Kkkur", "autopilot-lua", "master"
 local RAW = "https://raw.githubusercontent.com/" .. OWNER .. "/" .. REPO .. "/" .. BRANCH .. "/"
 local STAMP = "starcatcher_version.txt"
-
--- Pairing has its own protocol. The two flight protocols carry orders, and a
--- computer that is still being installed has no business hearing those.
-local PAIR = "starcatcher-pair"
 
 -- The three the flight computer collects, in the order the checklist shows
 -- them. The names are the manifest's role names, so what is typed at the
@@ -252,12 +252,15 @@ end
 -- The flight computer's half. It does not continue until all three have
 -- answered, on purpose: a ship whose link.peers is short is a ship that flies
 -- with a part of itself deaf, and nothing downstream would say so.
+--
+-- The asking is link.sweep's, not this file's, so the installer and the `ping`
+-- command on the flight computer ask the same question in the same words.
 local function pairCommand(link, modem)
     local peers, taken = {}, {}
     print("")
-    print("Now the other three. Install them first and leave each at its waiting")
-    print("screen: a relay that has already rebooted is running the relay program")
-    print("and is no longer listening for a ping.")
+    print("Now the other three. Install them first. They answer a ping from their")
+    print("waiting screen and they go on answering once they have rebooted, so the")
+    print("order they were installed in does not matter.")
     print("")
     for _, role in ipairs(PEER_ROLES) do
         peers[role] = askPeerId(role, taken)
@@ -275,8 +278,9 @@ local function pairCommand(link, modem)
         for i, role in ipairs(PEER_ROLES) do
             term.setCursorPos(1, top + i - 1)
             term.clearLine()
+            local said = answered[role]
             write(string.format("  %-8s #%-4d %s", role, peers[role],
-                answered[role] and "here" or "waiting"))
+                said and ("here, says it is the " .. said) or "waiting"))
         end
         term.setCursorPos(1, top + #PEER_ROLES)
         term.clearLine()
@@ -286,35 +290,31 @@ local function pairCommand(link, modem)
     redraw()
 
     while true do
-        local waiting = 0
+        local asking = {}
         for _, role in ipairs(PEER_ROLES) do
-            if not answered[role] then
-                waiting = waiting + 1
-                rednet.send(peers[role], link.stamp({ kind = "ping", role = role }), PAIR)
-            end
+            if not answered[role] then asking[#asking + 1] = peers[role] end
         end
-        if waiting == 0 then break end
+        if #asking == 0 then break end
 
-        local deadline = os.clock() + 2
-        while os.clock() < deadline do
-            local id, message = rednet.receive(PAIR, deadline - os.clock())
-            if not id then break end
-            local allowed, why = link.check(id, message)
-            if not allowed then
-                redraw(why)
-            elseif type(message) == "table" and message.kind == "here" then
-                local hit = nil
-                for _, role in ipairs(PEER_ROLES) do
-                    if peers[role] == id then hit = role end
+        local replies, refusals = link.sweep(asking, 2)
+        local note = nil
+        for _, role in ipairs(PEER_ROLES) do
+            local id = peers[role]
+            if replies[id] then
+                answered[role] = replies[id]
+                -- Worth saying rather than swallowing. A computer that answers
+                -- to the cruise slot calling itself the turbine relay is a
+                -- redstone relay on the wrong computer, and it is far cheaper
+                -- to read that here than out of a balloon that never moves.
+                if replies[id] ~= role then
+                    note = string.format("#%d answered the %s slot calling itself the %s",
+                        id, role, replies[id])
                 end
-                if hit then
-                    answered[hit] = true
-                    redraw()
-                else
-                    redraw("#" .. id .. " answered and is not one of the three")
-                end
+            elseif refusals[id] then
+                note = refusals[id]
             end
         end
+        redraw(note)
     end
 
     rednet.close(modem)
@@ -324,41 +324,28 @@ local function pairCommand(link, modem)
     print("All three answered to the same passcode. The ship is paired.")
 end
 
--- Every other computer's half. It answers pings for as long as the pilot leaves
--- this screen up, because the flight computer may be installed last and may be
--- retried, and a relay that answered once and stopped listening looks from the
--- other end exactly like a relay that never heard.
+-- Every other computer's half, and it is the same responder the relay program
+-- itself runs from now on. The wizard's screen is no longer the only window in
+-- which a relay can be found: leaving this screen up is polite, not required.
 local function pairRelay(link, modem, role)
     rednet.open(modem)
     print("")
-    print("Waiting to be pinged by the flight computer. Leave this screen up")
-    print("until it says it has all three, then press Enter.")
+    print("Waiting to be pinged by the flight computer. This relay answers from")
+    print("here and goes on answering once it has rebooted, so press Enter")
+    print("whenever you like.")
     print("")
 
-    local seen = {}
-    local function listen()
-        while true do
-            local id, message = rednet.receive(PAIR)
-            local allowed, why = link.check(id, message)
-            if not allowed then
-                print("  refused: " .. why)
-            elseif type(message) == "table" and message.kind == "ping" then
-                rednet.send(id, link.stamp({
-                    kind = "here",
-                    role = role,
-                    id = os.getComputerID(),
-                }), PAIR)
-                if not seen[id] then
-                    seen[id] = true
+    parallel.waitForAny(
+        function()
+            link.respond(role, function(kind, id, why)
+                if kind == "answered" then
                     print("  answered the flight computer, #" .. id)
-                    link.peers = { command = id }
-                    link.save()
+                else
+                    print("  refused a ping from #" .. id .. ": " .. tostring(why))
                 end
-            end
-        end
-    end
-
-    parallel.waitForAny(listen, function() read() end)
+            end)
+        end,
+        function() read() end)
     rednet.close(modem)
 end
 

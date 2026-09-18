@@ -19,8 +19,8 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.9.1",
-    note = "stage 9: the installer pairs, and two relays no longer fight over one rednet hostname",
+    version = "0.9.2",
+    note = "stage 9: every relay answers a ping for as long as it runs, not only in the wizard",
 
     roles = {
         -- The flight computer. Carries CC: Sable and a modem, owns the maths

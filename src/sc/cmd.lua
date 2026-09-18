@@ -346,6 +346,77 @@ define("passcode", {
     end,
 })
 
+-- Asks each computer on the ship to answer for itself. Everything else on this
+-- screen is inferred from messages that arrive on their own: a relay reads as
+-- lost when its broadcasts stop, which it also does when a chunk unloads, when
+-- a modem is broken and when somebody typed a different passcode. This is the
+-- one question with a direct answer, and the answer names the role the relay
+-- believes it has, so a redstone relay on the wrong computer shows up here
+-- rather than in a balloon that never moves.
+define("ping", {
+    aliases = { "peers" },
+    usage = "ping | ping <id> ...",
+    help = "Ask each computer on this ship to answer for itself.",
+    run = function(args)
+        if not turbine.modem then
+            return "no modem on this computer, so there is nobody to ask", "bad"
+        end
+
+        local ids, where = {}, {}
+        if #args > 0 then
+            for _, word in ipairs(args) do
+                local id = tonumber(word)
+                if not id then return "a computer id is a number: ping 1 2 3", "bad" end
+                ids[#ids + 1] = id
+                where[id] = "asked for"
+            end
+        else
+            for role, id in pairs(link.peers or {}) do
+                if role ~= "command" and type(id) == "number" then
+                    ids[#ids + 1] = id
+                    where[id] = role
+                end
+            end
+            -- A ship installed before the wizard wrote its peers down still has
+            -- relays talking to it, so the next best list is whoever has spoken.
+            if #ids == 0 then
+                for _, id in ipairs(turbine.order) do
+                    ids[#ids + 1] = id
+                    where[id] = "heard from"
+                end
+            end
+            if #ids == 0 then
+                return "no peers written down and no relay has spoken. Try `ping 1 2 3`", "warn"
+            end
+            table.sort(ids)
+        end
+
+        local answers, refusals = link.sweep(ids, 2)
+        local said, quiet, refused = {}, {}, {}
+        for _, id in ipairs(ids) do
+            if answers[id] then
+                said[#said + 1] = string.format("#%d %s", id, answers[id])
+            elseif refusals[id] then
+                refused[#refused + 1] = string.format("#%d", id)
+            else
+                quiet[#quiet + 1] = string.format("#%d %s", id, where[id] or "")
+            end
+        end
+
+        if #quiet == 0 and #refused == 0 then
+            return "answered: " .. table.concat(said, ", "), "good"
+        end
+        local parts = {}
+        if #said > 0 then parts[#parts + 1] = "answered " .. table.concat(said, ", ") end
+        if #refused > 0 then
+            parts[#parts + 1] = "wrong passcode at " .. table.concat(refused, ", ")
+        end
+        if #quiet > 0 then parts[#parts + 1] = "no answer from " .. table.concat(quiet, ", ") end
+        log.warn("ping: " .. table.concat(parts, "; "))
+        return table.concat(parts, "; "), "bad"
+    end,
+})
+
 -- == CALIBRATION =============================================
 
 define("cal", {

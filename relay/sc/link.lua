@@ -128,6 +128,96 @@ function link.check(id, message)
     return true
 end
 
+-- == THE PAIRING PROTOCOL ====================================
+--
+-- Its own protocol, `starcatcher-pair`, carrying two messages: a ping, and the
+-- answer to one. A computer being installed has no business hearing an order,
+-- and a ping is not an order.
+--
+-- **Every program on this ship answers a ping, not only the installer.** The
+-- first version lived inside the wizard, and a relay therefore answered only
+-- while the wizard was on its screen. So any one of the four computers being
+-- switched off or rebooted in the middle of a setup left the others pinging a
+-- relay that was powered, running, wired and deaf, with no way back but
+-- reinstalling all four. The responder now runs for as long as the relay runs,
+-- which means the checklist asks a question about the ship rather than a
+-- question about which screen somebody is standing in front of.
+--
+-- Answering is reporting, and reporting is what a relay is allowed to do. There
+-- is nothing here that commands anything.
+
+link.PAIR = "starcatcher-pair"
+link.answered = 0       -- pings answered since boot
+link.pingedBy = nil     -- the last computer to ask
+link.pingedAt = nil     -- when, so a screen can say how long ago
+
+function link.hello(role)
+    return { kind = "here", role = role, id = os.getComputerID() }
+end
+
+-- The reply to one ping, or nil and the reason it was refused. Split out from
+-- the loop so the answering rule can be checked on a computer with no modem.
+function link.answer(role, id, message)
+    if type(message) ~= "table" or message.kind ~= "ping" then return nil end
+    local allowed, why = link.check(id, message)
+    if not allowed then return nil, why end
+
+    link.answered = link.answered + 1
+    link.pingedBy, link.pingedAt = id, os.clock()
+
+    -- Who asked is worth keeping. It is how a relay knows which computer is
+    -- flying it, and it is written down the first time rather than every time,
+    -- because a disk write a second is a disk write a second.
+    if link.peers == nil or link.peers.command ~= id then
+        link.peers = link.peers or {}
+        link.peers.command = id
+        link.save()
+    end
+
+    return link.stamp(link.hello(role))
+end
+
+-- A task, run under parallel beside everything else a relay does. It never
+-- returns, because a task that returns under waitForAny takes the program with
+-- it.
+function link.respond(role, onEvent)
+    while true do
+        local id, message = rednet.receive(link.PAIR)
+        local reply, why = link.answer(role, id, message)
+        if reply then
+            rednet.send(id, reply, link.PAIR)
+            if onEvent then pcall(onEvent, "answered", id) end
+        elseif why and onEvent then
+            pcall(onEvent, "refused", id, why)
+        end
+    end
+end
+
+-- The asking half. One round: ping everybody named, then listen for as long as
+-- it was given. It does not decide when to stop asking, because the installer
+-- must not stop and a pilot at a keyboard must, and that is not this file's
+-- decision to make.
+function link.sweep(ids, seconds)
+    local answers, refusals = {}, {}
+    for _, id in ipairs(ids) do
+        rednet.send(id, link.stamp({ kind = "ping" }), link.PAIR)
+    end
+    local deadline = os.clock() + (seconds or 2)
+    while true do
+        local left = deadline - os.clock()
+        if left <= 0 then break end
+        local id, message = rednet.receive(link.PAIR, left)
+        if not id then break end
+        local allowed, why = link.check(id, message)
+        if not allowed then
+            refusals[id] = why
+        elseif type(message) == "table" and message.kind == "here" then
+            answers[id] = message.role or "unnamed"
+        end
+    end
+    return answers, refusals
+end
+
 -- What the screen and the preflight checker read. `paired` is the question that
 -- matters, and `refused` is the one that explains a relay that seems to be
 -- there and seems to be deaf.

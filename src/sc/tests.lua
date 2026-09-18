@@ -1095,6 +1095,33 @@ function tests.run()
     check(mismatched.byId.passcode.text:find("#4") ~= nil, "naming the computer that sent it")
     link.pass, link.refused, link.refusedFrom = nil, 0, nil
 
+    -- == answering a ping ==
+    --
+    -- The rule, without the radio. What matters is that a ping is answered only
+    -- when the passcode agrees, that the answer names the role the answering
+    -- computer believes it has, and that nothing else on the protocol is
+    -- treated as a ping. This is the half of the pairing exchange that can be
+    -- checked on a computer with no modem.
+    link.pass, link.refused, link.answered, link.peers = "skyline", 0, 0, nil
+    local reply = link.answer("turbine", 0, { kind = "ping", pass = "skyline" })
+    check(reply ~= nil and reply.kind == "here", "a ping with the right passcode is answered")
+    check(reply.role == "turbine", "and the answer says what this computer believes it is")
+    check(reply.pass == "skyline", "and carries the passcode itself, so the asker can refuse it")
+    check(link.peers and link.peers.command == 0, "who asked is written down")
+
+    local refusedReply, refusedWhy = link.answer("turbine", 9, { kind = "ping", pass = "other" })
+    check(refusedReply == nil and refusedWhy ~= nil, "a ping with a different passcode is not answered")
+    check(link.answer("turbine", 0, { cmd = "set" }) == nil,
+        "and an order on the pairing protocol is not a ping")
+    check(link.answered == 1, "only the answered ones are counted")
+
+    -- An unpaired relay answers anything, which is the state every computer is
+    -- in before the wizard has been round it and is what lets a half installed
+    -- ship be found at all.
+    link.pass, link.peers = nil, nil
+    check(link.answer("fuel", 3, { kind = "ping" }) ~= nil, "an unpaired computer answers any ping")
+    link.pass, link.refused, link.answered, link.peers = nil, 0, 0, nil
+
     print(string.format("%d passed, %d failed", passed, failed))
     return failed == 0
 end
