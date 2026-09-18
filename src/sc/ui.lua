@@ -2124,8 +2124,13 @@ function ui.makeWizard(title)
     ctx.ask = function(question, opts)
         opts = opts or {}
         render()
-        local answer = readLineAt(H - 10 > 2 and H - 10 or 2,
-            (question ~= "" and question .. " " or ""), opts.default)
+        local inputY = H - 10 > 2 and H - 10 or 2
+        local questionRows = question ~= "" and wrapText(question, W - 4) or {}
+        local questionTop = math.max(2, inputY - #questionRows)
+        for index, part in ipairs(questionRows) do
+            line(questionTop + index - 1, " " .. part, C("accent"))
+        end
+        local answer = readLineAt(inputY, "", opts.default)
         if answer:lower() == "q" then abort = true end
         if answer == "" and opts.default then return opts.default end
         return answer

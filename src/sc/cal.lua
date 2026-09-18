@@ -1315,10 +1315,10 @@ end
 -- each other is a hull that was still swinging when it was read.
 
 local ROSE = {
-    { name = "north", from = 0 },   { name = "north east", from = 45 },
-    { name = "east", from = 90 },   { name = "south east", from = 135 },
-    { name = "south", from = 180 }, { name = "south west", from = 225 },
-    { name = "west", from = 270 },  { name = "north west", from = 315 },
+    { name = "north", from = 0 },   { name = "north east", from = -45 },
+    { name = "east", from = -90 },  { name = "south east", from = -135 },
+    { name = "south", from = 180 }, { name = "south west", from = 135 },
+    { name = "west", from = 90 },   { name = "north west", from = 45 },
 }
 
 -- Command a turn to a heading and hold it until the pilot says it has arrived.
