@@ -788,10 +788,12 @@ local function track(ctx, opts)
 
     if opts.apply then opts.apply() end
     -- The prompt that offered this rung is gone the moment it is running, and
-    -- the one that ends it takes its place.
+    -- the one that ends it takes its place. A stage whose rung is worth more
+    -- than the reading on the panel says so in `keepPrompt`, because that line
+    -- is the only text in front of a pilot with a finger on Enter.
     ctx.panel({ prompt = false })
 
-    local started = os.clock()
+    local started = util.now()
     local history = {}
     local lost = false
     -- The steepest the reading rose while the rung was coming up to speed. The
@@ -801,7 +803,7 @@ local function track(ctx, opts)
 
     local function sampler()
         while true do
-            local now = os.clock()
+            local now = util.now()
             local value = opts.read()
             if value == nil then
                 lost = true
@@ -834,7 +836,7 @@ local function track(ctx, opts)
                     moving = math.abs(value) >= floor,
                     floor = floor > 0 and floor or nil,
                     phase = math.abs(slope) <= stable and "steady" or "changing",
-                    keepPrompt = "[Enter] keeps this reading   q stops",
+                    keepPrompt = opts.keepPrompt or "[Enter] keeps this reading   q stops",
                 })
             end
 
@@ -872,14 +874,14 @@ local function cooldown(ctx, read, label, floor)
     if ctx.aborted() then return end
     floor = floor or config.get("calMinDrift")
     ship.allStop()
-    local started = os.clock()
+    local started = util.now()
     local function wait()
         while true do
             local value = read() or 0
             if math.abs(value) < floor then return end
             ctx.panel({
                 value = value, valueLabel = label, phase = "cooldown",
-                elapsed = os.clock() - started, slope = 0,
+                elapsed = util.now() - started, slope = 0,
                 steady = false, moving = true, floor = floor,
                 keepPrompt = "[Enter] goes on without waiting   q stops",
                 pitch = false, yawRate = false, drift = false, guess = false,
@@ -948,6 +950,14 @@ end
 -- either swings the nose or it does not. Those two readings are the whole
 -- stage: a line that pushes forward and swings the nose right is on the left
 -- side, because that is what being on the left side means.
+--
+-- The size of the swing is kept as well as its direction, and that is the part
+-- a pilot cannot guess from the screen. It becomes the side's yaw authority,
+-- and `flight.sideScales` holds the stronger side back to match the weaker one,
+-- so a rung ended early files a side as weak and the mixer spends the rest of
+-- the ship's life turning on one propeller. A pilot who already knows the sides
+-- still has to let each rung even out, and the stage now says so rather than
+-- looking like a handedness check that happens to take a while.
 local function stageSides(ctx)
     local names = ship.order
     if #names == 0 then
@@ -956,6 +966,10 @@ local function stageSides(ctx)
     end
 
     ctx.note(string.format("%d lines, one at a time. Give the ship clear air.", #names))
+    ctx.note("Each spin measures how hard that side turns the hull, not only which way. "
+        .. "That number is what the mixer splits a turn by, so let every rung run until "
+        .. "the swing is steady before you keep it. Ending one early files the side as "
+        .. "weak and the ship turns on one propeller from then on.", "warn")
     -- A propeller read against the ground is read against friction, and the
     -- line that came out of that was filed as pushing nothing at all.
     flyClear(ctx, "reading which side a line is on")
@@ -994,8 +1008,9 @@ local function stageSides(ctx)
             local speed, reason = track(ctx, {
                 apply = function() ship.driveOnly(name, config.get("calRpm")) end,
                 read = forwardSpeed,
+                keepPrompt = "[Enter] when the swing is steady   q stops",
                 live = function(live)
-                    yawRate = windowMean(yawHistory, ship.yawRateHeading() or 0, os.clock())
+                    yawRate = windowMean(yawHistory, ship.yawRateHeading() or 0, util.now())
                     drift = ship.bodyVelocity()
                     live.step = index
                     live.total = #names
@@ -1059,6 +1074,17 @@ local function stageSides(ctx)
                     if answer == "left" or answer == "right" then
                         auth[answer] = auth[answer] + math.abs(yawRate) / config.get("calRpm")
                         measured[answer] = true
+                        -- The wizard's own threshold for a hull that is not
+                        -- turning. A reading under it is still filed, because
+                        -- the pilot asked for it to be, but it is worth saying
+                        -- that the authority it just became is noise.
+                        if math.abs(yawForward) < minYaw then
+                            ctx.note(string.format(
+                                "%s swung %.2f deg/s, under the %.2f this counts as turning at all. "
+                                .. "Its side is filed, but the authority off it is noise. "
+                                .. "Spin it again with clear air and let it even out.",
+                                util.shortName(name), math.abs(yawForward), minYaw), "warn")
+                        end
                     end
                     if answer == "main" and drift then
                         -- Where the nose actually points. The main is the only
@@ -1097,6 +1123,23 @@ local function stageSides(ctx)
     if cal.yawAuth.left and cal.yawAuth.right then
         ctx.note(string.format("yaw authority  left %.4f  right %.4f deg/s per rpm",
             cal.yawAuth.left, cal.yawAuth.right))
+        -- What the mixer is about to do with those two numbers, in the RPM the
+        -- pilot will read off the PROPS tab. A pair that came out lopsided is
+        -- invisible as two small decimals and obvious as this.
+        local scaleL, scaleR = flight.sideScales(cal.yawAuth.left, cal.yawAuth.right)
+        local top = config.get("maxRpm")
+        ctx.note(string.format(
+            "so a full turn is %d rpm one side against %d the other. "
+            .. "The weaker side is turned up all the way and the stronger held back to "
+            .. "match it, which is how the hull turns without crabbing.",
+            util.round(top * scaleL), util.round(top * scaleR)),
+            math.min(scaleL, scaleR) < 0.5 and "warn" or nil)
+        if math.min(scaleL, scaleR) < 0.5 then
+            ctx.note("Two sides of the same hull do not differ by that much. "
+                .. "One of the rungs above was kept before the hull had finished swinging. "
+                .. "Run this stage again with clear air, or set the two authorities equal "
+                .. "by hand, and measure the yaw ladder after it.", "warn")
+        end
     end
     return true
 end
@@ -1450,7 +1493,7 @@ local function turnTo(ctx, want, label)
     local pid = util.newPID(config.get("yawKp"), config.get("yawKi"),
         config.get("yawKd"), -1e6, 1e6, 50)
     local tol = config.get("calAlignTol")
-    local started = os.clock()
+    local started = util.now()
     local last = started
     -- The turn is traced once a second rather than once a sample, because the
     -- point is to read the numbers back afterwards and a pilot who leaves the
@@ -1461,13 +1504,13 @@ local function turnTo(ctx, want, label)
 
     local function drive()
         while true do
-            local readAt = os.clock()
+            local readAt = util.now()
             local state = ship.readState()
             if not state then
                 ctx.note("lost the pose mid turn", "bad")
                 return
             end
-            local now = os.clock()
+            local now = util.now()
             local dt = now - last
             if dt <= 0 then dt = config.get("calSample") end
             last = now
@@ -1477,10 +1520,10 @@ local function turnTo(ctx, want, label)
             -- The rate the hull is actually turning at, which is what lets the
             -- turn stop rather than coast through the heading.
             local rate = ship.yawRate()
-            local rateAt = os.clock()
+            local rateAt = util.now()
             local demand = flight.tankDemand(err, pid, cal, cfg(), dt, rate)
             ship.flush(flight.mix(0, demand.diff, ship.order, cal, cfg()))
-            local sentAt = os.clock()
+            local sentAt = util.now()
 
             -- Trace cadence is not control cadence. Print dt explicitly and
             -- time the reads and send so a world log can locate the delay.
@@ -2016,12 +2059,12 @@ local function brakeRun(ctx, which, rpm, label)
     local turbines = which == "all" and -rpm or 0
     ship.flush(flight.mixParts(-rpm, turbines, 0, ship.order, cal, cfg()))
 
-    local started = os.clock()
+    local started = util.now()
     local worstPitch, v, elapsed = 0, v0, 0
 
     local function run()
         while true do
-            local now = os.clock()
+            local now = util.now()
             elapsed = now - started
             local speed = forwardSpeed()
             if not speed then return end
