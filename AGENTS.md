@@ -233,7 +233,12 @@ The existing code is the specification for new code. Match it.
   the mirror filing is byte for byte the same file as a correct one. Anything
   that changes handedness calls `cal.sidesChanged`, every curve is stamped with
   `cal.curveMeasured`, and a stage only resumes a curve when
-  `cal.curveCurrent` says so.
+  `cal.curveCurrent` says so. Resuming is not the only consumer: heading turns
+  require `cal.yawReady`, which checks the current filing and usable ladders in
+  both directions. A stale turn offers the yaw stage before driving. Starting
+  a new yaw filing clears both old directions; resuming a current one keeps
+  its measured acceleration. Alignment control and calibration derivatives
+  use game seconds even though their elapsed displays use real seconds.
 - A ladder stage is a list of rungs through `walkLadder`, not its own loop.
   Each rung is written down as it is kept and a stage reopens on what it
   already measured, so a run stopped halfway is finished rather than redone.

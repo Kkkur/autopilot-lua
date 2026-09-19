@@ -401,6 +401,35 @@ function cal.curveMeasured(which)
     cal.curveRev[which] = cal.sidesRev or 0
 end
 
+-- Magnitudes cannot prove handedness. Only a signed yaw measurement made
+-- through the current filing can authorize a closed-loop turn.
+function cal.yawReady()
+    if not cal.curveCurrent("yaw") then
+        return false, "yaw ladder was not measured with the current sides"
+    end
+    for _, way in ipairs({ "pos", "neg" }) do
+        local ladder = cal.yawCurve and cal.yawCurve[way]
+        if not ladder or #ladder == 0 then
+            return false, "yaw ladder has no " .. way .. " direction measurement"
+        end
+        local last = 0
+        for _, rung in ipairs(ladder) do
+            if rung.speed <= 0 or rung.speed < last then
+                return false, "yaw " .. way .. " ladder falls at " .. rung.rpm .. " rpm"
+            end
+            last = rung.speed
+        end
+    end
+    return true
+end
+
+function cal.prepareYaw()
+    if not cal.curveCurrent("yaw") then
+        -- Stamping the first new rung must not certify the other old direction.
+        cal.yawCurve, cal.yawAccel = {}, nil
+    end
+end
+
 -- The sides stage decides handedness from one reading per line, and one
 -- reading is enough to get it backwards: a line read while the physics engine
 -- was reporting nothing, or a hull that was still swinging from the line
@@ -687,7 +716,9 @@ function cal.summary()
                     #cal.balloonCurve, cal.altHover)
             end
         elseif stage.id == "yaw" then
-            row.done = cal.yawCurve ~= nil
+            local ready, why = cal.yawReady()
+            row.done = ready
+            if not ready then row.detail = why end
             if row.done then
                 row.detail = string.format("top %.1f deg/s%s%s", cal.topYawRate() or 0,
                     cal.yawAccel and string.format(", %.1f deg/s/s", cal.yawAccel) or "",
@@ -863,11 +894,12 @@ local function track(ctx, opts)
             end
 
             windowMean(history, value, now)
+            history[#history].physics = os.clock()
 
             local slope = 0
             if #history >= 2 then
                 local a, b = history[1], history[#history]
-                local span = b.t - a.t
+                local span = b.physics - a.physics
                 if span > 0.2 then slope = (b.v - a.v) / span end
             end
 
@@ -1107,12 +1139,14 @@ local function walkLadder(ctx, opts)
             -- a question nobody is there to answer, so unattended says what it
             -- found and leaves the rung untaken.
             if reason == "went the wrong way" and opts.onWrongWay then
+                ship.allStop()
                 if auto then
                     ctx.note(string.format("%s went the wrong way. Left untaken: "
                         .. "which way round the sides are filed is not a question "
                         .. "an unattended run may answer.", rung.label), "bad")
                 else
                     again = opts.onWrongWay(rung, value) and not ctx.aborted()
+                    if again then taken = {} end
                     if again and opts.cooldownRead then
                         cooldown(ctx, opts.cooldownRead, opts.cooldownLabel, nil, auto)
                     end
@@ -1644,10 +1678,11 @@ local function stageYaw(ctx, auto)
 
     local ladder = cal.rpmLadder()
     local ways = config.get("calBothWays") and { 1, -1 } or { 1 }
+    local hadStale = cal.yawCurve and not cal.curveCurrent("yaw")
+    cal.prepareYaw()
     cal.yawCurve = cal.yawCurve or {}
-    -- Forgotten at the start of the run rather than kept and beaten, because
-    -- the largest rise ever seen on any ship is not a property of this one.
-    cal.yawAccel = nil
+    -- A resumed ladder keeps its measured acceleration too. Clearing it when
+    -- all rungs are resumed silently replaces a measurement with the fallback.
     -- The swap below is offered once, and only while the ladder has kept
     -- nothing this run, because the offer is about how the sides were filed and
     -- not about this rung. Past the first kept reading a hull that turns the
@@ -1699,8 +1734,7 @@ local function stageYaw(ctx, auto)
         cooldownRead = function() return ship.yawRateHeading() or 0 end,
         cooldownLabel = "yaw",
         auto = auto,
-        staleNote = cal.yawCurve and (cal.yawCurve.pos or cal.yawCurve.neg)
-            and not cal.curveCurrent("yaw")
+        staleNote = hadStale
             and "there is a yaw ladder on file, but it was measured with the sides filed "
                 .. "differently, so every rung in it names a turn this ship now makes the "
                 .. "other way. It is being measured again from the bottom."
@@ -1741,6 +1775,8 @@ local function stageYaw(ctx, auto)
                 return false
             end
             local moved = cal.swapSides()
+            held = { pos = {}, neg = {} }
+            cal.prepareYaw()
             cal.save()
             ctx.note(string.format(
                 "%d lines swapped over, and the authorities with them", moved), "good")
@@ -1886,13 +1922,32 @@ end
 -- Nothing here ends on a clock or on an arrival. A hull that has not begun to
 -- turn yet sits exactly on the heading it started from, and a wizard that took
 -- that for an arrival would file the ship as pointing wherever it was parked.
-local function turnTo(ctx, want, label)
+function cal.turnTo(ctx, want, label)
     if ctx.aborted() then return nil, "stopped" end
+    local ready, why = cal.yawReady()
+    if not ready then
+        ship.allStop()
+        ctx.note(why .. ". The yaw stage must verify the turn direction first.", "bad")
+        if not ctx.yesno("Measure yaw before turning to a heading?", true) then
+            return nil, why
+        end
+        stageYaw(ctx, false)
+        if ctx.aborted() then return nil, "stopped" end
+        ready, why = cal.yawReady()
+        if not ready then
+            ctx.note(why .. ". No heading turn was started.", "bad")
+            return nil, why
+        end
+        -- The yaw stage restores hover on exit. Regain clearance before the
+        -- enclosing stage resumes its turn rather than turning on that descent.
+        flyClear(ctx, "turning to a heading")
+        if ctx.aborted() then return nil, "stopped" end
+    end
     local pid = util.newPID(config.get("yawKp"), config.get("yawKi"),
         config.get("yawKd"), -1e6, 1e6, 50)
     local tol = config.get("calAlignTol")
     local started = util.now()
-    local last = started
+    local last = os.clock()
     -- The turn is traced once a second rather than once a sample, because the
     -- point is to read the numbers back afterwards and a pilot who leaves the
     -- ship sitting on a point would otherwise fill the log with one heading.
@@ -1909,9 +1964,12 @@ local function turnTo(ctx, want, label)
                 return
             end
             local now = util.now()
-            local dt = now - last
+            -- Rates and the hull evolve on game ticks; wall time belongs only
+            -- to the display and diagnostics, even on a lagging server.
+            local physicsNow = os.clock()
+            local dt = physicsNow - last
             if dt <= 0 then dt = config.get("calSample") end
-            last = now
+            last = physicsNow
 
             pose = state.yaw
             err = util.wrapAngle(want - pose)
@@ -2023,10 +2081,11 @@ local function stageAlign(ctx)
             local label = string.format("point %d of %d, %s, front to %+.1f (hull to %+.1f)",
                 index, #ROSE, point.name, want, aim)
 
-            local pose, reason, missed = turnTo(ctx, aim, label)
+            local pose, reason, missed = cal.turnTo(ctx, aim, label)
             if ctx.aborted() then break end
             if not pose then
                 ctx.note(string.format("%s: %s", point.name, tostring(reason)), "warn")
+                if reason ~= "skipped" then return false end
                 break
             end
 
@@ -2177,10 +2236,12 @@ local function stageCruise(ctx)
 
     flyClear(ctx, "the cruise leg")
 
-    local pose = turnTo(ctx, north, string.format("lining up on north, %+.1f", north))
+    local pose = cal.turnTo(ctx, north, string.format("lining up on north, %+.1f", north))
     if ctx.aborted() then return false end
     if pose then
         ctx.note(string.format("lined up, the hull reads %+.1f", pose))
+    else
+        return false
     end
 
     local start = ship.readState()

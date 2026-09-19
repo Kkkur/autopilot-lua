@@ -440,6 +440,8 @@ local wrapped = {}
 --   brake    the main is 0.012 of that 0.030, and pitch is 2.08 deg per m/s/s
 --   balloon  (3.2 * level / 15 - 1.6) / 0.9, which crosses zero near 7.5
 files["starcatcher/cal.cfg"] = [[{
+  sidesRev = 0,
+  curveRev = { yaw = 0, fwd = 0, brake = 0 },
   sides = {
     ["2:Create_RotationSpeedController_0"] = { side = "left",  reverse = false },
     ["2:Create_RotationSpeedController_1"] = { side = "left",  reverse = false },

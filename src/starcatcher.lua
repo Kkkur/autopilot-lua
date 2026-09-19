@@ -77,7 +77,7 @@ if ARGS[1] == "--test" or ARGS[1] == "-t" then
     local shipModule = loadModule("ship", util, config)
     local turbineModule = loadModule("turbine", util, shipModule, config, stubLog, linkModule)
     local tests = loadModule("tests", util, config, calModule, fuelModule,
-        turbineModule, shipModule, flightModule, preflightModule, popupModule, linkModule)
+        turbineModule, shipModule, flightModule, preflightModule, popupModule, linkModule, stubShip)
     return tests.run() and 0 or 1
 end
 

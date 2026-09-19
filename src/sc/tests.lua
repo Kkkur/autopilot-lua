@@ -6,7 +6,7 @@
 -- No ship, no peripherals, no modem. These verify the stated model and
 -- contracts; the real hull still has to validate their assumptions.
 
-local util, config, cal, fuel, turbine, ship, flight, preflight, popup, link = ...
+local util, config, cal, fuel, turbine, ship, flight, preflight, popup, link, calibrationShip = ...
 
 local tests = {}
 
@@ -664,6 +664,99 @@ function tests.run()
     check(not cal.curveCurrent("yaw"), "and a swap of the sides is such a change")
     cal.sides = savedSides
     cal.sidesRev, cal.curveRev = savedRev, savedCurveRev
+
+    do
+        local saved = { cal.yawCurve, cal.yawAccel, cal.sidesRev, cal.curveRev }
+        local positive = { { rpm = 64, speed = 0.647 }, { rpm = 256, speed = 2.485 } }
+        local negative = { { rpm = 64, speed = 0.602 }, { rpm = 192, speed = 1.836 },
+                           { rpm = 256, speed = 0.139 } }
+        cal.yawCurve = { pos = positive, neg = negative }
+        cal.sidesRev, cal.curveRev = 0, {}
+        check(not cal.yawReady(), "legacy unsigned ladders cannot authorize an align turn")
+        cal.curveMeasured("yaw")
+        local ready, why = cal.yawReady()
+        check(not ready and why:find("neg") and why:find("256"),
+            "the live reverse ladder's collapsed top rung is named and rejected")
+        cal.yawCurve.neg = positive
+        cal.yawAccel = 2.626
+        check(cal.yawReady(), "both directions measured with these sides authorize the turn")
+        cal.prepareYaw()
+        near(cal.yawAccel, 2.626, "resuming a current ladder keeps its acceleration")
+        cal.sidesChanged()
+        check(not cal.yawReady(), "refiling sides invalidates use as well as resume")
+        cal.prepareYaw()
+        check(next(cal.yawCurve) == nil and cal.yawAccel == nil,
+            "fresh yaw measurement discards both stale directions and their acceleration")
+        cal.yawCurve.pos = positive
+        cal.curveMeasured("yaw")
+        check(not cal.yawReady(), "one new direction cannot certify the other old direction")
+
+        -- The signed single-line responses in log_7, not the mirror convention
+        -- that two synthetic modules could accidentally agree on.
+        local oldSides, oldAuth = cal.sides, cal.yawAuth
+        cal.sides = { a = { side = "right", reverse = true },
+                      b = { side = "left", reverse = true } }
+        cal.yawAuth = {}
+        local function observedRate()
+            local rpm = flight.mix(0, 128, { "a", "b" }, cal, config.values)
+            return rpm.a * (-0.68 / 128) + rpm.b * (0.64 / 128)
+        end
+        check(observedRate() < 0, "the logged filing turns opposite to positive differential")
+        cal.swapSides()
+        check(observedRate() > 0, "the measured side swap restores positive yaw authority")
+        check(not cal.yawReady(), "the repair still requires a new signed ladder")
+        cal.sides, cal.yawAuth = oldSides, oldAuth
+        cal.curveMeasured("yaw")
+
+        -- Exercise the real caller without the compass questions. Diverging
+        -- clocks expose the regression hidden by the desktop's normal clock.
+        local ship = calibrationShip
+        local oldRead, oldRate, oldFlush, oldStop = ship.readState, ship.yawRate,
+            ship.flush, ship.allStop
+        local oldClock, oldNow, oldParallel = os.clock, util.now, parallel
+        local oldDemand = flight.tankDemand
+        local game, wall, reads, commands, asked = 0, 100, 0, 0, 0
+        local periods, stopLoop = {}, {}
+        os.clock = function() return game end
+        util.now = function() return wall end
+        ship.readState = function()
+            reads = reads + 1
+            if reads > 2 then error(stopLoop) end
+            game, wall = game + 0.3, wall + 1.2
+            return { yaw = 0 }
+        end
+        ship.yawRate = function() return 0 end
+        ship.flush = function() commands = commands + 1 end
+        ship.allStop = function() end
+        flight.tankDemand = function(err, pid, c, cfg, dt, rate)
+            periods[#periods + 1] = dt
+            return oldDemand(err, pid, c, cfg, dt, rate)
+        end
+        parallel = { waitForAny = function(drive)
+            local ok, fault = pcall(drive)
+            if not ok and fault ~= stopLoop then error(fault) end
+        end }
+        local oldSleep = sleep
+        sleep = function() end
+        local ctx = {
+            aborted = function() return false end, note = function() end,
+            panel = function() end,
+            yesno = function() asked = asked + 1; return false end,
+        }
+        local blockedOk, pose = pcall(cal.turnTo, ctx, 0.4, "test")
+        check(blockedOk and pose == nil and commands == 0 and asked == 1,
+            "declining yaw repair sends no heading turn command")
+        cal.yawCurve.neg = positive
+        local ran, failure = pcall(cal.turnTo, ctx, 0.4, "test")
+        os.clock, util.now, parallel, sleep = oldClock, oldNow, oldParallel, oldSleep
+        ship.readState, ship.yawRate, ship.flush, ship.allStop = oldRead, oldRate, oldFlush, oldStop
+        flight.tankDemand = oldDemand
+        check(ran, "the align caller runs against the stubbed hull: " .. tostring(failure))
+        check(#periods == 2, "two real align control updates were exercised")
+        near(periods[1], 0.3, "align starts with game seconds, not wall seconds")
+        near(periods[2], 0.3, "server lag does not change align's physics time unit")
+        cal.yawCurve, cal.yawAccel, cal.sidesRev, cal.curveRev = table.unpack(saved)
+    end
 
     -- == a yaw rate the engine has stopped reporting ==
     -- getAngularVelocity is the last figure the physics engine published, and a
