@@ -2149,6 +2149,33 @@ function ui.makeWizard(title)
             y = flow(y, counter .. fields.rungLabel, C("hi"))
         end
 
+        -- Which rungs have a reading and which do not, green against red, with
+        -- the one the pilot is on inverted. A ladder is walked over several
+        -- minutes with the ship swinging underneath, and "have I done that one"
+        -- is not a question anybody should be answering from memory.
+        if fields.rungCells and fields.rungCells ~= false then
+            local x = 2
+            for _, cell in ipairs(fields.rungCells) do
+                local text = " " .. cell.label .. " "
+                if x + #text > W then break end
+                local colour = cell.taken and C("good") or C("bad")
+                at(x, y, text, cell.here and C("ink") or colour,
+                    cell.here and colour or C("bg"))
+                x = x + #text
+            end
+            at(1, y, " ", C("hi"), C("bg"))
+            if x <= W then at(x, y, string.rep(" ", W - x + 1), C("hi"), C("bg")) end
+            y = y + 1
+            y = flow(y, "green has a reading, red has none, the boxed one is where you are",
+                C("dim"))
+        end
+
+        -- Its own field, not `current`. The stage card draws `current` too, and
+        -- one name for two things put the rung's reading on the screen twice.
+        if fields.rungValue and fields.rungValue ~= false then
+            y = flow(y, "this rung already reads " .. fields.rungValue, C("good"))
+        end
+
         -- One live row, whatever the stage happens to be measuring. The label
         -- and the unit come with the reading, so a yaw rate is never drawn as
         -- metres per second.
@@ -2183,7 +2210,13 @@ function ui.makeWizard(title)
                 state, colour = "STILL CHANGING", C("dim")
             end
             at(1, y, " " .. state, colour, C("bg"))
-            at(W - 7, y, string.format("%5.1fs", fields.elapsed or 0), C("dim"), C("bg"))
+            -- Unattended, the number that matters is how long it has left
+            -- before it is kept anyway, not how long it has been going.
+            if fields.auto then
+                at(W - 9, y, string.format("%5.1fs left", fields.auto), C("accent"), C("bg"))
+            else
+                at(W - 7, y, string.format("%5.1fs", fields.elapsed or 0), C("dim"), C("bg"))
+            end
             y = y + 1
         end
 
@@ -2300,6 +2333,26 @@ function ui.makeWizard(title)
             if event == "key" then
                 if p1 == keys.enter then return end
                 if p1 == keys.q then abort = true; return end
+            elseif event == "term_resize" then
+                ui.resize(); render()
+            end
+        end
+    end
+
+    -- What the pilot pressed on a ladder's rung card, as a word rather than a
+    -- key code, so the wizard decides what a key means and cal decides what to
+    -- do about it. Arrows move between rungs, which is the whole reason this
+    -- exists: a rung kept by accident used to cost the entire ladder.
+    ctx.rungChoice = function()
+        while true do
+            local event, p1 = os.pullEvent()
+            if event == "key" then
+                if p1 == keys.enter then return "take" end
+                if p1 == keys.left or p1 == keys.up then return "left" end
+                if p1 == keys.right or p1 == keys.down then return "right" end
+                if p1 == keys.a then return "auto" end
+                if p1 == keys.d then return "done" end
+                if p1 == keys.q then abort = true; return "quit" end
             elseif event == "term_resize" then
                 ui.resize(); render()
             end

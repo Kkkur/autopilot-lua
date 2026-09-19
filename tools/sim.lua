@@ -980,38 +980,41 @@ local function typeLine(text)
 end
 
 if options.script == "cal" then
-    -- Walk the wizard with a pilot who agrees with everything and who waits
-    -- before agreeing.
-    --
-    -- Nothing in the wizard ends a rung by itself any more: every reading is
-    -- kept when the pilot presses Enter. So the script cannot count seconds of
-    -- settling, and counting rungs would be a second copy of the wizard's own
-    -- arithmetic that goes wrong the first time calSteps changes. It presses
-    -- Enter on a slow tick instead, which answers a prompt when there is a
-    -- prompt and keeps a reading when there is a reading.
-    --
-    -- The tick is what makes the measurement real. Ten seconds is far longer
-    -- than the toy ship needs to reach a demand, so every reading is taken
-    -- from a ship that has finished responding, which is the whole point of
-    -- the change being tested.
+    -- The wizard drives itself now, so this drives `cal auto` rather than
+    -- pretending to be a pilot pressing Enter on a slow tick. That is the
+    -- honest harness: what runs here is exactly what runs on the ship when
+    -- nobody is at the keyboard, rungs ending on their own flattening trend or
+    -- on calAutoSeconds, with every reading written down as it lands.
     --
     -- Nothing is on the network at boot. Every propeller on this ship is on a
     -- relay and they adopt about a second in, so a wizard started before that
     -- measures a ship with no propellers on it.
+    --
+    -- **align and cruise are not in an unattended run and cannot be.** Their
+    -- question is the degrees a pilot reads off F3, and no keyboard queued up
+    -- before the wizard starts has anything to say to it. What those stages
+    -- would compute from such readings is checked under `--test`, where the
+    -- readings are handed in directly.
     queueWait(60)
-    typeLine("cal")
+    typeLine("cal auto")
 
-    -- **The align stage is not answered here and cannot be.** Its question is
-    -- the degrees a pilot reads off F3, and this keyboard is queued up before
-    -- the wizard starts rather than reacting to what is on the screen, so it
-    -- has nothing to type. The stage ends having read nothing, says so, and
-    -- the run carries on to the next one. What it would have computed from
-    -- those readings is checked under `--test` instead, where the readings can
-    -- be handed in directly.
-    for _ = 1, 110 do
-        queueWait(285)
-        queueEvent("key", keys.enter)
-    end
+    -- Then the same ladder again, by hand, on a wizard that should now find
+    -- every rung already measured. This is what checks that a stage reopens on
+    -- its own readings rather than on an empty ladder: the rung card comes up
+    -- green across the strip, and [D] leaves without measuring anything, so the
+    -- curve the checks below read is still the one the unattended run wrote.
+    queueWait(5200)
+    typeLine("cal yaw")
+    queueWait(400)
+    queueEvent("key", keys.enter)     -- the stage card, run it
+    queueWait(600)
+    queueEvent("key", keys.right)     -- walk the strip without taking anything
+    queueWait(60)
+    queueEvent("key", keys.left)
+    queueWait(60)
+    queueEvent("key", keys.d)         -- done, keep what was already there
+    queueWait(400)
+    queueEvent("key", keys.enter)
 
 elseif options.script == "tabs" then
     -- Walk every tab and photograph each one, which is the cheapest way to

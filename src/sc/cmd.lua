@@ -421,24 +421,39 @@ define("ping", {
 
 define("cal", {
     aliases = { "calibrate" },
-    usage = "cal [sides|balloon|yaw|forward|brake]",
-    help = "Measure the ship. Five stages, each confirmed and each skippable.",
+    usage = "cal [auto|sides|balloon|yaw|align|forward|cruise|brake]",
+    help = "Measure the ship. `cal auto` runs the five measured stages alone.",
     run = function(args)
         local only = args[1] and args[1]:lower() or nil
+        -- `auto` is not a stage, so it is taken off the front before the name
+        -- is checked. `cal auto yaw` runs the one stage unattended.
+        local auto = false
+        if only == "auto" then
+            auto = true
+            only = args[2] and args[2]:lower() or nil
+        end
         if only and not cal.stageById(only) then
             return "the stages are sides, balloon, yaw, align, forward, cruise and brake", "warn"
+        end
+        if auto and (only == "align" or only == "cruise") then
+            return only .. " asks which end of the hull is the front, "
+                .. "which is the one thing no sensor here can answer. Run it yourself.", "warn"
         end
         -- Calibration is the one thing the gate never blocks. It is how a ship
         -- gets into a state the checker would pass in the first place.
         control.stop("CALIBRATING")
-        ui.runWizard(only and ("CALIBRATION: " .. only:upper()) or "CALIBRATION",
-            function(ctx)
-                cal.runWizard(ctx, only)
+        local title = only and ("CALIBRATION: " .. only:upper()) or "CALIBRATION"
+        if auto then title = title .. " (ALONE)" end
+        ui.runWizard(title, function(ctx)
+                cal.runWizard(ctx, only, auto)
                 ctx.clearFields()
-                ctx.note("done. Press Enter to go back.", "good")
+                ctx.note("done. Press [Enter] to go back.", "good")
                 ctx.waitEnter()
             end)
         ui.tab = ui.TAB.CAL
+        if auto then
+            return "calibration finished. The front is still owed: run `cal align`", "warn"
+        end
         return "calibration finished", "good"
     end,
 })

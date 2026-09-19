@@ -170,6 +170,45 @@ are not.
 setting names after `set` and `get`. The completion is shown greyed ahead of
 the cursor rather than applied silently.
 
+## Calibrating without standing there
+
+    cal          the wizard, stage by stage, with a pilot answering
+    cal auto     the five measured stages, alone
+    cal yaw      one stage
+    cal auto yaw one stage, alone
+
+`cal auto` ends each rung on its own: when the trend flattens, or after
+`calAutoSeconds`, whichever comes first. The flattening is gated behind
+`calAutoMin` because a hull that has not begun to move is perfectly steady at
+zero, and that is the mistake that once filed a balloon sweep of six strengths
+all reading no climb. Every question a stage would ask is answered with the
+thing the stage had already worked out: the sides stage takes its own guess,
+and a ladder that finds the ship turning the wrong way leaves the rung untaken
+rather than asking which way round the sides are filed.
+
+**`align` and `cruise` are not in it and cannot be.** They exist because no
+sensor on this network can say which end of the hull the crew call the front.
+An unattended run that answered that would be inventing the one number the
+stage was built to stop being invented, so it does the five that are
+measurements and says the front is still owed.
+
+### Walking a ladder by hand
+
+Every rung is written down the moment it is kept, so a ladder stopped halfway
+reopens on what it already has rather than on an empty one. The rung card shows
+a strip with one cell per rung, green where there is a reading and red where
+there is none, with the one you are on boxed.
+
+    [Enter]           measure this rung, or take it again
+    [Left] [Right]    move to any other rung
+    [A]               run the rest of the ladder alone
+    [D]               done, keep what is there
+    [Q]               stop
+
+That strip is the answer to a rung kept by accident. It used to mean the whole
+ladder again, because the loop only went forward and the curve was only written
+at the end.
+
 ## Direction calibration
 
 The program has no idea which controller drives which propeller, or which way a

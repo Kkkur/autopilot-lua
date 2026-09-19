@@ -99,7 +99,7 @@ there before anyone walks out to the ship.
 - The relays cannot be booted here, because they need real peripherals.
   `syntax.js` is the whole of what covers them.
 - `install.lua` is never run here, only parsed.
-- **The align stage cannot be answered here.** Its question is the number a
+- **The align stage cannot be answered here**, and is not in `cal auto` either. Its question is the number a
   pilot reads off F3. Any arithmetic in it has to be pulled out into
   `sc/flight.lua`, where the self test can reach it, or it is not covered at all.
   `flight.hullHeadingFor` was pulled out for exactly this reason.
@@ -227,6 +227,14 @@ The existing code is the specification for new code. Match it.
 - Failures are named on screen in the words of the thing that failed, never
   swallowed and never turned into a generic message. Two different faults get
   two different strings.
+- A ladder stage is a list of rungs through `walkLadder`, not its own loop.
+  Each rung is written down as it is kept and a stage reopens on what it
+  already measured, so a run stopped halfway is finished rather than redone.
+  A stage that drives something which does not come back to rest on its own,
+  the balloon being the one, passes no `cooldownRead`.
+- Every wait in `sc/cal.lua` has to end without a keypress when `auto` is set,
+  or `cal auto` hangs on a screen nobody is watching. That has happened once
+  already, in the cooldown after a balloon rung.
 - `mainThread` peripheral calls yield a server tick each. Send only what changed,
   and send it through `parallel.waitForAll`.
 - Positive yaw is the ship turning to its own right, and a tank hull turns right
