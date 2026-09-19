@@ -1382,25 +1382,90 @@ end
 
 -- Which yaw this world's north sits at, as the wizard is going to fly it.
 --
--- `calNorthYaw` is what is used, and it is 180 because that is north in
--- Minecraft yaw. The dimension is still asked, but only to be compared: a
--- magnetic north the pilot does not expect is worth saying out loud, and it is
--- not worth silently turning a rose by. That silence is what sent this ship to
--- the opposite point of every one it named.
+-- The program's rose is meant to land on the same points as the rose the pilot
+-- reads off F3, so the dimension wins when it can answer: it is the only thing
+-- here that knows the world. `calNorthYaw` is the fallback, and it is 180
+-- because that is north in Minecraft yaw.
+--
+-- A disagreement is asked about rather than resolved quietly, because the one
+-- reason a pilot has had to move this number is a ship whose front is the
+-- other end from its hull, and that is not what this number is for. Turning
+-- north to cancel a backwards hull turns every label on the rose into a lie
+-- while the arithmetic underneath stays consistent, which is the worst shape a
+-- wrong setting can have. `cal.frontOffset` is the number that fixes it and
+-- the stage now asks for it outright.
 local function northYaw(ctx)
-    local north = util.wrapAngle(config.get("calNorthYaw"))
+    local configured = util.wrapAngle(config.get("calNorthYaw"))
     local sensed, why = ship.magneticNorth()
+
     if not sensed then
-        ctx.note(string.format("north is %+.1f, off calNorthYaw. The dimension says: %s",
-            north, tostring(why)))
-    elseif math.abs(util.wrapAngle(sensed - north)) > 1 then
         ctx.note(string.format(
-            "north is %+.1f, off calNorthYaw, but the dimension reads %+.1f. Set calNorthYaw on the TUNE tab if the dimension is right.",
-            north, sensed), "warn")
-    else
-        ctx.note(string.format("north is %+.1f, and the dimension agrees", north), "good")
+            "the dimension has no magnetic north to give (%s), so the rose is walked on calNorthYaw, %+.1f",
+            tostring(why), configured), "warn")
+        return configured
     end
-    return north
+    if math.abs(util.wrapAngle(sensed - configured)) <= 1 then
+        ctx.note(string.format("north is %+.1f, and the dimension agrees", sensed), "good")
+        return sensed
+    end
+
+    ctx.note(string.format("calNorthYaw says north is %+.1f, the dimension says %+.1f",
+        configured, sensed), "warn")
+    if ctx.yesno(string.format(
+        "Walk the rose on the dimension's north, %+.1f? Moving north moves every label on the compass and is not what corrects a ship whose front is the other end from its hull. The front offset does that, and the next question asks for it.",
+        sensed), true) then
+        return sensed
+    end
+    return configured
+end
+
+-- The front offset, asked before anything is flown.
+--
+-- One reading, no turn: park anywhere, read what the front points at, and the
+-- difference from the hull's own pose is the offset. Nothing on the network
+-- will ever say which end is the front, which is why a pilot is asked at all.
+--
+-- The stage used to discover this by flying the first point of the rose bare,
+-- seeing the front land a half turn away, and flying that point again. That
+-- works, and to a pilot it reads as the wizard arguing with what they can
+-- plainly see out of the window. The retake is still there for a pilot who
+-- skips this question or mistypes the answer.
+local function askFrontOffset(ctx, known)
+    local state = ship.readState()
+    if not state then
+        ctx.note("no pose, so the front cannot be placed against the hull yet", "warn")
+        return known
+    end
+
+    if known then
+        ctx.note(string.format("the front is on file as %+.1f off the hull", known))
+        if not ctx.yesno("Measure the front offset again before walking the rose?", false) then
+            return known
+        end
+    end
+
+    local typed = ctx.ask(string.format(
+        "The hull is pointing %+.1f. Stand so you are facing the way the ship's front faces and type what F3 says. Enter on its own skips this and lets the rose work it out.",
+        state.yaw), { hint = "degrees, -180 to 180" })
+    if ctx.aborted() then return known end
+    if typed == "" then
+        ctx.note("skipped, so the first point of the rose is what finds the front", "warn")
+        return known
+    end
+
+    local seen, bad = util.parseHeading(typed)
+    if not seen then
+        ctx.note(string.format("%s. The rose will find the front itself.", tostring(bad)), "warn")
+        return known
+    end
+
+    local offset = util.wrapAngle(seen - state.yaw)
+    ctx.note(string.format(
+        "the front sits %+.1f off the hull, so every point is flown around the front",
+        offset), "good")
+    log.infof("cal: align front offset asked: pose=%.1f seen=%.1f offset=%.1f",
+        state.yaw, seen, offset)
+    return offset
 end
 
 -- Command a turn to a heading and hold it until the pilot says it has arrived.
@@ -1507,21 +1572,23 @@ local function stageAlign(ctx)
 
     local north = northYaw(ctx)
 
-    flyClear(ctx, "turning to each point of the compass")
-
-    local points, offsets, misses = {}, {}, {}
     -- What the front is believed to be off the hull by, as the rose is walked.
     --
     -- The stage sends the ship to a compass point and the pilot reads where the
     -- FRONT ended up, so the heading commanded has to be the one that puts the
-    -- front there, not the hull. Nothing is known at the first point of a first
-    -- run and the hull is sent bare; from the second point on the running mean
-    -- is subtracted, and a ship whose front is the other end from its +Z stops
-    -- being driven a half turn away from every point it is asked for.
+    -- front there, not the hull. Asked before the ship leaves the ground, so
+    -- the first point is flown around the front like every other point; from
+    -- the second point on the running mean of what the rose itself measured is
+    -- what gets used, and the answer typed here is only the start of it.
     --
-    -- A re-run starts from what the last one found, so the front is flown from
-    -- the very first point.
-    local known = cal.frontOffset
+    -- A pilot who skips the question leaves this nil, and the first point is
+    -- flown bare and then flown again once the reading has taught it.
+    local known = askFrontOffset(ctx, cal.frontOffset)
+    if ctx.aborted() then return false end
+
+    flyClear(ctx, "turning to each point of the compass")
+
+    local points, offsets, misses = {}, {}, {}
 
     for index, point in ipairs(ROSE) do
         if ctx.aborted() then break end
