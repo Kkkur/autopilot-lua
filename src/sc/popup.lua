@@ -362,23 +362,55 @@ function popup.calReplace(title, what, oldValue, newValue, unit, over)
     }
 end
 
--- Readings that do not agree with each other. Their average is still an
--- average, and it is offered, but a pilot who keeps it should know what they
--- are keeping.
-function popup.calSpread(spread, allowed, mean, count)
+-- Points of the rose the front came out not facing, once the half turn and
+-- the mirror were both settled. The two flips are still offered, because a
+-- single bad turn should not throw away seven good answers, but a pilot who
+-- keeps them should know how many points disagreed with them.
+function popup.calRose(wrong, total, offset, mirror)
     local lines, cost = {}, {}
-    say(lines, "warn", "the %d readings disagree by up to %.0f degrees", count or 0, spread or 0)
-    say(lines, "dim", "which is past the %.0f this ship calls consistent", allowed or 0)
-    say(cost, "hi", "their average is %+.1f degrees", mean or 0)
-    say(cost, "dim", "a ship that was not steady when it was read does this")
+    say(lines, "warn", "on %d of %d points the front was not facing the way it was sent",
+        wrong or 0, total or 0)
+    say(lines, "dim", "and by then neither the front nor the rose had anything left to learn")
+    say(cost, "hi", "the front sits %+.1f degrees off the hull%s", offset or 0,
+        mirror == -1 and ", on a mirrored rose" or "")
+    say(cost, "dim", "one point is a turn that landed badly, several is a hull these two flips do not describe")
     return {
         severity = "warn",
-        title = "THE READINGS DISAGREE",
+        title = "THE ROSE DISAGREES",
         lines = lines,
         cost = cost,
         choices = {
-            { key = "enter", label = "keep the average", action = "keep" },
+            { key = "enter", label = "keep both flips", action = "keep" },
             { key = "d", label = "throw the stage away", action = "drop" },
+        },
+    }
+end
+
+-- What the rose settled, put in front of the pilot as a sentence rather than
+-- as the arithmetic. The stage asked yes or no eight times and this is what
+-- those answers came to, so the last word on it is also yes or no.
+function popup.calFrontFlip(offset, mirror, wrong, total)
+    local lines, cost = {}, {}
+    local half = math.abs(math.abs(offset or 0) - 180) < 1
+    say(lines, half and "warn" or "hi", half
+        and "the front is the other end of the hull from its own +Z"
+        or string.format("the front sits %+.1f degrees off the hull", offset or 0))
+    say(lines, mirror == -1 and "warn" or "dim", mirror == -1
+        and "and the rose is mirrored: east and west are the other way round"
+        or "and the rose is the way round the compass is")
+    say(lines, (wrong or 0) > 0 and "warn" or "good",
+        "%d of %d points came out facing the way they were sent",
+        (total or 0) - (wrong or 0), total or 0)
+    say(cost, "dim", "this is what the screens will read in from now on")
+    say(cost, "warn", "if that does not match what you can see, run the stage again")
+    return {
+        severity = "info",
+        title = "WHICH WAY ROUND THIS SHIP IS",
+        lines = lines,
+        cost = cost,
+        choices = {
+            { key = "enter", label = "that is the front", action = "confirm" },
+            { key = "a", label = "run it again", action = "again" },
         },
     }
 end

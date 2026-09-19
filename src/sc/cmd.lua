@@ -491,7 +491,8 @@ define("forget", {
             cal.fwdCurve, cal.stressAtCruise, cal.fwdResponse = nil, nil, nil
             cal.meta.forwardAt = nil
         elseif what == "align" then
-            cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
+            cal.frontOffset, cal.alignMissed, cal.alignPoints = nil, nil, nil
+            cal.roseMirror = 1
             cal.frontConfirmed = nil
             cal.meta.alignAt = nil
         elseif what == "cruise" then
@@ -510,7 +511,8 @@ define("forget", {
             cal.brakeResponse, cal.fwdResponse = nil, nil
             cal.stressAtTurn, cal.stressAtCruise, cal.inventory = nil, nil, nil
             cal.yawAccel = nil
-            cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
+            cal.frontOffset, cal.alignMissed, cal.alignPoints = nil, nil, nil
+            cal.roseMirror = 1
             cal.frontConfirmed = nil
         else
             return "forget sides, balloon, yaw, align, forward, cruise, brake or all", "warn"

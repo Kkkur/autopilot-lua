@@ -466,8 +466,26 @@ function tests.run()
         west = "W", ["north west"] = "NW" }
     check(#cal.ROSE == 8, "the rose has eight points")
     for _, point in ipairs(cal.ROSE) do
-        check(util.compass(cal.rosePoint(point, 180)) == ROSE_SHORT[point.name],
+        check(util.compass(cal.rosePoint(point, 180, 1)) == ROSE_SHORT[point.name],
             point.name .. " is the point it says it is")
+    end
+
+    -- The mirror is the second of the two flips the align stage settles. It
+    -- reflects the rose about north and south, which is the wrongness a pilot
+    -- sees when the front points north correctly and east lands on west.
+    local MIRRORED = { north = "N", ["north east"] = "NW", east = "W",
+        ["south east"] = "SW", south = "S", ["south west"] = "SE",
+        west = "E", ["north west"] = "NE" }
+    for _, point in ipairs(cal.ROSE) do
+        check(util.compass(cal.rosePoint(point, 180, -1)) == MIRRORED[point.name],
+            point.name .. " mirrors to " .. MIRRORED[point.name])
+    end
+    -- Mirroring twice is not mirroring at all, which is what lets a pilot who
+    -- answered no by mistake say no again and get the same point back.
+    for _, point in ipairs(cal.ROSE) do
+        local mirrored = { yaw = cal.rosePoint(point, 180, -1) }
+        near(cal.rosePoint(mirrored, 180, -1), point.yaw,
+            "mirroring " .. point.name .. " twice lands where it started")
     end
     -- A dimension whose north is elsewhere carries the whole rose with it, so
     -- the points stay a right angle apart and still read in order.
@@ -525,13 +543,27 @@ function tests.run()
     end
     check(saidNever, "and a number that was never measured says so rather than reading zero")
 
-    ask = popup.calSpread(40, 15, 12, 8)
+    ask = popup.calRose(3, 8, 180, -1)
     check(ask.choices[1].action == "keep" and ask.choices[2].action == "drop",
-        "readings that disagree can be kept or thrown away")
+        "points the ship came out wrong on can be kept or thrown away")
 
     ask = popup.calFront(175, -5, 180)
     check(ask.choices[1].action == "confirm" and ask.choices[2].action == "again",
         "and the front is confirmed by the pilot or read again")
+
+    -- The align stage asks yes or no rather than for a heading, so its own
+    -- confirmation says which way round the ship came out rather than quoting
+    -- a reading nobody typed.
+    ask = popup.calFrontFlip(180, -1, 0, 8)
+    check(ask.choices[1].action == "confirm" and ask.choices[2].action == "again",
+        "the flips the rose settled are confirmed or the stage is run again")
+    local saidMirror, saidHalf = false, false
+    for _, entry in ipairs(ask.lines) do
+        if entry.text:find("mirrored") then saidMirror = true end
+        if entry.text:find("other end of the hull") then saidHalf = true end
+    end
+    check(saidHalf, "a ship whose front is its stern is told so in words")
+    check(saidMirror, "and so is a mirrored rose")
 
     -- == the two alignment stages exist and are in the right order ==
     local order = {}

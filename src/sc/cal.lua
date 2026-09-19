@@ -53,8 +53,9 @@ cal.FILE = nil
 cal.sides = {}        -- line name -> { side = "left"|"right"|"main"|"none", reverse }
 cal.noseOffset = nil  -- degrees between the hull's +Z and where the main pushes
 cal.frontOffset = nil -- degrees between the hull's +Z and the end the crew calls the front
-cal.alignSpread = nil -- how far the worst of the rose's readings sat from their mean
-cal.alignPoints = nil -- { { want, pose, seen }, ... }, the rose as the pilot read it
+cal.roseMirror = nil  -- 1, or -1 for a ship whose rose comes out east for west
+cal.alignMissed = nil -- points of the rose the front came out not facing
+cal.alignPoints = nil -- { { want, pose, ok }, ... }, the rose as the pilot answered it
 cal.frontConfirmed = nil -- the pilot has looked at the ship and said the front is the front
 cal.yawAuth = {}      -- { left, right }, deg/s per RPM
 cal.yawCurve = nil    -- { pos, neg }, differential RPM against yaw rate
@@ -147,19 +148,23 @@ function cal.parseSides(data)
     return sides
 end
 
--- The rose as the pilot read it. Kept whole rather than reduced to its mean,
--- because the eight numbers are the evidence for the one: a pilot looking at
--- the CAL tab and wondering why the front offset is what it is can see which
--- point disagreed with the rest.
+-- The rose as the pilot answered it. Kept whole rather than reduced to the
+-- flips it settled, because the eight answers are the evidence for them: a
+-- pilot looking at the CAL tab and wondering why the front offset is what it
+-- is can see which point the ship came out wrong on.
+--
+-- A file written before the stage asked yes or no carries `seen`, the heading
+-- the pilot typed at that point. It reads back as an answer that agreed,
+-- because a point the old stage kept is a point it was happy with.
 function cal.parsePoints(data)
     if type(data) ~= "table" then return nil end
     local out = {}
     for _, entry in ipairs(data) do
-        if type(entry) == "table" and tonumber(entry.pose) and tonumber(entry.seen) then
+        if type(entry) == "table" and tonumber(entry.pose) then
             out[#out + 1] = {
                 want = tonumber(entry.want),
                 pose = tonumber(entry.pose),
-                seen = tonumber(entry.seen),
+                ok = entry.ok ~= false,
             }
         end
     end
@@ -264,8 +269,8 @@ function cal.load()
     cal.balloonCurve, cal.altHover, cal.inventory = nil, nil, nil
     cal.stressAtTurn, cal.stressAtCruise = nil, nil
     cal.yawAccel = nil
-    cal.frontOffset, cal.alignSpread, cal.alignPoints = nil, nil, nil
-    cal.frontConfirmed = nil
+    cal.frontOffset, cal.alignMissed, cal.alignPoints = nil, nil, nil
+    cal.roseMirror, cal.frontConfirmed = nil, nil
 
     if not cal.FILE or not fs.exists(cal.FILE) then return false end
     local handle = fs.open(cal.FILE, "r")
@@ -278,8 +283,11 @@ function cal.load()
     cal.noseOffset = tonumber(data.noseOffset)
     cal.yawAccel = tonumber(data.yawAccel)
     cal.frontOffset = tonumber(data.frontOffset)
-    cal.alignSpread = tonumber(data.alignSpread)
+    cal.alignMissed = tonumber(data.alignMissed)
     cal.alignPoints = cal.parsePoints(data.alignPoints)
+    -- Anything but the mirror is no mirror, so a file that has never heard of
+    -- this field is a ship whose rose was never found to be back to front.
+    cal.roseMirror = tonumber(data.roseMirror) == -1 and -1 or 1
     cal.frontConfirmed = data.frontConfirmed == true
     if type(data.yawAuth) == "table" then
         cal.yawAuth = { left = tonumber(data.yawAuth.left),
@@ -310,8 +318,9 @@ function cal.save()
     end
     handle.write(textutils.serialize({
         sides = cal.sides, noseOffset = cal.noseOffset, yawAuth = cal.yawAuth,
-        frontOffset = cal.frontOffset, alignSpread = cal.alignSpread,
-        alignPoints = cal.alignPoints, frontConfirmed = cal.frontConfirmed,
+        frontOffset = cal.frontOffset, alignMissed = cal.alignMissed,
+        roseMirror = cal.roseMirror, alignPoints = cal.alignPoints,
+        frontConfirmed = cal.frontConfirmed,
         yawCurve = cal.yawCurve, fwdCurve = cal.fwdCurve,
         brakeCurve = cal.brakeCurve, brakeResponse = cal.brakeResponse,
         fwdResponse = cal.fwdResponse, balloonCurve = cal.balloonCurve,
@@ -644,8 +653,10 @@ function cal.summary()
         elseif stage.id == "align" then
             row.done = cal.frontOffset ~= nil
             if row.done then
-                row.detail = string.format("front %+.1f deg%s%s", cal.frontOffset,
-                    cal.alignSpread and string.format(", spread %.0f", cal.alignSpread) or "",
+                row.detail = string.format("front %+.1f deg%s%s%s", cal.frontOffset,
+                    cal.roseMirror == -1 and ", mirrored" or "",
+                    (cal.alignMissed or 0) > 0
+                        and string.format(", %d wrong", cal.alignMissed) or "",
                     cal.frontConfirmed and ", confirmed" or "")
             end
         elseif stage.id == "cruise" then
@@ -1371,13 +1382,18 @@ cal.ROSE = {
 }
 local ROSE = cal.ROSE
 
--- Where the rose sits, given what this world calls north.
+-- Where a point of the rose sits, given what this world calls north and which
+-- way round the rose came out on this ship.
 --
--- In an ordinary world north is yaw 180 and this is the identity. A dimension
--- whose north is somewhere else moves the whole rose with it, and the pilot can
--- say where that is on the TUNE tab when the dimension will not.
-function cal.rosePoint(point, north)
-    return util.wrapAngle(point.yaw + util.wrapAngle((north or 180) - 180))
+-- In an ordinary world north is yaw 180 and there is no mirror, so this is the
+-- identity. A dimension whose north is elsewhere carries the whole rose with
+-- it. A mirror of -1 reflects the rose about the line from north to south,
+-- which swaps east with west and leaves north and south where they are: that
+-- is the one wrongness a pilot can see that a half turn of the front does not
+-- account for.
+function cal.rosePoint(point, north, mirror)
+    local turned = (mirror == -1) and -point.yaw or point.yaw
+    return util.wrapAngle(turned + util.wrapAngle((north or 180) - 180))
 end
 
 -- Which yaw this world's north sits at, as the wizard is going to fly it.
@@ -1417,55 +1433,6 @@ local function northYaw(ctx)
         return sensed
     end
     return configured
-end
-
--- The front offset, asked before anything is flown.
---
--- One reading, no turn: park anywhere, read what the front points at, and the
--- difference from the hull's own pose is the offset. Nothing on the network
--- will ever say which end is the front, which is why a pilot is asked at all.
---
--- The stage used to discover this by flying the first point of the rose bare,
--- seeing the front land a half turn away, and flying that point again. That
--- works, and to a pilot it reads as the wizard arguing with what they can
--- plainly see out of the window. The retake is still there for a pilot who
--- skips this question or mistypes the answer.
-local function askFrontOffset(ctx, known)
-    local state = ship.readState()
-    if not state then
-        ctx.note("no pose, so the front cannot be placed against the hull yet", "warn")
-        return known
-    end
-
-    if known then
-        ctx.note(string.format("the front is on file as %+.1f off the hull", known))
-        if not ctx.yesno("Measure the front offset again before walking the rose?", false) then
-            return known
-        end
-    end
-
-    local typed = ctx.ask(string.format(
-        "The hull is pointing %+.1f. Stand so you are facing the way the ship's front faces and type what F3 says. Enter on its own skips this and lets the rose work it out.",
-        state.yaw), { hint = "degrees, -180 to 180" })
-    if ctx.aborted() then return known end
-    if typed == "" then
-        ctx.note("skipped, so the first point of the rose is what finds the front", "warn")
-        return known
-    end
-
-    local seen, bad = util.parseHeading(typed)
-    if not seen then
-        ctx.note(string.format("%s. The rose will find the front itself.", tostring(bad)), "warn")
-        return known
-    end
-
-    local offset = util.wrapAngle(seen - state.yaw)
-    ctx.note(string.format(
-        "the front sits %+.1f off the hull, so every point is flown around the front",
-        offset), "good")
-    log.infof("cal: align front offset asked: pose=%.1f seen=%.1f offset=%.1f",
-        state.yaw, seen, offset)
-    return offset
 end
 
 -- Command a turn to a heading and hold it until the pilot says it has arrived.
@@ -1572,42 +1539,48 @@ local function stageAlign(ctx)
 
     local north = northYaw(ctx)
 
-    -- What the front is believed to be off the hull by, as the rose is walked.
+    -- Two things can be wrong about the way round this ship reads, and both of
+    -- them are a flip rather than a number.
     --
-    -- The stage sends the ship to a compass point and the pilot reads where the
-    -- FRONT ended up, so the heading commanded has to be the one that puts the
-    -- front there, not the hull. Asked before the ship leaves the ground, so
-    -- the first point is flown around the front like every other point; from
-    -- the second point on the running mean of what the rose itself measured is
-    -- what gets used, and the answer typed here is only the start of it.
+    -- The front can be the other end of the hull, which puts north where south
+    -- should be and east where west should be, both at once. And the rose can
+    -- come out mirrored, which swaps east with west and leaves north and south
+    -- alone. Between them they cover every way round this ship has come out.
     --
-    -- A pilot who skips the question leaves this nil, and the first point is
-    -- flown bare and then flown again once the reading has taught it.
-    local known = askFrontOffset(ctx, cal.frontOffset)
-    if ctx.aborted() then return false end
+    -- So the stage does not ask for a heading off F3 any more. It asks two
+    -- questions a pilot answers by looking out of the window: at north, is the
+    -- front facing north, and at the next point, is it facing that. A number
+    -- typed at a prompt while a ship drifts can be mistyped and was. Yes and no
+    -- cannot, and the coordinates were never wrong, only flipped.
+    local known = cal.frontOffset or 0
+    local mirror = cal.roseMirror == -1 and -1 or 1
+    if cal.frontOffset then
+        ctx.note(string.format("starting from the front %+.1f off the hull%s, and checking it",
+            known, mirror == -1 and " and a mirrored rose" or ""))
+    end
 
     flyClear(ctx, "turning to each point of the compass")
 
-    local points, offsets, misses = {}, {}, {}
+    local points, misses = {}, {}
+    local wrong = 0
 
     for index, point in ipairs(ROSE) do
         if ctx.aborted() then break end
-        local want = cal.rosePoint(point, north)
         ctx.panel({ rungIndex = index, rungTotal = #ROSE })
 
-        -- One retake per point, and only when the front missed by more than the
-        -- stage's own tolerance. The first reading of a first run is the one
-        -- that discovers a hull filed back to front, and reading the rest of the
-        -- rose off a ship pointing the wrong way would be eight readings of the
-        -- same mistake. So the point that taught it is flown again, now around
-        -- the front, and what is kept is the second reading.
+        -- The first point settles the half turn and the second settles the
+        -- mirror, because those are the two points where a no still has
+        -- something to teach. After them a no is a point this ship came out
+        -- wrong on and is written down as one.
+        local settles = (index == 1 and "flip") or (index == 2 and "mirror") or nil
         local tries = 0
+
         while tries < 2 do
             tries = tries + 1
+            local want = cal.rosePoint(point, north, mirror)
             local aim = flight.hullHeadingFor(want, known)
-            local label = string.format("point %d of %d, %s, front to %+.1f%s",
-                index, #ROSE, point.name, want,
-                known and string.format(" (hull to %+.1f)", aim) or "")
+            local label = string.format("point %d of %d, %s, front to %+.1f (hull to %+.1f)",
+                index, #ROSE, point.name, want, aim)
 
             local pose, reason, missed = turnTo(ctx, aim, label)
             if ctx.aborted() then break end
@@ -1616,51 +1589,44 @@ local function stageAlign(ctx)
                 break
             end
 
-            local typed = ctx.ask(
-                "Facing the way the ship's front faces, what does F3 say?",
-                { hint = "degrees, -180 to 180" })
+            local facing = ctx.yesno(
+                string.format("Is the front of the ship facing %s?", point.name), true)
             if ctx.aborted() then break end
-            local seen, bad = util.parseHeading(typed)
-            if not seen then
-                ctx.note(string.format("%s: %s", point.name, tostring(bad)), "bad")
-                break
-            end
 
-            local offset = util.wrapAngle(seen - pose)
-            -- How far the front ended up from the point it was sent to, which
-            -- is the thing the pilot is looking at and the thing that decides
-            -- whether this point is worth flying again.
-            local frontMiss = util.wrapAngle(want - seen)
-            local first = known == nil
-
-            known = known or offset
-            if math.abs(frontMiss) > config.get("calAlignTol") and tries < 2 then
-                -- Learned from this reading rather than kept. Writing down a
-                -- point the front was never at would put the miss into the
-                -- spread, where it would read as a hull that cannot hold a
-                -- heading rather than as one that had not been measured yet.
-                known = offset
-                ctx.note(string.format(
-                    "%s: the front came out %+.1f, %.0f off the %+.1f it was sent to",
-                    point.name, seen, math.abs(frontMiss), want), "warn")
-                ctx.note(first
-                    and string.format("the front sits %+.1f off the hull, so that point was flown backwards. Going round again on the front.", offset)
-                    or "going round again, now that the front is known", "warn")
-                log.infof("cal: align retake %s want=%.1f seen=%.1f offset=%.1f",
-                    point.name, want, seen, offset)
+            if not facing and settles and tries < 2 then
+                -- Nothing is written down for a point that was flown the wrong
+                -- way round. Keeping it would file the mistake as evidence
+                -- about the hull rather than as the thing that taught the flip.
+                if settles == "flip" then
+                    known = util.wrapAngle(known + 180)
+                    ctx.note(string.format(
+                        "then the front is the other end of the hull. It sits %+.1f off it, and every point from here is flown around the front. Going round again.",
+                        known), "warn")
+                else
+                    mirror = -mirror
+                    ctx.note(mirror == -1
+                        and "then the rose is mirrored: this ship comes out east where the compass says west. Turning the rose over and going round again."
+                        or "then the rose is not mirrored after all. Turning it back and going round again.", "warn")
+                end
+                log.infof("cal: align %s settled the %s: offset=%.1f mirror=%d",
+                    point.name, settles, known, mirror)
             else
                 -- How close the controller got, which needs no pilot at all and
                 -- is the only evidence in the stage about the turn rather than
                 -- about the hull.
                 misses[#misses + 1] = missed or util.wrapAngle(aim - pose)
-                points[#points + 1] = { want = want, pose = pose, seen = seen }
-                offsets[#offsets + 1] = offset
-                known = util.meanAngle(offsets) or offset
-                ctx.note(string.format(
-                    "%s: the front reads %+.1f against the %+.1f asked for, and sits %+.1f off the hull",
-                    point.name, seen, want, offset), "good")
-                log.infof("cal: align %s want=%.1f aim=%.1f pose=%.1f seen=%.1f offset=%.1f",
-                    point.name, want, aim, pose, seen, offset)
+                points[#points + 1] = { want = want, pose = pose, ok = facing }
+                if facing then
+                    ctx.note(string.format("%s: the front is facing it, hull at %+.1f",
+                        point.name, pose), "good")
+                else
+                    wrong = wrong + 1
+                    ctx.note(string.format(
+                        "%s: the front is not facing it, and both flips are settled by now, so this is written down as a point the ship came out wrong on.",
+                        point.name), "bad")
+                end
+                log.infof("cal: align %s want=%.1f aim=%.1f pose=%.1f facing=%s",
+                    point.name, want, aim, pose, tostring(facing))
                 break
             end
         end
@@ -1670,36 +1636,32 @@ local function stageAlign(ctx)
     ship.allStop()
     settleBack(ctx)
 
-    if #offsets == 0 then
-        ctx.note("nothing was read, so nothing is written down", "bad")
+    if #points == 0 then
+        ctx.note("nothing was answered, so nothing is written down", "bad")
         return false
     end
 
-    local mean = util.meanAngle(offsets)
-    if not mean then
-        ctx.note("the readings point every way at once and have no average", "bad")
-        return false
-    end
-    local spread = util.angleSpread(offsets, mean) or 0
-
-    -- The readings disagreeing with each other is its own finding, and it is
-    -- worth more than the average of them.
-    if spread > config.get("calAlignSpread") then
-        local action = ctx.choose(popup.calSpread(spread, config.get("calAlignSpread"),
-            mean, #offsets))
+    -- Points the ship came out wrong on after both flips were settled. One is
+    -- a turn that landed badly. Several is the pair of flips not being the
+    -- whole story about this hull, and writing the pair down anyway would file
+    -- a guess as a measurement, so it is offered rather than taken.
+    if wrong > 0 then
+        local action = ctx.choose(popup.calRose(wrong, #points, known, mirror))
         if action ~= "keep" then
             ctx.note("the rose was thrown away. Nothing was written down.", "warn")
             return false
         end
     end
 
-    cal.frontOffset = mean
-    cal.alignSpread = spread
+    cal.frontOffset = known
+    cal.roseMirror = mirror
+    cal.alignMissed = wrong
     cal.alignPoints = points
     cal.meta.alignAt = stamp()
     cal.save()
-    ctx.note(string.format("the front sits %+.1f deg off the hull, worst reading %.0f off that",
-        mean, spread), "good")
+    ctx.note(string.format(
+        "the front sits %+.1f deg off the hull%s, and %d of %d points came out facing the way they were sent",
+        known, mirror == -1 and " on a mirrored rose" or "", #points - wrong, #points), "good")
 
     -- What the turn itself did, which is the handedness question. A controller
     -- that cannot get near the heading it was given is not a controller that
@@ -1725,11 +1687,11 @@ local function stageAlign(ctx)
     -- Thrust and the front pointing opposite ways. Either number on its own
     -- looks reasonable; it is the pair that says the ship is filed backwards.
     if cal.noseOffset then
-        local apart = math.abs(util.wrapAngle(mean - cal.noseOffset))
+        local apart = math.abs(util.wrapAngle(known - cal.noseOffset))
         if apart >= 180 - config.get("calFlipTol") then
             local action = ctx.choose(popup.calBackwards(
                 string.format("the front is %+.1f off the hull and the thrust is %+.1f, which is %.0f apart",
-                    mean, cal.noseOffset, apart),
+                    known, cal.noseOffset, apart),
                 { "the main propeller pushes out of the stern",
                   "this ship flies away from every target it is given" }))
             if action == "flip" then
@@ -1744,8 +1706,7 @@ local function stageAlign(ctx)
     -- The confirmation preflight looks for. It is asked here rather than
     -- assumed from the arithmetic, because the arithmetic is what is being
     -- checked.
-    local confirm = ctx.choose(popup.calFront(
-        points[#points].seen, points[#points].pose, mean))
+    local confirm = ctx.choose(popup.calFrontFlip(known, mirror, wrong, #points))
     cal.frontConfirmed = confirm == "confirm"
     if not cal.frontConfirmed then
         ctx.note("the front is written down but not confirmed. Run the stage again when you can see it.", "warn")

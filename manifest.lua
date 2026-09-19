@@ -19,7 +19,7 @@
 -- relay as on the flight computer, so it is recorded here rather than guessed.
 
 return {
-    version = "0.17.0",
+    version = "0.18.0",
     note = "sampled longitudinal control, signed braking and live cruise yaw",
 
     roles = {
