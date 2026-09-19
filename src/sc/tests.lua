@@ -456,6 +456,28 @@ function tests.run()
     near(flight.hullHeadingFor(90, 45), 45, "a quarter turn of offset comes straight off")
     near(flight.hullHeadingFor(-170, 30), 160, "and the answer wraps past north like every other heading")
 
+    -- == the compass rose the align stage walks ==
+    -- Every point of it used to be the mirror of the point it named, because
+    -- the offsets were stepped off north the way a compass runs rather than the
+    -- way Minecraft yaw runs. The rose is now written in yaw, and what settles
+    -- it is reading each point back through the same compass the screens use.
+    local ROSE_SHORT = { north = "N", ["north east"] = "NE", east = "E",
+        ["south east"] = "SE", south = "S", ["south west"] = "SW",
+        west = "W", ["north west"] = "NW" }
+    check(#cal.ROSE == 8, "the rose has eight points")
+    for _, point in ipairs(cal.ROSE) do
+        check(util.compass(cal.rosePoint(point, 180)) == ROSE_SHORT[point.name],
+            point.name .. " is the point it says it is")
+    end
+    -- A dimension whose north is elsewhere carries the whole rose with it, so
+    -- the points stay a right angle apart and still read in order.
+    near(cal.rosePoint({ name = "north", yaw = 180 }, 90), 90,
+        "north in a turned world is the yaw the pilot said north was")
+    near(cal.rosePoint({ name = "east", yaw = -90 }, 90), 180,
+        "and east stays the quarter turn off north that it is")
+    near(cal.rosePoint({ name = "south", yaw = 0 }, -90), 90,
+        "a rose turned the other way wraps like every other heading")
+
     -- == headings a pilot typed, and headings averaged ==
     -- The align stage lives on both of these. An average of headings is not an
     -- average of numbers, and a heading of zero is due south rather than a

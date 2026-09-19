@@ -1358,12 +1358,50 @@ end
 -- amount is a yaw ladder that is off, and a set of readings that disagree with
 -- each other is a hull that was still swinging when it was read.
 
-local ROSE = {
-    { name = "north", from = 0 },   { name = "north east", from = -45 },
-    { name = "east", from = -90 },  { name = "south east", from = -135 },
-    { name = "south", from = 180 }, { name = "south west", from = 135 },
-    { name = "west", from = 90 },   { name = "north west", from = 45 },
+-- The eight points in Minecraft yaw, which is the convention the whole program
+-- reads and writes in: 0 is south, 180 is north, -90 is east, +90 is west.
+-- Written out rather than stepped off north by an offset, because an offset has
+-- a sign and that sign was wrong: the rose ran the way a compass rose runs and
+-- sent the ship to the mirror of every point it named.
+cal.ROSE = {
+    { name = "north", yaw = 180 },  { name = "north east", yaw = -135 },
+    { name = "east", yaw = -90 },   { name = "south east", yaw = -45 },
+    { name = "south", yaw = 0 },    { name = "south west", yaw = 45 },
+    { name = "west", yaw = 90 },    { name = "north west", yaw = 135 },
 }
+local ROSE = cal.ROSE
+
+-- Where the rose sits, given what this world calls north.
+--
+-- In an ordinary world north is yaw 180 and this is the identity. A dimension
+-- whose north is somewhere else moves the whole rose with it, and the pilot can
+-- say where that is on the TUNE tab when the dimension will not.
+function cal.rosePoint(point, north)
+    return util.wrapAngle(point.yaw + util.wrapAngle((north or 180) - 180))
+end
+
+-- Which yaw this world's north sits at, as the wizard is going to fly it.
+--
+-- `calNorthYaw` is what is used, and it is 180 because that is north in
+-- Minecraft yaw. The dimension is still asked, but only to be compared: a
+-- magnetic north the pilot does not expect is worth saying out loud, and it is
+-- not worth silently turning a rose by. That silence is what sent this ship to
+-- the opposite point of every one it named.
+local function northYaw(ctx)
+    local north = util.wrapAngle(config.get("calNorthYaw"))
+    local sensed, why = ship.magneticNorth()
+    if not sensed then
+        ctx.note(string.format("north is %+.1f, off calNorthYaw. The dimension says: %s",
+            north, tostring(why)))
+    elseif math.abs(util.wrapAngle(sensed - north)) > 1 then
+        ctx.note(string.format(
+            "north is %+.1f, off calNorthYaw, but the dimension reads %+.1f. Set calNorthYaw on the TUNE tab if the dimension is right.",
+            north, sensed), "warn")
+    else
+        ctx.note(string.format("north is %+.1f, and the dimension agrees", north), "good")
+    end
+    return north
+end
 
 -- Command a turn to a heading and hold it until the pilot says it has arrived.
 --
@@ -1467,16 +1505,7 @@ local function stageAlign(ctx)
         ctx.note("no yaw ladder yet, so the turns run on plain proportional and land roughly", "warn")
     end
 
-    local north, why = ship.magneticNorth()
-    if not north then
-        ctx.note("north: " .. tostring(why), "bad")
-        if not ctx.yesno("Use 180, which is north in an ordinary world?", true) then
-            return false
-        end
-        north = 180
-    else
-        ctx.note(string.format("north is %+.1f, off the dimension itself", north), "good")
-    end
+    local north = northYaw(ctx)
 
     flyClear(ctx, "turning to each point of the compass")
 
@@ -1496,7 +1525,7 @@ local function stageAlign(ctx)
 
     for index, point in ipairs(ROSE) do
         if ctx.aborted() then break end
-        local want = util.wrapAngle(north + point.from)
+        local want = cal.rosePoint(point, north)
         ctx.panel({ rungIndex = index, rungTotal = #ROSE })
 
         -- One retake per point, and only when the front missed by more than the
@@ -1675,20 +1704,14 @@ local function stageCruise(ctx)
         ctx.note("no forward ladder yet, so the leg runs at the configured cruise rpm", "warn")
     end
 
-    local north, why = ship.magneticNorth()
-    if not north then
-        ctx.note("north: " .. tostring(why), "warn")
-        north = nil
-    end
+    local north = northYaw(ctx)
 
     flyClear(ctx, "the cruise leg")
 
-    if north then
-        local pose = turnTo(ctx, north, string.format("lining up on north, %+.1f", north))
-        if ctx.aborted() then return false end
-        if pose then
-            ctx.note(string.format("lined up, the hull reads %+.1f", pose))
-        end
+    local pose = turnTo(ctx, north, string.format("lining up on north, %+.1f", north))
+    if ctx.aborted() then return false end
+    if pose then
+        ctx.note(string.format("lined up, the hull reads %+.1f", pose))
     end
 
     local start = ship.readState()
