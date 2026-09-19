@@ -44,6 +44,14 @@ local SAMPLE      = 0.5                 -- seconds between tank reads
 local SEND_EVERY  = 1.0                 -- seconds between broadcasts
 local HISTORY     = 600                 -- samples kept: five minutes at 0.5s
 local RATE_WINDOW = 60                  -- seconds of history the rate fit uses
+-- How much of that window has to have gone by before a rate is quoted at all.
+-- Four samples is two seconds, and two seconds of a tank that reads in whole
+-- mB is a slope fitted through rounding: the relay came up saying the ship was
+-- burning 22 mB a second and walked it back to 1.8 as the window filled. A
+-- captain who read the first number planned the leg on it. So the fit waits
+-- for real span rather than for a count, and says it is still gathering until
+-- it has one.
+local RATE_MIN_SPAN = 20                -- seconds the samples must actually cover
 local BLOCK_MB    = 8000                -- mB per tank block, Create's default
 local TANK_BLOCKS = 63                  -- blocks in each of this ship's tanks
 local ASSUMED_CAP = BLOCK_MB * TANK_BLOCKS   -- 504,000 mB, and 1,008,000 across both
@@ -168,10 +176,10 @@ end
 
 -- == HISTORY AND RATE ========================================
 
-local history = {}      -- {t = os.clock(), total = mB}, newest last
+local history = {}      -- {t = log.now(), total = mB}, newest last
 
 local function record(total)
-    history[#history + 1] = { t = os.clock(), total = total }
+    history[#history + 1] = { t = log.now(), total = total }
     while #history > HISTORY do table.remove(history, 1) end
 end
 
@@ -179,19 +187,28 @@ end
 -- the fluid is going: negative is being burned. A single pair of readings is
 -- far too noisy to put in front of a captain, which is why this fits a line
 -- rather than differencing the last two samples.
+--
+-- Returns the span the fit covered as well as the count, because a rate is
+-- only worth what the span behind it is worth and the screen has to be able to
+-- say which it is short of.
 local function fluidRate()
-    local now = os.clock()
+    local now = log.now()
     local n, sx, sy, sxx, sxy = 0, 0, 0, 0, 0
+    local oldest = nil
     for _, sample in ipairs(history) do
         if now - sample.t <= RATE_WINDOW then
             local x, y = sample.t - now, sample.total
             n = n + 1; sx = sx + x; sy = sy + y; sxx = sxx + x * x; sxy = sxy + x * y
+            oldest = oldest or sample.t
         end
     end
-    if n < 4 then return nil, n end
+    local span = oldest and (now - oldest) or 0
+    -- Span, not count. A burst of samples taken over two seconds is four
+    -- readings of the same number and a slope made of rounding error.
+    if n < 4 or span < RATE_MIN_SPAN then return nil, n, span end
     local denom = n * sxx - sx * sx
-    if math.abs(denom) < 1e-9 then return nil, n end
-    return (n * sxy - sx * sy) / denom, n
+    if math.abs(denom) < 1e-9 then return nil, n, span end
+    return (n * sxy - sx * sy) / denom, n, span
 end
 
 -- == EVENT LOGGING ===========================================
@@ -258,12 +275,12 @@ local function buildMessage()
         }
     end
 
-    local rate, samples = fluidRate()
+    local rate, samples, span = fluidRate()
     return {
         v = 1,
         id = os.getComputerID(),
         label = os.getComputerLabel(),
-        clock = os.clock(),
+        clock = log.now(),
         tanks = list,
         total = total,
         capacity = capacity,
@@ -271,7 +288,9 @@ local function buildMessage()
         worstFraction = worst,
         rate = rate,                -- mB/s, negative is burning
         rateSamples = samples,
+        rateSpan = span,            -- seconds the fit actually covered
         rateWindow = RATE_WINDOW,
+        rateMinSpan = RATE_MIN_SPAN,
         assumedCapacity = ASSUMED_CAP,
     }
 end
@@ -344,9 +363,12 @@ local function draw(msg, sent)
     term.setTextColour(colours.lightGrey)
     term.setCursorPos(2, y)
     if msg.rate then
-        term.write(string.format("%+.1f mB/s over %ds", msg.rate, msg.rateWindow))
+        term.write(string.format("%+.1f mB/s over %ds", msg.rate, math.floor(msg.rateSpan or 0)))
     else
-        term.write("rate: gathering samples")
+        -- Named with the number it is waiting for. "gathering samples" for
+        -- twenty seconds with no end in sight reads as a relay that is stuck.
+        term.write(string.format("rate: %ds of %ds gathered",
+            math.floor(msg.rateSpan or 0), msg.rateMinSpan or 0))
     end
     term.setCursorPos(2, y + 1)
     term.write(modemSide and ("sent " .. sent .. " on " .. modemSide)
@@ -478,7 +500,7 @@ local function writeTelemetry(message)
         local handle = fs.open(fs.combine(TELEMETRY, "snapshot.txt"), "w")
         if not handle then return end
         handle.writeLine("-- rewritten every sample, computer " .. os.getComputerID())
-        handle.writeLine("-- clock " .. string.format("%.1f", os.clock()))
+        handle.writeLine("-- written at " .. log.timestamp())
         handle.writeLine(textutils.serialise(message))
         handle.close()
     end)

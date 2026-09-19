@@ -193,10 +193,19 @@ from that list, and the tab bar, the click map and the function keys all lay
 themselves out from it.
 
 ```lua
-ui.TABS = { "FLIGHT", "MANUAL", "PROPS", "NAV", "CAL", "TUNE", "FUEL", "LOG" }
+ui.TABS = { "FLIGHT", "MANUAL", "PROPS", "NAV", "CAL", "TUNE", "TEL", "LOG" }
 ```
 
-Then write `drawCargo(snap, reads)` and add the branch in `paint`. Anything
+Then write `drawCargo(snap, reads)` and add the branch in `paint`.
+
+If what you are adding is a readout rather than a control, it is probably not a
+tab at all. The TEL tab is a list of sections, each one a title and a function
+returning rows, and adding a subject to it is adding one entry to
+`ui.TELEMETRY`. A row is a label, a value, a colour and optionally a bar; the
+drawing does not know what any of them mean. A section that throws is caught
+and named on screen as the section that threw, so one broken readout cannot
+take the tab down.
+ Anything
 that sets `ui.tab` uses the name, `ui.TAB.CARGO`, never a number: they were
 bare numbers in five files once and inserting MANUAL in the middle moved every
 one of them silently.
@@ -204,7 +213,9 @@ one of them silently.
 The tab bar tiles the full width in equal cells, so every column belongs to
 some tab and a click can never land in a gap. `drawTabs` and `handleClick` both
 lay it out through `tabLabels`, because two layouts that disagree by a column
-is a pilot pressing FUEL and getting TUNE. Adding a ninth tab narrows every
+is a pilot pressing TEL and getting TUNE. That is not hypothetical: the
+`fuel` command carried `ui.tab = 6` from before MANUAL existed, so for six tabs
+worth of history it opened TUNE and pinged the relay behind it. Adding a ninth tab narrows every
 cell, and on a 51 column computer the clock in the corner gives up its space
 first. Run `node sim.js --tabs` and `node sim.js --clicks` afterward and look
 at what came out.

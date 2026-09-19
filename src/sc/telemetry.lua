@@ -146,7 +146,7 @@ function telemetry.event(kind, what, detail)
     if not events then return end
     safely(function()
         events.writeLine(table.concat({
-            field(os.clock()), field(kind), field(what), field(detail),
+            field(util.now()), field(kind), field(what), field(detail),
         }, ","))
         events.flush()
     end)
@@ -182,7 +182,7 @@ function telemetry.sample(snap, tanks, turbines, popup)
     table.sort(demands)
 
     local row = {
-        t = os.clock(),
+        t = util.now(),
         phase = snap.phase,
         running = snap.running,
         safe = snap.safe,

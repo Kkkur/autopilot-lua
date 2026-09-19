@@ -795,6 +795,14 @@ os = os or {}
 os.clock = function() return clock end
 os.time = function() return clock / 3600 % 24 end
 os.day = function() return 1 end
+-- Real milliseconds, which is what the program now takes every duration off.
+-- Driven by the same simulated clock so a test that advances time still sees
+-- the fuel rate and the rung timers advance with it, and offset so the wall
+-- clock text is not permanently midnight.
+os.epoch = function(kind)
+    local base = kind == "local" and 12 * 3600 * 1000 or 0
+    return math.floor(base + clock * 1000)
+end
 os.getComputerID = function() return 7 end
 os.pullEvent = function()
     local event = coroutine.yield({ kind = "event" })

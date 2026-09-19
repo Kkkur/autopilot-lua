@@ -16,7 +16,7 @@ local ui = {}
 local W, H = term.getSize()
 local win = window.create(term.current(), 1, 1, W, H)
 
-ui.TABS = { "FLIGHT", "MANUAL", "PROPS", "NAV", "CAL", "TUNE", "FUEL", "LOG" }
+ui.TABS = { "FLIGHT", "MANUAL", "PROPS", "NAV", "CAL", "TUNE", "TEL", "LOG" }
 
 -- Named, because the tab a command wants to put up was a bare number in five
 -- files and inserting MANUAL in the middle would have moved every one of them
@@ -27,6 +27,7 @@ for index, name in ipairs(ui.TABS) do ui.TAB[name] = index end
 ui.tab = ui.TAB.FLIGHT
 ui.sel = { nav = 1, tune = 1, props = 1 }
 ui.tuneGroup = 1
+ui.telSection = 1
 ui.logScroll = 0
 ui.input = ""
 ui.history = {}
@@ -180,7 +181,7 @@ ui.MESSAGE_SECONDS = 8
 function ui.say(text, kind)
     ui.message = text
     ui.messageKind = kind or "hi"
-    ui.messageAt = os.clock()
+    ui.messageAt = util.now()
 end
 
 -- == PANE ====================================================
@@ -342,7 +343,7 @@ local function drawStatusBar(snap)
     local engaged = snap.running and " ENGAGED " or "  IDLE   "
     at(1, y, string.rep(" ", W), C("hi"), C("bg"))
     at(1, y, engaged, C("ink"), snap.running and C("good") or C("panel"))
-    local fresh = ui.message and (os.clock() - (ui.messageAt or 0)) < ui.MESSAGE_SECONDS
+    local fresh = ui.message and (util.now() - (ui.messageAt or 0)) < ui.MESSAGE_SECONDS
     local text = (fresh and ui.message) or snap.status or ""
     local kind = fresh and ui.messageKind or snap.statusKind
     at(#engaged + 2, y, text:sub(1, math.max(0, W - #engaged - 2)), kindColour(kind), C("bg"))
@@ -1165,130 +1166,310 @@ local function drawTune()
     end
 end
 
--- == TAB: FUEL ===============================================
+-- == TAB: TEL ================================================
 --
--- Everything the relay computer knows, plus the two things it cannot know on
--- its own: how fast this ship is going, and how far away the target is. The
--- advice panel at the bottom is the point of the tab. The numbers above it are
--- there so the captain can check the advice rather than take it on faith.
+-- Everything the ship knows about itself that is not a control input: the fuel
+-- relay, the turbine relays, the pose, and the two links. It was the FUEL tab,
+-- and it was one column of everything at once, which is why the numbers on it
+-- went unread.
+--
+-- The shape is the TUNE tab's: sections down the left, the selected section's
+-- readings filling the rest. That is not decoration. A section is a heading a
+-- captain can aim at, and a tab with a heading per subject does not have to
+-- choose between showing the tanks and showing the stress.
+--
+-- **Adding a readout is adding one entry to ui.TELEMETRY and nothing else.**
+-- Each entry gives a title and a function returning rows, and a row is a label,
+-- a value, a colour and optionally a bar. The drawing does not know what any of
+-- them mean, so a new subject needs no changes here.
+--
+-- Rows come back from a plain function rather than being drawn directly so the
+-- same rows can be checked by the sim without a terminal.
 
--- Advice wraps rather than being cut off, and a wrapped line is indented so it
--- reads as a continuation and not as a second, shorter warning.
-local function drawAdvice(p, status, snap, turbines)
-    local items = fuel.advice(status, snap)
-    -- The turbine relay's advice goes in the same panel. A captain does not care
-    -- which computer noticed the problem.
-    for _, item in ipairs(turbine.advice(turbines)) do items[#items + 1] = item end
-    for _, item in ipairs(items) do
-        for index, part in ipairs(wrapText(item.text, W - 3)) do
-            if p:left() <= 0 then break end
-            p:text((index == 1 and " " or "   ") .. part, kindColour(item.kind))
-        end
-    end
+local TEL_WIDTH = 11
+
+-- A row: what it is, what it reads, and how worried to be about it.
+local function telRow(label, text, colour, fraction, barColour)
+    return { label = label, text = text, colour = colour,
+             fraction = fraction, barColour = barColour }
 end
 
-local function drawFuel(snap, reads)
-    local p = pane()
-    local status = reads.fuel
+local function telNote(text, colour)
+    return { note = true, text = text, colour = colour }
+end
 
-    -- The link line first. Every number under it is worth exactly what the link
-    -- is worth, and a stale reading that looks live is how a ship runs dry.
-    local linkText, linkColour
-    if status.link == "nomodem" then
-        linkText, linkColour = "no modem on this computer", C("bad")
-    elseif status.link == "waiting" then
-        linkText, linkColour = "listening on " .. tostring(fuel.modem) .. ", nothing heard yet", C("warn")
-    elseif status.link == "stale" then
-        linkText = string.format("relay #%d SILENT for %s", status.relayId or -1,
-            util.fmtETA(status.age))
-        linkColour = C("bad")
-    else
-        linkText = string.format("relay #%d   %.1fs ago   %d msgs",
-            status.relayId or -1, status.age or 0, fuel.messages)
-        linkColour = C("good")
+-- Whether a link is worth reading numbers off, in one row, in the words of
+-- what is wrong with it. Every section that sits behind a radio opens with one.
+local function linkRow(status, what, id, messages)
+    if status == "nomodem" then
+        return telRow("link", "no modem on this computer", C("bad"))
+    elseif status == "waiting" then
+        return telRow("link", "listening, " .. what .. " has not spoken", C("warn"))
+    elseif status == "stale" then
+        return telRow("link", "SILENT, numbers are from before that", C("bad"))
     end
-    p:rule("LINK")
-    p:text(" " .. linkText, linkColour)
+    return telRow("link", messages
+        and string.format("#%s live, %d messages", tostring(id or "?"), messages)
+        or string.format("#%s live", tostring(id or "?")), C("good"))
+end
 
-    if not status.snap then
-        p:gap(99)
-        p:rule("ADVICE")
-        drawAdvice(p, status, snap, reads.turbines)
-        p:place()
-        return
-    end
+ui.TELEMETRY = {
+    {
+        id = "fuel", title = "FUEL",
+        rows = function(snap, reads)
+            local status = reads.fuel
+            local rows = { linkRow(status.link, "the fuel relay", status.relayId, fuel.messages) }
+            if status.age then
+                rows[#rows + 1] = telRow("heard", util.fmtETA(status.age) .. " ago", C("dim"))
+            end
+            if not status.snap then return rows end
 
-    p:gap()
-    p:rule("TOTAL")
-    p:row(function(y)
-        local headline = string.format(" %s / %s mB", comma(status.total), comma(status.capacity))
-        at(1, y, headline, fuelColour(status.fraction), C("bg"))
-        at(W - 10, y, string.format("%7d%%", math.floor(status.fraction * 100 + 0.5)),
-            fuelColour(status.fraction), C("bg"))
-    end)
-    p:row(function(y)
-        bar(2, y, W - 2, status.fraction, fuelColour(status.fraction), C("barBg"))
-    end)
+            rows[#rows + 1] = telRow("total",
+                string.format("%s / %s mB", comma(status.total), comma(status.capacity)),
+                fuelColour(status.fraction), status.fraction, fuelColour(status.fraction))
+            rows[#rows + 1] = telRow("level",
+                string.format("%d%%", math.floor(status.fraction * 100 + 0.5)),
+                fuelColour(status.fraction))
 
-    p:gap()
-    p:rule("TANKS")
-    for _, tank in ipairs(status.tanks) do
-        -- Four rows held back: the flow heading and its line, and the advice
-        -- heading and its first line. A ship with many tanks still gets told
-        -- what to do about them.
-        if p:left() <= 4 then break end
-        p:row(function(y)
-            local fraction = (tank.capacity or 0) > 0 and tank.amount / tank.capacity or 0
-            if tank.ok == false then
-                line(y, string.format(" %-6s OFFLINE  %s", tank.side, tostring(tank.err)), C("bad"))
+            if status.filling then
+                rows[#rows + 1] = telRow("filling",
+                    string.format("%+.1f mB/s", status.filling), C("good"))
+                rows[#rows + 1] = telRow("full in", util.fmtETA(status.fullIn), C("good"))
+            elseif status.burn > 0 then
+                rows[#rows + 1] = telRow("burn",
+                    string.format("%.1f mB/s", status.burn), C("hi"))
+            elseif status.burnBasis then
+                -- Held, and said to be held. A number that stopped being
+                -- measured and goes on being drawn in the live colour is the
+                -- one that strands a ship.
+                rows[#rows + 1] = telRow("burn",
+                    string.format("%.1f mB/s held", status.burnBasis), C("warn"))
+            elseif status.rateSpan and status.rateMinSpan
+                    and status.rateSpan < status.rateMinSpan then
+                rows[#rows + 1] = telRow("burn",
+                    string.format("%ds of %ds gathered", math.floor(status.rateSpan),
+                        math.floor(status.rateMinSpan)), C("dim"))
             else
-                -- The mod prefix is dropped: the captain knows what dimension he is
-                -- in, and `lava` reads faster than `minecraft:lava` in six columns.
-                local fluidName = (tank.fluid or "empty"):gsub("^.*:", "")
-                at(1, y, string.format(" %-6s %-9s %6s/%-6s", tank.side, fluidName:sub(1, 9),
-                    comma(tank.amount), comma(tank.capacity)), C("hi"), C("bg"))
-                -- A tilde is the difference between a maximum that was read off the
-                -- tank and one the relay assumed. It is small on purpose and it is
-                -- never left off.
-                at(W - 16, y, tank.capSource ~= "reported" and "~" or " ", C("dim"), C("bg"))
-                at(W - 15, y, string.format("%3d%%", math.floor(fraction * 100 + 0.5)),
-                    fuelColour(fraction), C("bg"))
-                bar(W - 10, y, 10, fraction, fuelColour(fraction), C("barBg"))
+                rows[#rows + 1] = telRow("burn", "nothing drawing fuel", C("dim"))
             end
-        end)
-    end
 
-    p:gap()
-    p:rule("FLOW")
-    if status.filling then
-        p:text(string.format(" filling %+.1f mB/s   full in %s",
-            status.filling, util.fmtETA(status.fullIn)), C("good"))
-    elseif status.burn > 0 then
-        p:text(string.format(" burn %.1f mB/s   res %s   dry %s",
-            status.burn, util.fmtETA(status.endurance), util.fmtETA(status.dry)),
-            status.endurance and status.endurance < 120 and C("bad") or C("hi"))
-    else
-        p:text(" no flow measured", C("dim"))
-    end
-    if p:left() > 2 then
-        local rangeText
-        if status.range then
-            rangeText = string.format(" range %.0f blk at %.1f m/s", status.range, status.speed)
+            if status.endurance then
+                rows[#rows + 1] = telRow("reserve", util.fmtETA(status.endurance),
+                    status.endurance < 120 and C("bad") or C("hi"))
+                rows[#rows + 1] = telRow("dry", util.fmtETA(status.dry), C("dim"))
+            end
+            if status.range then
+                rows[#rows + 1] = telRow("range",
+                    string.format("%.0f blk at %.1f m/s", status.range, status.speed), C("hi"))
+            end
             if status.rangeAtCruise then
-                rangeText = rangeText .. string.format("   %.0f blk at cruise", status.rangeAtCruise)
+                rows[#rows + 1] = telRow("at cruise",
+                    string.format("%.0f blk", status.rangeAtCruise), C("dim"))
             end
-        elseif status.rangeAtCruise then
-            rangeText = string.format(" range %.0f blk at cruise, stationary now", status.rangeAtCruise)
+            if status.burnHeldFor then
+                rows[#rows + 1] = telNote(string.format(
+                    "The burn has not been measured for %s. Endurance and dry are quoted "
+                    .. "off the last one that was.", util.fmtETA(status.burnHeldFor)), C("warn"))
+            end
+            return rows
+        end,
+    },
+    {
+        id = "tanks", title = "TANKS",
+        rows = function(snap, reads)
+            local status = reads.fuel
+            if not status.snap then
+                return { linkRow(status.link, "the fuel relay", status.relayId) }
+            end
+            local rows = {}
+            for _, tank in ipairs(status.tanks) do
+                if tank.ok == false then
+                    rows[#rows + 1] = telRow(tank.side,
+                        "OFFLINE, " .. tostring(tank.err), C("bad"))
+                else
+                    local fraction = (tank.capacity or 0) > 0
+                        and tank.amount / tank.capacity or 0
+                    -- The mod prefix goes: the captain knows what dimension he
+                    -- is in, and `lava` reads faster than `minecraft:lava`.
+                    local fluidName = (tank.fluid or "empty"):gsub("^.*:", "")
+                    rows[#rows + 1] = telRow(tank.side,
+                        string.format("%-8s %s/%s%s", fluidName:sub(1, 8),
+                            comma(tank.amount), comma(tank.capacity),
+                            tank.capSource ~= "reported" and " ~" or ""),
+                        fuelColour(fraction), fraction, fuelColour(fraction))
+                end
+            end
+            if status.guessed then
+                rows[#rows + 1] = telNote(
+                    "A tilde marks a tank maximum the relay guessed rather than read.", C("dim"))
+            end
+            return rows
+        end,
+    },
+    {
+        id = "turbines", title = "TURBINES",
+        rows = function(snap, reads)
+            local status = reads.turbines
+            local rows = { linkRow(status.link, "a turbine relay", status.worstRelay) }
+            if status.age then
+                rows[#rows + 1] = telRow("heard", util.fmtETA(status.age) .. " ago", C("dim"))
+            end
+            for _, relay in ipairs(status.relays or {}) do
+                rows[#rows + 1] = telRow("#" .. tostring(relay.id),
+                    string.format("%d line(s), %s", #(relay.lines or {}), relay.link),
+                    relay.link == "live" and C("good") or C("bad"))
+            end
+            if status.stressOk then
+                rows[#rows + 1] = telRow("stress",
+                    string.format("%s / %s su", comma(math.floor(status.stress or 0)),
+                        comma(math.floor(status.capacity or 0))),
+                    status.overstressed and C("bad") or C("hi"),
+                    status.fraction, status.overstressed and C("bad") or C("bar"))
+                rows[#rows + 1] = telRow("headroom",
+                    comma(math.floor(status.headroom or 0)) .. " su",
+                    status.overstressed and C("bad") or C("dim"))
+            elseif status.stressError then
+                rows[#rows + 1] = telRow("stress", tostring(status.stressError), C("bad"))
+            end
+            if status.hasBalloon then
+                rows[#rows + 1] = telRow("balloon",
+                    string.format("strength %d", status.balloon or 0), C("hi"))
+                if status.vents then
+                    rows[#rows + 1] = telRow("vents", tostring(status.vents), C("dim"))
+                end
+            end
+            return rows
+        end,
+    },
+    {
+        id = "pose", title = "POSE",
+        rows = function(snap)
+            if not snap or not snap.state then
+                return { telRow("pose", "no reading from the ship", C("bad")) }
+            end
+            local state = snap.state
+            return {
+                telRow("position", string.format("%.0f %.0f %.0f",
+                    state.position.x, state.position.y, state.position.z), C("hi")),
+                telRow("heading", string.format("%+.1f deg %s",
+                    state.yaw, util.compass(state.yaw)), C("hi")),
+                telRow("speed", string.format("%.2f m/s", state.speed or 0), C("hi")),
+                telRow("climb", string.format("%+.2f m/s", state.velocity.y), C("dim")),
+                telRow("pitch", string.format("%+.1f deg",
+                    util.pitchOf(state.orientation)), C("dim")),
+                telRow("roll", string.format("%+.1f deg",
+                    util.rollOf(state.orientation)), C("dim")),
+            }
+        end,
+    },
+    {
+        id = "advice", title = "ADVICE",
+        rows = function(snap, reads)
+            local items = fuel.advice(reads.fuel, snap)
+            -- The turbine relay's advice goes in the same list. A captain does
+            -- not care which computer noticed the problem.
+            for _, item in ipairs(turbine.advice(reads.turbines)) do items[#items + 1] = item end
+            local rows = {}
+            for _, item in ipairs(items) do
+                rows[#rows + 1] = telNote(item.text, kindColour(item.kind))
+            end
+            if #rows == 0 then
+                rows[#rows + 1] = telNote("Nothing to say. Everything reads normal.", C("good"))
+            end
+            return rows
+        end,
+    },
+}
+
+-- The rows of whichever section is up. Split out so the sim can ask for them
+-- without a terminal, the same way ui.tuneRows is.
+function ui.telRows(snap, reads)
+    ui.telSection = util.clamp(ui.telSection, 1, #ui.TELEMETRY)
+    local section = ui.TELEMETRY[ui.telSection]
+    local ok, rows = pcall(section.rows, snap, reads)
+    -- A section that throws is named as the section that threw. One broken
+    -- readout must not take the whole tab down, and a blank panel would not say
+    -- which one it was.
+    if not ok then
+        rows = { telRow("error", tostring(rows), C("bad")) }
+    end
+    return rows, section
+end
+
+local function drawTel(snap, reads)
+    local rows, section = ui.telRows(snap, reads)
+
+    -- The left panel, the same shape and the same width rules as TUNE's, so a
+    -- pilot who has used one tab has used both.
+    local room = H - 6
+    local first = util.clamp(ui.telSection - math.floor(room / 2), 1,
+        math.max(1, #ui.TELEMETRY - room + 1))
+    ui.telFirstSection = first
+    for offset = 0, room - 1 do
+        local index = first + offset
+        local y = 2 + offset
+        local entry = ui.TELEMETRY[index]
+        if not entry then
+            at(1, y, string.rep(" ", TEL_WIDTH), C("hi"), C("bg"))
         else
-            rangeText = " range needs a burn rate and a speed"
+            local selected = index == ui.telSection
+            at(1, y, util.pad(" " .. entry.title, TEL_WIDTH),
+                selected and C("ink") or C("dim"),
+                selected and C("accent") or C("bg"))
         end
-        p:text(rangeText, C("dim"))
     end
 
-    p:gap()
-    p:rule("ADVICE")
-    drawAdvice(p, status, snap, reads.turbines)
-    p:place()
+    local x = TEL_WIDTH + 2
+    local width = W - x + 1
+    local y = 2
+    at(x - 1, y, "|", C("panel"), C("bg"))
+    at(x, y, util.pad(section.title, width), C("ink"), C("panel")); y = y + 1
+
+    local listRoom = H - 6 - y + 1
+    for _, row in ipairs(rows) do
+        if listRoom <= 0 then break end
+        at(x - 1, y, "|", C("panel"), C("bg"))
+        if row.note then
+            -- Prose wraps. A sentence cut at the right hand edge has usually
+            -- lost the half that said what to do about it.
+            for index, part in ipairs(wrapText(row.text, width - 2)) do
+                if listRoom <= 0 then break end
+                at(x - 1, y, "|", C("panel"), C("bg"))
+                at(x, y, util.pad((index == 1 and " " or "   ") .. part, width),
+                    row.colour, C("bg"))
+                y = y + 1; listRoom = listRoom - 1
+            end
+        else
+            at(x, y, util.pad(string.format(" %-9s %s", row.label, row.text), width),
+                row.colour, C("bg"))
+            if row.fraction then
+                bar(x + 30, y, math.max(4, W - x - 30), row.fraction,
+                    row.barColour or C("bar"), C("barBg"))
+            end
+            y = y + 1; listRoom = listRoom - 1
+        end
+    end
+    while listRoom > 0 do
+        at(x - 1, y, "|" .. string.rep(" ", width), C("panel"), C("bg"))
+        y = y + 1; listRoom = listRoom - 1
+    end
+
+    -- The footer says how to move, in the same key notation the whole program
+    -- uses, because a panel of readings with no way out named on it is a panel
+    -- a pilot leaves by guessing.
+    rule(H - 5)
+    -- Each key group is its own line rather than one wrapped sentence. Wrapping
+    -- eats the run of spaces that separated them, and "[Left] [Right] the same
+    -- click a name to jump" is not a sentence anybody can follow.
+    local wrapped = {
+        "[Up] [Down] [Left] [Right] pick a section",
+        "click a section name to jump straight to it",
+        "everything on this tab is read, never commanded",
+    }
+    for offset = 0, 2 do
+        line(H - 4 + offset, wrapped[offset + 1] and (" " .. wrapped[offset + 1]) or "",
+            C("dim"))
+    end
 end
 
 -- == TAB: LOG ================================================
@@ -1359,7 +1540,7 @@ local function drawAlarm(p)
     local field = C("bad")
     for y = 1, H do line(y, "", C("hi"), field) end
     local title = " " .. p.title .. " "
-    local inverted = math.floor(os.clock() * 2) % 2 == 0
+    local inverted = math.floor(util.now() * 2) % 2 == 0
     centre(title, 2, inverted and field or C("hi"), inverted and C("hi") or field)
     local y = 4
     for _, item in ipairs(popupBody(p, W - 4)) do
@@ -1411,7 +1592,7 @@ local function paint(snap, reads)
     elseif ui.tab == ui.TAB.NAV then drawNav(snap)
     elseif ui.tab == ui.TAB.CAL then drawCal(snap)
     elseif ui.tab == ui.TAB.TUNE then drawTune()
-    elseif ui.tab == ui.TAB.FUEL then drawFuel(snap, reads)
+    elseif ui.tab == ui.TAB.TEL then drawTel(snap, reads)
     else drawLog() end
     drawStatusBar(snap)
     drawInput()
@@ -1445,7 +1626,7 @@ local lastReads = nil
 local lastExtras, lastExtrasAt = nil, nil
 
 local function readInstruments()
-    local now = os.clock()
+    local now = util.now()
     if not lastExtras or (now - (lastExtrasAt or 0)) >= config.get("uiExtrasTick") then
         lastExtras = ship.readExtras()
         lastExtrasAt = now
@@ -1519,6 +1700,11 @@ local function listStep(dir)
     elseif ui.tab == ui.TAB.TUNE then
         local rows = ui.tuneRows()
         ui.sel.tune = util.clamp(ui.sel.tune + dir, 1, math.max(1, #rows))
+    elseif ui.tab == ui.TAB.TEL then
+        -- The section list is the only thing on this tab that moves. Nothing
+        -- here is editable, so up and down carry the whole selection rather
+        -- than picking a row inside a panel that cannot be acted on.
+        ui.telSection = util.clamp(ui.telSection + dir, 1, #ui.TELEMETRY)
     elseif ui.tab == ui.TAB.LOG then
         ui.logScroll = math.max(0, ui.logScroll - dir)
     end
@@ -1741,6 +1927,10 @@ function ui.handleKey(key)
     end
     if key == keys.left or key == keys.right then
         local dir = key == keys.right and 1 or -1
+        if ui.tab == ui.TAB.TEL then
+            ui.telSection = util.clamp(ui.telSection + dir, 1, #ui.TELEMETRY)
+            return
+        end
         if ui.tab == ui.TAB.TUNE then
             local rows = ui.tuneRows()
             local row = rows[ui.sel.tune]
@@ -1807,6 +1997,15 @@ function ui.handleClick(x, y)
         for index, label in ipairs(tabLabels()) do
             if x >= at_ and x < at_ + #label then ui.tab = index; return end
             at_ = at_ + #label
+        end
+        return
+    end
+    if ui.tab == ui.TAB.TEL then
+        -- One click target: the section list. The right panel is readings, and
+        -- a reading is not something a pilot can press.
+        if x <= TEL_WIDTH then
+            local index = (ui.telFirstSection or 1) + (y - 2)
+            if ui.TELEMETRY[index] then ui.telSection = index end
         end
         return
     end

@@ -596,11 +596,15 @@ define("log", {
 
 -- == FUEL ====================================================
 
-define("fuel", {
-    usage = "fuel",
-    help = "Open the fuel tab and ask the relay for a reading now.",
+define("tel", {
+    aliases = { "fuel", "telemetry" },
+    usage = "tel",
+    help = "Open the telemetry tab and ask the fuel relay for a reading now.",
     run = function()
-        ui.tab = 6
+        -- Named, not numbered. This line read `ui.tab = 6` and had done since
+        -- before MANUAL was inserted, so `fuel` put up the TUNE tab and pinged
+        -- the relay behind it. That is the whole reason ui.TAB exists.
+        ui.tab = ui.TAB.TEL
         fuel.ping()
         local status = fuel.status()
         if status.link == "nomodem" then
@@ -614,9 +618,10 @@ define("fuel", {
         -- The one line worth putting on the status bar is the level and how long
         -- it lasts, because that is the question that made the pilot type this.
         local level = math.floor(status.fraction * 100 + 0.5)
-        if status.burn > 0 then
-            return string.format("%d%%, burning %.1f mB/s, %s to reserve",
-                level, status.burn, util.fmtETA(status.endurance)),
+        if status.burnBasis then
+            return string.format("%d%%, %s%.1f mB/s, %s to reserve",
+                level, status.burn > 0 and "burning " or "last measured ",
+                status.burnBasis, util.fmtETA(status.endurance)),
                 level <= config.get("fuelCrit") and "bad"
                     or level <= config.get("fuelWarn") and "warn" or "good"
         end

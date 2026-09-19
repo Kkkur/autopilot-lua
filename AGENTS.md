@@ -218,6 +218,12 @@ The existing code is the specification for new code. Match it.
   out of it and the failure is a comparison against nil three files away.
 - Comments explain why, not what. A comment that restates the line above it is
   worse than no comment.
+- Time has two clocks and they are not interchangeable. `util.now` (or
+  `log.now` in the relays and in log itself) is real seconds off `os.epoch` and
+  is what every number a person reads comes from. `os.clock` is game ticks and
+  is kept only where the physics is also on ticks: the control loop's `dt`, the
+  yaw trail, the relay deadman. Putting a duration a pilot reads on `os.clock`
+  quotes it in a second that stretches whenever the server lags.
 - Failures are named on screen in the words of the thing that failed, never
   swallowed and never turned into a generic message. Two different faults get
   two different strings.

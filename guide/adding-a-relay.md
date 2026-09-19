@@ -121,7 +121,7 @@ local function buildMessage()
         v = 1,
         id = os.getComputerID(),
         label = os.getComputerLabel(),
-        clock = os.clock(),
+        clock = log.now(),
         slots = slots,
         used = used,
         capacity = capacity,
@@ -224,7 +224,7 @@ local function writeTelemetry(message)
         local handle = fs.open(fs.combine(TELEMETRY, "snapshot.txt"), "w")
         if not handle then return end
         handle.writeLine("-- rewritten every sample, computer " .. os.getComputerID())
-        handle.writeLine("-- clock " .. string.format("%.1f", os.clock()))
+        handle.writeLine("-- written at " .. log.timestamp())
         handle.writeLine(textutils.serialise(message))
         handle.close()
     end)
@@ -319,7 +319,7 @@ local cargo = {}
 
 cargo.PROTOCOL = "starcatcher-cargo"
 cargo.snap = nil        -- the last message, as it arrived
-cargo.at = nil          -- os.clock() when it arrived
+cargo.at = nil          -- util.now() when it arrived, in real seconds
 cargo.relayId = nil
 cargo.messages = 0
 cargo.everSeen = false
@@ -340,7 +340,7 @@ function cargo.accept(id, message)
     if type(message) ~= "table" or message.v ~= 1 or type(message.slots) ~= "table" then
         return false
     end
-    cargo.snap, cargo.at, cargo.relayId = message, os.clock(), id
+    cargo.snap, cargo.at, cargo.relayId = message, util.now(), id
     cargo.messages = cargo.messages + 1
     return true
 end
@@ -378,7 +378,7 @@ Staleness is a question the receiving end answers, not the relay:
 ```lua
 function cargo.age()
     if not cargo.at then return nil end
-    return os.clock() - cargo.at
+    return util.now() - cargo.at
 end
 
 function cargo.isLive()

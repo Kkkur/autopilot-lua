@@ -335,6 +335,9 @@ config.SCHEMA = {
     { key = "fuelImbalance", group = "fuel",   kind = "number", def = 15.0, min = 0,   max = 100, step = 5,
       help = "Percent difference between tanks that reads as a pump fault.",
       symptom = "it calls a pump fault on tanks that always sit uneven" },
+    { key = "fuelBurnHold",  group = "fuel",   kind = "number", def = 120.0, min = 0,  max = 900, step = 30,
+      help = "Seconds a measured burn keeps answering after the flow stops reading.",
+      symptom = "endurance and the run to dry blank out whenever the burn dips" },
 
     -- == TURBINE RELAY =======================================
     -- Stress is the relay's reading. What counts as too much of it is the

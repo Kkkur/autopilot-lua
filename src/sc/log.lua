@@ -29,8 +29,29 @@ local function nextLogNumber(dir)
     return highest + 1
 end
 
+-- Real seconds, not Minecraft's. `os.clock` counts ticks, so it runs slow
+-- whenever the server does, and a log read afterwards to work out how long
+-- something took was reading a clock that had been stopping. This module is
+-- loaded with no dependencies, on all three roles, so it carries its own copy
+-- of what util.now does and hands it out for the relays to share.
+function log.now()
+    if os.epoch then
+        local ok, ms = pcall(os.epoch, "utc")
+        if ok and type(ms) == "number" then return ms / 1000 end
+    end
+    return os.clock()
+end
+
+-- The time of day a line was written, off the same wall clock a pilot reads.
+-- A log whose stamps are uptime cannot be lined up against anything that
+-- happened outside the computer, which is most of what goes wrong on a ship.
 function log.timestamp()
-    local secs = math.floor(os.clock())
+    local secs
+    if os.epoch then
+        local ok, ms = pcall(os.epoch, "local")
+        if ok and type(ms) == "number" then secs = math.floor(ms / 1000) end
+    end
+    secs = secs or math.floor(os.clock())
     return string.format("%02d:%02d:%02d",
         math.floor(secs / 3600) % 24, math.floor(secs / 60) % 60, secs % 60)
 end

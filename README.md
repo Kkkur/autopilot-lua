@@ -129,8 +129,11 @@ the CAL tab is up.
 - **CAL** : what is calibrated, when, and the measured speed curve per axis.
 - **TUNE** : every tuning value, live. `left`/`right` changes the selected one,
   `[` and `]` switch group. Changes save and apply at once.
-- **FUEL** : the tanks, what they hold, how fast it is going, how long that
-  lasts and how far it gets you, and what to do about it.
+- **TEL** : everything the ship reads about itself, a section at a time down
+  the left the way TUNE does its groups: FUEL, TANKS, TURBINES, POSE and
+  ADVICE. `up`/`down` or `left`/`right` picks a section, or click its name.
+  Nothing on this tab commands anything. Adding a readout is adding one entry
+  to `ui.TELEMETRY` and nothing else.
 - **LOG** : this session's log. `pageUp`/`pageDown` scrolls.
 
 Keys are for flying and commands are for saying exactly what you mean.
@@ -157,7 +160,8 @@ are not.
     set <key> <value>       change any tuning value
     get [key]               read one, or open TUNE
     reset [key]             back to the default
-    fuel                    the FUEL tab, and ask the relay for a reading now
+    tel                     the TEL tab, and ask the fuel relay for a reading
+                            now. `fuel` still works and means the same
     turbines                the turbine relay: link, stress and its lines
     rescan                  look at the network again
     help [command]
@@ -366,6 +370,14 @@ is a least squares fit over the last minute of samples rather than the
 difference between the last two readings, which on a tank being fed by a pump is
 mostly noise.
 
+The fit waits for the window to fill before it quotes anything, and it waits on
+real elapsed time rather than on a count of samples. Four samples is two
+seconds, and two seconds of a tank that reads in whole mB is a slope fitted
+through rounding: the relay used to come up announcing a burn of 22 mB a second
+and walk it back to 1.8 as the window filled, which is a number a captain plans
+a leg on. Until it has its twenty seconds the relay says how much it has
+gathered instead of guessing.
+
 Its log lives in `fuelrelay/logs/` and is deliberately quiet: crossing a level,
 changing fluid, a tank going silent, a capacity being corrected. A line twice a
 second would bury the one that mattered.
@@ -380,6 +392,13 @@ this ship is actually moving, and how far away the target is.
     endurance   how long the fuel above the reserve lasts at this burn
     dry         how long everything lasts, quoted separately
     range       endurance at the speed the ship is making right now
+
+A fit has gaps: the relay has just booted, the flow dipped under the noise
+floor, the window has not filled. Endurance and dry used to be computed inside
+`if burn > 0` and so left the screen entirely on every one of them, and a
+captain watching two numbers vanish mid leg learns nothing from the blank. The
+last burn that was actually measured is held for `fuelBurnHold` seconds and
+quoted with its age, in the warning colour, never in the live one.
 
 Range is the point of all of it. A burn rate is a number; "range 4720 blk,
 target 115 out" is an answer. With a target set, the advice panel says whether
@@ -400,6 +419,7 @@ a stale reading looking live.
     fuelReserve    fuel held back, which endurance and range are quoted above
     fuelStale      seconds of silence before the link counts as lost
     fuelImbalance  percent difference between tanks that reads as a pump fault
+    fuelBurnHold   seconds a measured burn keeps answering after the flow stops
 
 None of it ever commands anything.
 
@@ -458,8 +478,8 @@ propeller that is there and one that is not is thrust aimed at nothing.
 Stress sits across the top of the PROPS tab and on the FLIGHT tab next to the
 fuel, quoted as a percentage and as the headroom left in stress units, which is
 the number that decides whether asking for more RPM will get you any. The advice
-for it shares the FUEL tab's panel: a captain does not care which computer
-noticed the problem.
+for it shares the TEL tab's ADVICE section: a captain does not care which
+computer noticed the problem.
 
     stressWarn     percent of capacity that reads as working the network hard
     stressCrit     percent at which the next demand is what breaks it
@@ -469,6 +489,32 @@ Like the fuel link, it never commands anything on its own. Overstress is
 reported, not reacted to: the kinetic network has already stopped by then, and
 an autopilot that cut thrust on top of that would be dropping the ship on
 purpose.
+
+## Which clock
+
+`os.clock` on CC: Tweaked is not seconds. It counts the ticks the computer has
+been up, twenty to the second when the server is keeping up and fewer when it
+is not. Every duration in this program used to be taken off it, so every
+duration was quoted in a second that stretches under load: a burn rate fitted
+over "sixty seconds" of a server running at twelve ticks had measured a hundred
+real seconds of fuel and called it sixty, and a log read afterwards to work out
+how long something took was reading a clock that had been stopping.
+
+So there are two clocks and which one a number belongs to is decided by who
+reads it.
+
+    util.now()      real seconds, off os.epoch. Everything a person reads:
+                    log stamps, fuel age, burn, endurance, dry, every ETA,
+                    the calibration rung timers
+    log.now()       the same thing, for the relays and for log itself, which
+                    are loaded with no dependencies and cannot reach util
+    os.clock()      game ticks, on purpose. The control loop's dt, the yaw
+                    trail window, the relay deadman
+
+The control loop stays on ticks because the physics it is steering steps on
+ticks, and the turn was measured and tuned against that. Moving it to wall time
+is a change to the flight model, not a formatting fix, and it needs a turn on
+the real ship behind it.
 
 ## Testing it on the desktop
 

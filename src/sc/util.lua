@@ -212,6 +212,49 @@ function util.shortName(name)
     return "#" .. (name:match("_(%d+)$") or name)
 end
 
+-- == TIME ====================================================
+--
+-- Reading a clock is not a peripheral call, so this belongs here with the rest
+-- of what the self test can reach.
+--
+-- **`os.clock` is not seconds.** On CC: Tweaked it counts the ticks the
+-- computer has been up, twenty to the second when the server is keeping up and
+-- fewer when it is not. Every duration in this program used to come off it, so
+-- every duration was quoted in a second that stretches under load: a burn rate
+-- fitted over "sixty seconds" of a server running at twelve ticks measured a
+-- hundred real seconds of fuel and called it sixty. A ship's endurance is how
+-- long the pilot has, and the pilot is not on Minecraft's clock.
+--
+-- `os.epoch` is wall time in milliseconds and is what this returns. The
+-- fallback is only for a host that has no epoch at all, and it is named as the
+-- old broken clock rather than quietly standing in for the new one.
+function util.now()
+    if os.epoch then
+        local ok, ms = pcall(os.epoch, "utc")
+        if ok and type(ms) == "number" then return ms / 1000 end
+    end
+    return os.clock()
+end
+
+-- The real time of day on the wall behind the computer, for a line a pilot is
+-- going to compare against something outside the game. Durations do not come
+-- off this: a local clock moves when a timezone does, and `util.now` does not.
+function util.wallText(at)
+    local ms = at
+    if not ms and os.epoch then
+        local ok, got = pcall(os.epoch, "local")
+        if ok and type(got) == "number" then ms = got end
+    end
+    if not ms then
+        local secs = math.floor(os.clock())
+        return string.format("%02d:%02d:%02d",
+            math.floor(secs / 3600) % 24, math.floor(secs / 60) % 60, secs % 60)
+    end
+    local secs = math.floor(ms / 1000)
+    return string.format("%02d:%02d:%02d",
+        math.floor(secs / 3600) % 24, math.floor(secs / 60) % 60, secs % 60)
+end
+
 -- == FORMATTERS ==============================================
 
 function util.fmtETA(secs)

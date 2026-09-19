@@ -22,10 +22,20 @@ fuel.MODEM_SIDES = { "top", "bottom", "left", "right", "front", "back" }
 
 fuel.modem = nil          -- side the modem was opened on, nil if there is none
 fuel.snap = nil           -- the last message from the relay, as it arrived
-fuel.at = nil             -- os.clock() when it arrived
+fuel.at = nil             -- util.now() when it arrived, in real seconds
 fuel.relayId = nil
 fuel.messages = 0
 fuel.everSeen = false
+
+-- The last burn the relay actually measured, and when. A burn rate arrives
+-- from a least squares fit over a window, and a fit has gaps: the relay has
+-- just booted, the window has not filled, the flow dipped under the noise
+-- floor for a sample. Every one of those used to take endurance and the run to
+-- dry off the screen entirely, because both were computed inside
+-- `if burn > 0`. A captain watching the numbers vanish mid leg learns nothing
+-- from the blank. The last real measurement is held and quoted with its age.
+fuel.lastBurn = nil
+fuel.lastBurnAt = nil
 
 -- == LINK ====================================================
 
@@ -79,7 +89,7 @@ function fuel.accept(id, message)
     -- reports every recovery as having taken no time at all.
     local gap = fuel.everSeen and not fuel.isLive() and fuel.age() or nil
     fuel.snap = message
-    fuel.at = os.clock()
+    fuel.at = util.now()
     fuel.relayId = id
     fuel.messages = fuel.messages + 1
     if not fuel.everSeen then
@@ -115,7 +125,7 @@ end
 
 function fuel.age()
     if not fuel.at then return nil end
-    return os.clock() - fuel.at
+    return util.now() - fuel.at
 end
 
 function fuel.isLive()
@@ -170,11 +180,35 @@ function fuel.status()
     if rate and math.abs(rate) < 0.1 then rate = 0 end
     out.burn = (rate and rate < 0) and -rate or 0
     out.filling = (rate and rate > 0) and rate or nil
+    -- How much of the fit's window the relay had behind that number. A rate off
+    -- two seconds of a tank that reads in whole mB is a slope through rounding,
+    -- which is the 22 mB/s the relay used to open with, so the relay no longer
+    -- sends one and this is what it sends instead.
+    out.rateSpan = snap.rateSpan
+    out.rateMinSpan = snap.rateMinSpan
+
+    if out.burn > 0 then
+        fuel.lastBurn, fuel.lastBurnAt = out.burn, util.now()
+    end
+
+    -- What endurance and the run to dry are actually divided by. A live burn
+    -- when there is one, and otherwise the last one measured, for as long as
+    -- the captain agreed it is still worth something. Held is flagged, never
+    -- passed off as live.
+    local basis, heldFor = out.burn, nil
+    if basis <= 0 and fuel.lastBurn then
+        local since = util.now() - (fuel.lastBurnAt or 0)
+        if since <= config.get("fuelBurnHold") then
+            basis, heldFor = fuel.lastBurn, since
+        end
+    end
+    out.burnBasis = basis > 0 and basis or nil
+    out.burnHeldFor = heldFor
 
     out.usable = usableAmount(snap)
-    if out.burn > 0 then
-        out.endurance = out.usable / out.burn
-        out.dry = out.total / out.burn
+    if out.burnBasis then
+        out.endurance = out.usable / out.burnBasis
+        out.dry = out.total / out.burnBasis
     end
     if out.filling then
         local room = math.max(0, out.capacity - out.total)
@@ -278,6 +312,16 @@ function fuel.advice(status, snap)
         say(status.endurance and status.endurance < 120 and "bad" or "hi",
             "burning %.1f mB/s, %s above the %d%% reserve.",
             status.burn, util.fmtETA(status.endurance), reserve)
+    elseif status.burnBasis then
+        -- The flow has stopped reading but the tanks have not refilled. Saying
+        -- which of those it is costs one line and is the difference between a
+        -- captain topping up and a captain looking for a broken relay.
+        say("warn", "no flow reading now. Still quoting the %.1f mB/s measured %s ago.",
+            status.burnBasis, util.fmtETA(status.burnHeldFor))
+    elseif status.link == "live" and status.rateSpan and status.rateMinSpan
+            and status.rateSpan < status.rateMinSpan then
+        say("dim", "burn not measured yet: %ds of the %ds the fit needs.",
+            math.floor(status.rateSpan), math.floor(status.rateMinSpan))
     elseif status.link == "live" then
         say("dim", "no flow for %ds. Nothing is drawing fuel.",
             (status.snap and status.snap.rateWindow) or 60)
@@ -295,7 +339,7 @@ function fuel.advice(status, snap)
             say("good", "range %.0f blk, target %.0f out. Comfortable.",
                 status.range, snap.dist)
         end
-    elseif status.rangeAtCruise and status.burn > 0 then
+    elseif status.rangeAtCruise and status.burnBasis then
         say("hi", "range at cruise %.0f blk.", status.rangeAtCruise)
     end
 
