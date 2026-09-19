@@ -71,6 +71,31 @@ cal.stressAtCruise = nil
 cal.inventory = nil   -- what the ship looked like when it was last measured
 cal.meta = {}         -- when each stage was last run, for the screen
 
+-- Which filing of the sides every curve below was measured through, and which
+-- filing the ship is on now.
+--
+-- A ladder is not a property of the hull. It is a property of the hull *and* of
+-- which line this program calls left, because the differential it wrote down
+-- was put on the water by `flight.mix` reading `cal.sides`. Re-file the sides
+-- the other way round and every rung in that ladder now describes a turn the
+-- ship makes in the opposite direction, and nothing in the numbers says so:
+-- `util.tidyCurve` keeps magnitudes, so a backwards ladder and a correct one
+-- are the same file.
+--
+-- That cost a flight. The sides stage was re-run and came out the mirror of the
+-- filing the last yaw ladder was measured through, the yaw stage then found
+-- every rung already measured and resumed rather than turning the ship once,
+-- and the wrong way check that exists precisely to catch this never got a rung
+-- to look at. The align stage flew the ship away from every heading it was
+-- sent to.
+--
+-- So the sides carry a revision, every curve records the revision it was
+-- measured under, and a ladder from an older one is not resumable. It is not
+-- thrown away either: it is still the best guess the ship has until something
+-- better is measured, and the stage says out loud why it is starting again.
+cal.sidesRev = 0
+cal.curveRev = {}     -- { yaw = n, fwd = n, brake = n }
+
 -- The order is the wizard's running order and the screen's row order, so there
 -- is one list of them rather than two that can disagree.
 cal.STAGES = {
@@ -264,6 +289,7 @@ end
 
 function cal.load()
     cal.sides, cal.yawAuth, cal.meta = {}, {}, {}
+    cal.sidesRev, cal.curveRev = 0, {}
     cal.noseOffset, cal.yawCurve, cal.fwdCurve, cal.brakeCurve = nil, nil, nil, nil
     cal.brakeResponse, cal.fwdResponse = nil, nil
     cal.balloonCurve, cal.altHover, cal.inventory = nil, nil, nil
@@ -304,6 +330,8 @@ function cal.load()
     cal.stressAtCruise = tonumber(data.stressAtCruise)
     cal.inventory = type(data.inventory) == "table" and data.inventory or nil
     cal.meta = type(data.meta) == "table" and data.meta or {}
+    cal.sidesRev = tonumber(data.sidesRev) or 0
+    cal.curveRev = type(data.curveRev) == "table" and data.curveRev or {}
     return true
 end
 
@@ -327,6 +355,7 @@ function cal.save()
         altHover = cal.altHover, inventory = cal.inventory,
         stressAtTurn = cal.stressAtTurn, stressAtCruise = cal.stressAtCruise,
         yawAccel = cal.yawAccel,
+        sidesRev = cal.sidesRev, curveRev = cal.curveRev,
         meta = cal.meta,
     }))
     handle.close()
@@ -353,6 +382,25 @@ end
 
 -- Left becomes right and right becomes left, authorities and all.
 --
+-- Every way the handedness of the ship can change goes through here, so there
+-- is one place that decides a ladder is stale rather than three that can
+-- disagree. Called by the sides stage, by the swap and by the flip.
+function cal.sidesChanged()
+    cal.sidesRev = (cal.sidesRev or 0) + 1
+end
+
+-- Whether a curve measured earlier still describes this ship. A ladder from a
+-- different filing of the sides is not resumable, because every rung in it now
+-- names a turn the ship makes the other way.
+function cal.curveCurrent(which)
+    return (cal.curveRev and cal.curveRev[which]) == (cal.sidesRev or 0)
+end
+
+function cal.curveMeasured(which)
+    cal.curveRev = cal.curveRev or {}
+    cal.curveRev[which] = cal.sidesRev or 0
+end
+
 -- The sides stage decides handedness from one reading per line, and one
 -- reading is enough to get it backwards: a line read while the physics engine
 -- was reporting nothing, or a hull that was still swinging from the line
@@ -378,6 +426,7 @@ function cal.swapSides()
         end
     end
     cal.yawAuth.left, cal.yawAuth.right = cal.yawAuth.right, cal.yawAuth.left
+    cal.sidesChanged()
     return swapped
 end
 
@@ -987,6 +1036,14 @@ local function walkLadder(ctx, opts)
             resumed = resumed + 1
         end
     end
+    -- A ladder that exists but could not be resumed is the dangerous case, and
+    -- it is the one that has to be said out loud. Silently starting over on a
+    -- stale ladder looks identical to starting over on no ladder at all, and
+    -- the pilot has no way to tell that the numbers on the CAL tab no longer
+    -- describe the ship.
+    if resumed == 0 and opts.staleNote then
+        ctx.note(opts.staleNote, "warn")
+    end
     if resumed > 0 then
         ctx.note(string.format(
             "%d of %d rungs are already measured and are kept as they are. "
@@ -1356,7 +1413,14 @@ local function stageSides(ctx, auto)
                     ctx.note(util.shortName(name) .. " left as it was")
                 elseif answer == "left" or answer == "right" or answer == "main"
                         or answer == "none" then
+                    local was = cal.sides[name]
                     cal.sides[name] = { side = answer, reverse = reverse }
+                    -- Only when the filing actually moved. Re-running the stage
+                    -- and confirming what was already there must not throw away
+                    -- a ladder that is still describing this ship correctly.
+                    if not was or was.side ~= answer or was.reverse ~= reverse then
+                        cal.sidesChanged()
+                    end
                     done = done + 1
                     if answer == "left" or answer == "right" then
                         auth[answer] = auth[answer] + math.abs(yawRate) / config.get("calRpm")
@@ -1618,6 +1682,7 @@ local function stageYaw(ctx, auto)
             samples[#samples + 1] = { rpm = rpm, speed = speed }
         end
         cal.yawCurve[way] = util.tidyCurve(samples)
+        cal.curveMeasured("yaw")
         cal.save()
     end
 
@@ -1634,10 +1699,22 @@ local function stageYaw(ctx, auto)
         cooldownRead = function() return ship.yawRateHeading() or 0 end,
         cooldownLabel = "yaw",
         auto = auto,
+        staleNote = cal.yawCurve and (cal.yawCurve.pos or cal.yawCurve.neg)
+            and not cal.curveCurrent("yaw")
+            and "there is a yaw ladder on file, but it was measured with the sides filed "
+                .. "differently, so every rung in it names a turn this ship now makes the "
+                .. "other way. It is being measured again from the bottom."
+            or nil,
 
         -- What the last run of this stage left behind, rung by rung. This is
         -- the whole of resuming: a ladder reopens on its own readings.
+        --
+        -- Unless the sides have been filed again since, in which case every
+        -- rung in it describes a turn this ship now makes the other way and
+        -- resuming would hand back a ladder that reads correct and flies
+        -- backwards.
         resume = function(rung)
+            if not cal.curveCurrent("yaw") then return nil end
             for _, sample in ipairs(cal.yawCurve[rung.way] or {}) do
                 if sample.rpm == rung.rpm then
                     held[rung.way][rung.rpm] = sample.speed
@@ -2262,6 +2339,7 @@ local function stageForward(ctx, auto)
             samples[#samples + 1] = { rpm = rpm, speed = speed }
         end
         cal.fwdCurve[way] = util.tidyCurve(samples)
+        cal.curveMeasured("fwd")
         cal.save()
     end
 
@@ -2273,8 +2351,14 @@ local function stageForward(ctx, auto)
         cooldownRead = function() return forwardSpeed() or 0 end,
         cooldownLabel = "speed",
         auto = auto,
+        staleNote = cal.fwdCurve and (cal.fwdCurve.pos or cal.fwdCurve.neg)
+            and not cal.curveCurrent("fwd")
+            and "there is a forward ladder on file, but the lines have been filed again "
+                .. "since it was measured. It is being measured again from the bottom."
+            or nil,
 
         resume = function(rung)
+            if not cal.curveCurrent("fwd") then return nil end
             for _, sample in ipairs(cal.fwdCurve[rung.way] or {}) do
                 if sample.rpm == rung.rpm then
                     held[rung.way][rung.rpm] = sample.speed
@@ -2453,7 +2537,9 @@ local function stageBrake(ctx, auto)
         -- after two of its four runs finishes rather than starts again. Each
         -- run is written down as it lands, the same way the ladders are.
         local kept = {}
-        for _, rung in ipairs(cal.brakeCurve[which] or {}) do kept[#kept + 1] = rung end
+        if cal.curveCurrent("brake") then
+            for _, rung in ipairs(cal.brakeCurve[which] or {}) do kept[#kept + 1] = rung end
+        end
         local function alreadyHave(rpm)
             for _, rung in ipairs(kept) do if rung.rpm == rpm then return true end end
             return false
@@ -2494,6 +2580,7 @@ local function stageBrake(ctx, auto)
                     kept[#kept + 1] = rung
                     table.sort(kept, function(a, b) return a.rpm < b.rpm end)
                     cal.brakeCurve[which] = kept
+                    cal.curveMeasured("brake")
                     cal.save()
                     ctx.note(string.format("%s: %.2f m/s/s from %.1f m/s, nose %+.1f deg",
                         label, rung.speed, from or 0, rung.pitch or 0), "good")

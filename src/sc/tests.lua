@@ -627,6 +627,44 @@ function tests.run()
     end
     cal.sides, cal.yawAuth, cal.noseOffset = savedSides, savedAuth, savedNose
 
+    -- == a ladder outlives the filing it was measured through ==
+    -- A curve is a property of the hull and of which line this program calls
+    -- left, because the differential it wrote down reached the water through
+    -- flight.mix reading cal.sides. util.tidyCurve keeps magnitudes, so a
+    -- ladder measured with the sides the other way round is the same file as a
+    -- correct one and nothing in the numbers says otherwise.
+    --
+    -- That flew a ship backwards. The sides stage was re-run and came out the
+    -- mirror of the previous filing, the yaw stage found every rung already
+    -- measured and resumed without turning the ship once, and the wrong way
+    -- check never got a rung to look at. So a curve records the filing it was
+    -- measured under and a stale one is not resumable.
+    local savedRev, savedCurveRev = cal.sidesRev, cal.curveRev
+    cal.sidesRev, cal.curveRev = 0, {}
+    cal.curveMeasured("yaw")
+    check(cal.curveCurrent("yaw"), "a ladder just measured describes this ship")
+    cal.sidesChanged()
+    check(not cal.curveCurrent("yaw"),
+        "and stops describing it the moment the sides are filed again")
+    cal.curveMeasured("yaw")
+    check(cal.curveCurrent("yaw"), "measuring it again under the new filing restores it")
+    -- The other two ladders ride on the same filing and go stale with it.
+    cal.curveMeasured("fwd")
+    cal.curveMeasured("brake")
+    cal.sidesChanged()
+    check(not cal.curveCurrent("fwd") and not cal.curveCurrent("brake"),
+        "the forward and brake ladders go stale on the same change")
+    -- A swap is a change of filing by definition, so it has to bump it too, or
+    -- the one action taken *because* the ladder was backwards leaves the ladder
+    -- looking current.
+    savedSides = cal.sides
+    cal.sides = { l = { side = "left" }, r = { side = "right" } }
+    cal.curveMeasured("yaw")
+    cal.swapSides()
+    check(not cal.curveCurrent("yaw"), "and a swap of the sides is such a change")
+    cal.sides = savedSides
+    cal.sidesRev, cal.curveRev = savedRev, savedCurveRev
+
     -- == a yaw rate the engine has stopped reporting ==
     -- getAngularVelocity is the last figure the physics engine published, and a
     -- hull creeping round slowly enough is close enough to still for it to stop

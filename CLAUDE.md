@@ -227,6 +227,13 @@ The existing code is the specification for new code. Match it.
 - Failures are named on screen in the words of the thing that failed, never
   swallowed and never turned into a generic message. Two different faults get
   two different strings.
+- A ladder is a property of the hull **and** of which line is filed as left,
+  because the differential reached the water through `flight.mix` reading
+  `cal.sides`. `util.tidyCurve` keeps magnitudes, so a ladder measured through
+  the mirror filing is byte for byte the same file as a correct one. Anything
+  that changes handedness calls `cal.sidesChanged`, every curve is stamped with
+  `cal.curveMeasured`, and a stage only resumes a curve when
+  `cal.curveCurrent` says so.
 - A ladder stage is a list of rungs through `walkLadder`, not its own loop.
   Each rung is written down as it is kept and a stage reopens on what it
   already measured, so a run stopped halfway is finished rather than redone.

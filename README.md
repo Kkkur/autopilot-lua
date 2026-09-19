@@ -205,6 +205,16 @@ there is none, with the one you are on boxed.
     [D]               done, keep what is there
     [Q]               stop
 
+A ladder only reopens on its own readings while the sides are still filed the
+way they were when it was measured. Re-file them and every rung in it names a
+turn the ship now makes the other way, and nothing in the numbers says so,
+because `util.tidyCurve` keeps magnitudes: a backwards ladder is the same file
+as a correct one. So the sides carry a revision, each curve records the one it
+was measured under, and a stale ladder is measured again from the bottom with
+the stage saying why. It cost a flight to learn: the sides were re-run and came
+out mirrored, the yaw stage resumed without turning the ship once, and the
+wrong way check that exists to catch exactly this never got a rung to look at.
+
 That strip is the answer to a rung kept by accident. It used to mean the whole
 ladder again, because the loop only went forward and the curve was only written
 at the end.
